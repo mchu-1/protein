@@ -128,17 +128,25 @@ boltz2_image = (
 )
 
 # Chai-1 image for docking/structure prediction
+# chai_lab requires specific torch version with CUDA and additional dependencies
 chai1_image = (
-    modal.Image.debian_slim(python_version="3.10")
+    modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "wget", "build-essential")
     .pip_install(
-        "torch>=2.0.0",
-        "numpy>=1.24.0",
+        "numpy>=1.24.0,<2.0.0",
         "scipy>=1.11.0",
         "biopython>=1.81",
         "pydantic>=2.0.0",
         "einops>=0.7.0",
-        "chai_lab",  # Chai-1 structure prediction
+        "modelcif",  # For CIF file handling
+        "gemmi",  # Molecular structure library
+        index_url="https://pypi.org/simple",
+    )
+    .run_commands(
+        # Install PyTorch with CUDA support
+        "pip install torch==2.2.0 --index-url https://download.pytorch.org/whl/cu121",
+        # Install chai_lab after torch
+        "pip install chai_lab",
     )
 )
 

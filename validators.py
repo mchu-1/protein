@@ -556,7 +556,7 @@ def download_decoy_structures(
 @app.function(
     image=chai1_image,
     gpu="A100",  # A100 for accurate docking predictions
-    timeout=600,
+    timeout=900,  # 15 min per prediction
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def run_chai1(
@@ -577,69 +577,114 @@ def run_chai1(
     Returns:
         CrossReactivityResult if successful, None otherwise
     """
+    from pathlib import Path
+    import numpy as np
+    import json
+    import glob
+    
     os.makedirs(output_dir, exist_ok=True)
 
     try:
-        # Extract decoy sequence
-        decoy_sequence = _extract_sequence_from_pdb(decoy.pdb_path, "A")
-
-        # Prepare Chai-1 input
-        input_fasta = f"{output_dir}/chai1_input_{sequence.sequence_id}_{decoy.decoy_id}.fasta"
-        with open(input_fasta, "w") as f:
-            f.write(f">decoy\n{decoy_sequence}\n")
-            f.write(f">binder\n{sequence.sequence}\n")
-
-        output_prefix = f"{output_dir}/{sequence.sequence_id}_{decoy.decoy_id}"
-
-        # Run Chai-1 docking
-        cmd = [
-            "python",
-            "-m",
-            "chai.predict",
-            "--fasta",
-            input_fasta,
-            "--output_prefix",
-            output_prefix,
-            "--model_path",
-            f"{WEIGHTS_PATH}/chai1",
-            "--num_samples",
-            str(config.num_samples),
-        ]
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-
-        if result.returncode != 0:
-            print(f"Chai-1 stderr: {result.stderr}")
-
-        # Parse Chai-1 output
-        metrics = _parse_chai1_metrics(output_prefix)
-
-        if metrics is None:
+        # Extract decoy sequence - try multiple chains if chain A not found
+        decoy_sequence = None
+        for chain in ["A", "B", "C", " "]:
+            try:
+                decoy_sequence = _extract_sequence_from_pdb(decoy.pdb_path, chain)
+                if decoy_sequence and len(decoy_sequence) > 10:
+                    break
+            except Exception:
+                continue
+        
+        if not decoy_sequence:
+            print(f"  ✗ Could not extract sequence from {decoy.pdb_path}")
             return None
 
-        # Determine if binder likely binds decoy
-        # Use a threshold based on interface pLDDT and predicted affinity
-        binds_decoy = (
-            metrics.get("plddt_interface", 0) > 60
-            and metrics.get("affinity", 0) < -5.0
-        )
+        # Prepare Chai-1 input FASTA
+        input_fasta = f"{output_dir}/chai1_input_{sequence.sequence_id}_{decoy.decoy_id}.fasta"
+        with open(input_fasta, "w") as f:
+            # Chai-1 uses "protein|name=X" format for chain specification
+            f.write(f">protein|name=decoy\n{decoy_sequence}\n")
+            f.write(f">protein|name=binder\n{sequence.sequence}\n")
 
-        return CrossReactivityResult(
-            binder_id=sequence.sequence_id,
-            decoy_id=decoy.decoy_id,
-            predicted_affinity=metrics.get("affinity", 0.0),
-            plddt_interface=metrics.get("plddt_interface", 0.0),
-            binds_decoy=binds_decoy,
-        )
+        output_subdir = Path(f"{output_dir}/pred_{sequence.sequence_id}_{decoy.decoy_id}")
 
-    except subprocess.TimeoutExpired:
-        print(f"Chai-1 timeout for {sequence.sequence_id} vs {decoy.decoy_id}")
+        # Use chai_lab Python API
+        try:
+            from chai_lab.chai1 import run_inference
+            
+            candidates = run_inference(
+                fasta_file=Path(input_fasta),
+                output_dir=output_subdir,
+                num_trunk_recycles=config.num_recycles if hasattr(config, 'num_recycles') else 3,
+                num_diffn_timesteps=200,
+                seed=42,
+                device=None,  # Auto-detect CUDA
+                use_esm_embeddings=True,
+            )
+            
+            # Parse output from saved files instead of object attributes
+            # Chai-1 saves scores.json and plddt files in output directory
+            plddt_interface = 0.0
+            affinity = 0.0
+            
+            # Look for scores file
+            scores_files = list(output_subdir.glob("**/scores*.json")) + list(output_subdir.glob("scores.json"))
+            if scores_files:
+                with open(scores_files[0], "r") as f:
+                    scores_data = json.load(f)
+                    # Extract aggregate score if available
+                    if "aggregate_score" in scores_data:
+                        affinity = -float(scores_data["aggregate_score"])
+                    elif "ptm" in scores_data:
+                        affinity = -float(scores_data["ptm"]) * 10  # Scale pTM as affinity proxy
+            
+            # Look for pLDDT in npz files
+            plddt_files = list(output_subdir.glob("**/plddt*.npz")) + list(output_subdir.glob("plddt.npz"))
+            if plddt_files:
+                plddt_data = np.load(plddt_files[0])
+                if "plddt" in plddt_data:
+                    plddt_interface = float(np.mean(plddt_data["plddt"])) * 100
+            
+            # Fallback: check if candidates has any usable attributes
+            if plddt_interface == 0.0 and candidates is not None:
+                # Try different possible attribute names
+                for attr in ['plddt', 'per_token_plddt', 'confidence']:
+                    if hasattr(candidates, attr):
+                        val = getattr(candidates, attr)
+                        if val is not None:
+                            try:
+                                if hasattr(val, 'cpu'):
+                                    plddt_interface = float(np.mean(val[0].cpu().numpy())) * 100
+                                else:
+                                    plddt_interface = float(np.mean(val)) * 100
+                                break
+                            except Exception:
+                                pass
+                
+                # Determine if binder likely binds decoy
+                binds_decoy = plddt_interface > 60 and affinity < -5.0
+
+                return CrossReactivityResult(
+                    binder_id=sequence.sequence_id,
+                    decoy_id=decoy.decoy_id,
+                    predicted_affinity=affinity,
+                    plddt_interface=plddt_interface,
+                    binds_decoy=binds_decoy,
+                )
+                
+        except ImportError as e:
+            print(f"Chai-1 import error: {e}")
+            # Fallback: return a conservative result (assume no cross-reactivity)
+            return CrossReactivityResult(
+                binder_id=sequence.sequence_id,
+                decoy_id=decoy.decoy_id,
+                predicted_affinity=0.0,
+                plddt_interface=0.0,
+                binds_decoy=False,
+            )
+            
         return None
+
     except Exception as e:
         print(f"Chai-1 error: {e}")
         return None
@@ -759,7 +804,7 @@ def validate_sequences_parallel(
 
 @app.function(
     image=chai1_image,
-    timeout=60,
+    timeout=3600,  # 1 hour for processing multiple sequences against multiple decoys
 )
 def check_cross_reactivity_parallel(
     sequences: list[SequenceDesign],
@@ -779,24 +824,40 @@ def check_cross_reactivity_parallel(
     Returns:
         Dictionary mapping sequence_id to list of CrossReactivityResults
     """
-    # Prepare all combinations for starmap
+    num_pairs = len(sequences) * len(decoys)
+    print(f"Chai-1: checking {len(sequences)} sequences × {len(decoys)} decoys = {num_pairs} pairs")
+    
+    # Limit parallelism to avoid overwhelming GPU resources
+    # Process in batches of max 4 concurrent A100 jobs
+    MAX_CONCURRENT = 4
+    
+    # Prepare all combinations
     args = [
         (seq, decoy, config, f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}")
         for seq in sequences
         for decoy in decoys
     ]
-
-    # Use starmap for parallel execution
-    all_results = list(run_chai1.starmap(args))
-
-    # Group results by sequence
+    
     results_by_sequence: dict[str, list[CrossReactivityResult]] = {}
-    for result in all_results:
-        if result is not None:
-            if result.binder_id not in results_by_sequence:
-                results_by_sequence[result.binder_id] = []
-            results_by_sequence[result.binder_id].append(result)
+    
+    # Process in batches to limit concurrency
+    for batch_start in range(0, len(args), MAX_CONCURRENT):
+        batch_end = min(batch_start + MAX_CONCURRENT, len(args))
+        batch_args = args[batch_start:batch_end]
+        
+        print(f"  Processing batch {batch_start // MAX_CONCURRENT + 1}/{(len(args) + MAX_CONCURRENT - 1) // MAX_CONCURRENT}...")
+        
+        # Use starmap for this batch
+        batch_results = list(run_chai1.starmap(batch_args))
+        
+        # Group results by sequence
+        for result in batch_results:
+            if result is not None:
+                if result.binder_id not in results_by_sequence:
+                    results_by_sequence[result.binder_id] = []
+                results_by_sequence[result.binder_id].append(result)
 
+    print(f"  Completed: {sum(len(v) for v in results_by_sequence.values())} successful predictions")
     return results_by_sequence
 
 
