@@ -1,9 +1,10 @@
 <proteins>
 <aim>To generate and simulate protein binders in-silico.</aim>
+<objective>max(P(functional))</objective> # in the wet lab
 <input>A target protein.</input>
 <output>A _specific_ and _selective protein binder.</output>
 <language>Python</language>>
-<infrastructure>Modal</infrastructure>
+<infrastructure>Modal</infrastructure> # budget $30 USD
 <tools:{open-source:True}>
   # Specificity
   - **RFDiffusion**: Backbone structure generation.
