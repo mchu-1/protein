@@ -8,9 +8,10 @@
   # Specificity
   - **RFDiffusion**: Backbone structure generation.
   - **ProteinMPNN**: Backbone structure to sequence conversion.
+  - **Boltz-2**: Binder-target affinity.
   # Selectivity
   - **FoldSeek**: Flagging similar structures in the proteome to the target.
-  # Affinity Determination
-  - **Boltz-2**
+  - **Chai-1**: Binder-proteome affinity (versus similar structures).
+  
 </tools>
 </proteins>
