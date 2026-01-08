@@ -50,7 +50,7 @@ The pipeline operates in a directed acyclic graph (DAG) structure:
 To respect the $5 USD budget, you must strictly adhere to these infrastructure patterns:
 
 - **Shared Volumes:** Do NOT download model weights (RFDiffusion, Boltz-2 parameters) at runtime. Use `modal.Volume` or `modal.NetworkFileSystem` to mount pre-downloaded weights.
-- **Cold Starts:** Use `keep_warm` only for the orchestrator, not heavy GPU workers.
+- **Cold Starts:** Use `min_containers` only for the orchestrator, not heavy GPU workers.
 - **GPU Selection:**
     - *RFDiffusion/ProteinMPNN:* Use `gpu="A10g"` or `gpu="L4"` (cheaper/sufficient).
     - *Boltz-2/Chai-1:* Use `gpu="A100"` only for final validation steps where memory is critical.

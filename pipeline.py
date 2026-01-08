@@ -72,6 +72,15 @@ from validators import (
 
 app = modal.App(APP_NAME)
 
+# Add local Python modules to the base image so they're available in Modal containers
+base_image_with_code = base_image.add_local_file(
+    "common.py", remote_path="/root/common.py"
+).add_local_file(
+    "generators.py", remote_path="/root/generators.py"
+).add_local_file(
+    "validators.py", remote_path="/root/validators.py"
+)
+
 # =============================================================================
 # Cost Estimation
 # =============================================================================
@@ -149,10 +158,10 @@ def estimate_cost(config: PipelineConfig) -> float:
 
 
 @app.function(
-    image=base_image,
+    image=base_image_with_code,
     timeout=3600,  # 1 hour max
     volumes={DATA_PATH: data_volume},
-    keep_warm=1,  # Keep orchestrator warm for quick starts
+    min_containers=1,  # Keep orchestrator warm for quick starts
 )
 def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineResult:
     """
