@@ -43,12 +43,17 @@ Where:
 ## Installation
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Install dependencies using uv
+uv sync
 
 # Authenticate with Modal
-modal token new
+uv run modal token new
 ```
+
+> **Note:** If you don't have `uv` installed, you can install it with:
+> ```bash
+> curl -LsSf https://astral.sh/uv/install.sh | sh
+> ```
 
 ## Usage
 
@@ -56,14 +61,14 @@ modal token new
 
 ```bash
 # Run with Modal CLI
-modal run pipeline.py --target-pdb /path/to/target.pdb \
+uv run modal run pipeline.py --target-pdb /path/to/target.pdb \
     --hotspot-residues "10,15,20,25" \
     --num-designs 5 \
     --num-sequences 4 \
     --max-budget 5.0
 
 # Test with mocks (no GPU required)
-modal run pipeline.py --target-pdb /path/to/target.pdb \
+uv run modal run pipeline.py --target-pdb /path/to/target.pdb \
     --hotspot-residues "10,15,20" \
     --use-mocks
 ```
@@ -124,19 +129,19 @@ Before running the pipeline, populate the Modal volumes with model weights:
 
 ```bash
 # Create and populate the weights volume
-modal volume create binder-weights
+uv run modal volume create binder-weights
 
 # Upload RFDiffusion weights
-modal volume put binder-weights /path/to/rfdiffusion/weights /rfdiffusion
+uv run modal volume put binder-weights /path/to/rfdiffusion/weights /rfdiffusion
 
 # Upload ProteinMPNN weights
-modal volume put binder-weights /path/to/proteinmpnn /ProteinMPNN
+uv run modal volume put binder-weights /path/to/proteinmpnn /ProteinMPNN
 
 # Upload Boltz-2 weights
-modal volume put binder-weights /path/to/boltz2 /boltz2
+uv run modal volume put binder-weights /path/to/boltz2 /boltz2
 
 # Upload Chai-1 weights
-modal volume put binder-weights /path/to/chai1 /chai1
+uv run modal volume put binder-weights /path/to/chai1 /chai1
 ```
 
 ## Configuration Options
