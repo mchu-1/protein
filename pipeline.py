@@ -300,32 +300,45 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         )
     )
 
-    # Step 5: Chai-1 - Cross-Reactivity Check
+    # Step 5: Chai-1 - Cross-Reactivity Check (with Positive Control)
+    positive_control_results: dict[str, CrossReactivityResult] = {}
     cross_reactivity_results: dict[str, list[CrossReactivityResult]] = {}
 
-    if decoys:
-        print("\n=== Phase 3: Cross-Reactivity Check (Chai-1) ===")
-        # Get sequences that passed validation
-        validated_sequences = [
-            seq for seq in sequences
-            if any(p.sequence_id == seq.sequence_id for p in predictions)
-        ]
+    # Get sequences that passed validation
+    validated_sequences = [
+        seq for seq in sequences
+        if any(p.sequence_id == seq.sequence_id for p in predictions)
+    ]
 
-        cross_reactivity_results = _run_cross_reactivity_check(
+    if validated_sequences:
+        print("\n=== Phase 3: Cross-Reactivity Check (Chai-1) ===")
+        
+        # Run positive control + decoy check
+        positive_control_results, cross_reactivity_results = _run_cross_reactivity_check(
             validated_sequences,
-            decoys,
+            decoys if decoys else [],
             config.chai1,
             f"{base_output_dir}/cross_reactivity",
             use_mocks,
+            target=config.target,  # Include target for positive control
         )
-        print(f"Checked cross-reactivity for {len(cross_reactivity_results)} sequences")
+        
+        # Report positive control results
+        num_binding = sum(1 for r in positive_control_results.values() if r.plddt_interface > 50)
+        print(f"Positive control: {num_binding}/{len(validated_sequences)} binders bind target")
+        
+        if decoys:
+            print(f"Decoy check: {len(cross_reactivity_results)} sequences checked against {len(decoys)} decoys")
 
         validation_results.append(
             ValidationResult(
                 stage=PipelineStage.CROSS_REACTIVITY,
                 status=ValidationStatus.PASSED,
                 candidate_id=run_id,
-                metrics={"num_checked": len(cross_reactivity_results)},
+                metrics={
+                    "num_checked": len(cross_reactivity_results),
+                    "positive_control_binding": num_binding,
+                },
             )
         )
 
@@ -510,10 +523,32 @@ def _run_cross_reactivity_check(
     config: Chai1Config,
     output_dir: str,
     use_mocks: bool,
-) -> dict[str, list[CrossReactivityResult]]:
-    """Execute cross-reactivity check step."""
+    target: Optional[TargetProtein] = None,
+) -> tuple[dict[str, CrossReactivityResult], dict[str, list[CrossReactivityResult]]]:
+    """
+    Execute cross-reactivity check step.
+    
+    Returns:
+        Tuple of:
+        - positive_controls: dict mapping sequence_id to target binding result
+        - decoy_results: dict mapping sequence_id to list of decoy binding results
+    """
+    positive_controls: dict[str, CrossReactivityResult] = {}
+    decoy_results: dict[str, list[CrossReactivityResult]] = {}
+    
     if use_mocks:
-        results: dict[str, list[CrossReactivityResult]] = {}
+        # Mock positive control
+        if target is not None:
+            for seq in sequences:
+                positive_controls[seq.sequence_id] = CrossReactivityResult(
+                    binder_id=seq.sequence_id,
+                    decoy_id="TARGET",
+                    predicted_affinity=-10.0,  # Strong binding expected
+                    plddt_interface=85.0,
+                    binds_decoy=True,
+                )
+        
+        # Mock decoy results
         for seq in sequences:
             seq_results = []
             for decoy in decoys:
@@ -521,16 +556,16 @@ def _run_cross_reactivity_check(
                     seq, decoy, config, f"{output_dir}/{seq.sequence_id}/{decoy.decoy_id}"
                 )
                 seq_results.append(result)
-            results[seq.sequence_id] = seq_results
-        return results
+            decoy_results[seq.sequence_id] = seq_results
+        return positive_controls, decoy_results
 
     try:
         return check_cross_reactivity_parallel.remote(
-            sequences, decoys, config, output_dir
+            sequences, decoys, config, output_dir, target
         )
     except Exception as e:
         print(f"Chai-1 cross-reactivity check failed: {e}")
-        return {}
+        return {}, {}
 
 
 def _create_empty_result(

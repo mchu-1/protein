@@ -558,6 +558,7 @@ def download_decoy_structures(
     gpu="A100",  # A100 for accurate docking predictions
     timeout=900,  # 15 min per prediction
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
+    max_containers=2,  # Limit to 2 concurrent A100 workers to control costs
 )
 def run_chai1(
     sequence: SequenceDesign,
@@ -811,54 +812,89 @@ def check_cross_reactivity_parallel(
     decoys: list[DecoyHit],
     config: Chai1Config,
     base_output_dir: str,
-) -> dict[str, list[CrossReactivityResult]]:
+    target: Optional[TargetProtein] = None,
+) -> tuple[dict[str, CrossReactivityResult], dict[str, list[CrossReactivityResult]]]:
     """
     Check cross-reactivity for multiple sequences against decoys in parallel.
+    
+    Optionally includes the target as a positive control to verify binding.
+    
+    Note: Concurrency is limited to 2 A100 workers via run_chai1's max_containers.
 
     Args:
         sequences: List of binder sequences
         decoys: List of decoy structures
         config: Chai-1 configuration
         base_output_dir: Base output directory
+        target: Optional target protein for positive control check
 
     Returns:
-        Dictionary mapping sequence_id to list of CrossReactivityResults
+        Tuple of:
+        - Dictionary mapping sequence_id to positive control result (target binding)
+        - Dictionary mapping sequence_id to list of CrossReactivityResults (decoys)
     """
-    num_pairs = len(sequences) * len(decoys)
-    print(f"Chai-1: checking {len(sequences)} sequences × {len(decoys)} decoys = {num_pairs} pairs")
+    positive_control_results: dict[str, CrossReactivityResult] = {}
+    decoy_results: dict[str, list[CrossReactivityResult]] = {}
     
-    # Limit parallelism to avoid overwhelming GPU resources
-    # Process in batches of max 4 concurrent A100 jobs
-    MAX_CONCURRENT = 4
-    
-    # Prepare all combinations
-    args = [
-        (seq, decoy, config, f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}")
-        for seq in sequences
-        for decoy in decoys
-    ]
-    
-    results_by_sequence: dict[str, list[CrossReactivityResult]] = {}
-    
-    # Process in batches to limit concurrency
-    for batch_start in range(0, len(args), MAX_CONCURRENT):
-        batch_end = min(batch_start + MAX_CONCURRENT, len(args))
-        batch_args = args[batch_start:batch_end]
+    # Step 1: Run positive control (binder vs target) if target provided
+    if target is not None:
+        print(f"Chai-1 Positive Control: checking {len(sequences)} sequences against target")
         
-        print(f"  Processing batch {batch_start // MAX_CONCURRENT + 1}/{(len(args) + MAX_CONCURRENT - 1) // MAX_CONCURRENT}...")
+        # Create a DecoyHit for the target (reusing the structure)
+        target_as_decoy = DecoyHit(
+            decoy_id="TARGET",
+            pdb_path=target.pdb_path,
+            evalue=0.0,
+            tm_score=1.0,
+            aligned_length=0,
+            sequence_identity=1.0,
+        )
         
-        # Use starmap for this batch
-        batch_results = list(run_chai1.starmap(batch_args))
+        # Run positive control checks
+        pos_ctrl_args = [
+            (seq, target_as_decoy, config, f"{base_output_dir}/{seq.sequence_id}/positive_control")
+            for seq in sequences
+        ]
+        
+        pos_ctrl_results = list(run_chai1.starmap(pos_ctrl_args))
+        
+        for result in pos_ctrl_results:
+            if result is not None:
+                positive_control_results[result.binder_id] = result
+                status = "✓ BINDS" if result.plddt_interface > 50 else "✗ NO BINDING"
+                print(f"  {result.binder_id}: pLDDT={result.plddt_interface:.1f} {status}")
+        
+        print(f"  Positive control: {len(positive_control_results)}/{len(sequences)} sequences bind target")
+    
+    # Step 2: Run decoy checks
+    if decoys:
+        num_pairs = len(sequences) * len(decoys)
+        print(f"Chai-1 Decoy Check: {len(sequences)} sequences × {len(decoys)} decoys = {num_pairs} pairs")
+        print(f"  (concurrency limited to 2 A100 workers)")
+        
+        # Prepare all combinations for starmap
+        args = [
+            (seq, decoy, config, f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}")
+            for seq in sequences
+            for decoy in decoys
+        ]
+        
+        # Use starmap - concurrency is controlled by run_chai1's max_containers=2
+        all_results = list(run_chai1.starmap(args))
         
         # Group results by sequence
-        for result in batch_results:
+        for result in all_results:
             if result is not None:
-                if result.binder_id not in results_by_sequence:
-                    results_by_sequence[result.binder_id] = []
-                results_by_sequence[result.binder_id].append(result)
+                if result.binder_id not in decoy_results:
+                    decoy_results[result.binder_id] = []
+                decoy_results[result.binder_id].append(result)
 
-    print(f"  Completed: {sum(len(v) for v in results_by_sequence.values())} successful predictions")
-    return results_by_sequence
+        total_success = sum(len(v) for v in decoy_results.values())
+        print(f"  Decoy check completed: {total_success}/{num_pairs} successful predictions")
+    
+    return positive_control_results, decoy_results
+
+
 
 
 # =============================================================================

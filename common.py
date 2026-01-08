@@ -148,6 +148,12 @@ chai1_image = (
         # Install chai_lab after torch
         "pip install chai_lab",
     )
+    .env({
+        # Suppress pandera deprecation warning from chai_lab dependencies
+        "DISABLE_PANDERA_IMPORT_WARNING": "True",
+        # Reduce verbosity of progress bars
+        "TQDM_DISABLE": "1",
+    })
 )
 
 # FoldSeek image for proteome scanning
