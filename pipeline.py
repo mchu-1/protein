@@ -560,6 +560,106 @@ def _create_empty_result(
 # =============================================================================
 
 
+def print_dry_run_summary(config: PipelineConfig) -> None:
+    """
+    Print a detailed human-readable overview of deployment parameters and costs.
+    """
+    num_backbones = config.rfdiffusion.num_designs
+    num_sequences_per_backbone = config.proteinmpnn.num_sequences
+    total_sequences = num_backbones * num_sequences_per_backbone
+    num_decoys = config.foldseek.max_hits
+
+    # Assume 50% pass Boltz-2 validation (same assumption as estimate_cost)
+    passing_sequences = int(total_sequences * 0.5)
+    chai1_pairs = passing_sequences * num_decoys
+
+    # Calculate per-step costs
+    rfdiffusion_hours = (STEP_RUNTIMES["rfdiffusion"] * num_backbones) / 3600
+    rfdiffusion_cost = rfdiffusion_hours * GPU_COSTS["A10G"]
+
+    proteinmpnn_hours = (STEP_RUNTIMES["proteinmpnn"] * num_backbones) / 3600
+    proteinmpnn_cost = proteinmpnn_hours * GPU_COSTS["L4"]
+
+    boltz2_hours = (STEP_RUNTIMES["boltz2"] * total_sequences) / 3600
+    boltz2_cost = boltz2_hours * GPU_COSTS["A100"]
+
+    foldseek_cost = 0.01
+
+    chai1_hours = (STEP_RUNTIMES["chai1"] * chai1_pairs) / 3600
+    chai1_cost = chai1_hours * GPU_COSTS["A100"]
+
+    total_cost = rfdiffusion_cost + proteinmpnn_cost + boltz2_cost + foldseek_cost + chai1_cost
+
+    # Estimate total runtime (sequential worst-case)
+    est_runtime_sec = (
+        STEP_RUNTIMES["rfdiffusion"] * num_backbones
+        + STEP_RUNTIMES["proteinmpnn"] * num_backbones
+        + STEP_RUNTIMES["boltz2"] * total_sequences
+        + STEP_RUNTIMES["foldseek"]
+        + STEP_RUNTIMES["chai1"] * chai1_pairs
+    )
+    est_runtime_min = est_runtime_sec / 60
+
+    print("=" * 70)
+    print("  DRY RUN - DEPLOYMENT PREVIEW")
+    print("=" * 70)
+    print()
+    print("┌─────────────────────────────────────────────────────────────────────┐")
+    print("│  PIPELINE CONFIGURATION                                             │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    print(f"│  Target PDB:           {config.target.pdb_path:<43} │")
+    print(f"│  Chain ID:             {config.target.chain_id:<43} │")
+    print(f"│  Hotspot Residues:     {str(config.target.hotspot_residues):<43} │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    print(f"│  Backbone Designs:     {num_backbones:<43} │")
+    print(f"│  Sequences/Backbone:   {num_sequences_per_backbone:<43} │")
+    print(f"│  Total Sequences:      {total_sequences:<43} │")
+    print(f"│  Max Decoys:           {num_decoys:<43} │")
+    print(f"│  Budget Limit:         ${config.max_compute_usd:<42.2f} │")
+    print("└─────────────────────────────────────────────────────────────────────┘")
+    print()
+    print("┌─────────────────────────────────────────────────────────────────────┐")
+    print("│  PHASE 1: GENERATION                                                │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    print(f"│  RFDiffusion     │ GPU: A10G   │ {num_backbones:>3} runs × ~60s  │  ${rfdiffusion_cost:>6.3f}  │")
+    print(f"│  ProteinMPNN     │ GPU: L4     │ {num_backbones:>3} runs × ~15s  │  ${proteinmpnn_cost:>6.3f}  │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    print("│  PHASE 2: VALIDATION                                                │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    print(f"│  Boltz-2         │ GPU: A100   │ {total_sequences:>3} runs × ~120s │  ${boltz2_cost:>6.3f}  │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    print("│  PHASE 3: SELECTIVITY                                               │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    print(f"│  FoldSeek        │ CPU         │   1 run  × ~30s  │  ${foldseek_cost:>6.3f}  │")
+    print(f"│  Chai-1          │ GPU: A100   │ {chai1_pairs:>3} runs × ~90s  │  ${chai1_cost:>6.3f}  │")
+    print("└─────────────────────────────────────────────────────────────────────┘")
+    print()
+    print("┌─────────────────────────────────────────────────────────────────────┐")
+    print("│  COST SUMMARY                                                       │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    budget_status = "✓ WITHIN BUDGET" if total_cost <= config.max_compute_usd else "⚠ EXCEEDS BUDGET"
+    print(f"│  Estimated Total Cost:      ${total_cost:<8.2f}  {budget_status:<21} │")
+    print(f"│  Estimated Runtime:         ~{est_runtime_min:<6.0f} minutes (sequential)        │")
+    print(f"│  Budget Limit:              ${config.max_compute_usd:<8.2f}                           │")
+    print("└─────────────────────────────────────────────────────────────────────┘")
+    print()
+
+    if total_cost > config.max_compute_usd:
+        scale_factor = config.max_compute_usd / total_cost
+        suggested_designs = max(1, int(num_backbones * scale_factor))
+        suggested_sequences = max(1, int(num_sequences_per_backbone * scale_factor))
+        print("┌─────────────────────────────────────────────────────────────────────┐")
+        print("│  ⚠ BUDGET WARNING                                                   │")
+        print("├─────────────────────────────────────────────────────────────────────┤")
+        print(f"│  Consider reducing designs to ~{suggested_designs} and sequences to ~{suggested_sequences}           │")
+        print(f"│  to stay within the ${config.max_compute_usd:.2f} budget.                                │")
+        print("└─────────────────────────────────────────────────────────────────────┘")
+        print()
+
+    print("To run this pipeline, remove the --dry-run flag.")
+    print()
+
+
 @app.local_entrypoint()
 def main(
     target_pdb: str,
@@ -569,6 +669,7 @@ def main(
     num_sequences: int = 4,
     use_mocks: bool = False,
     max_budget: float = 5.0,
+    dry_run: bool = False,
 ):
     """
     Run the protein binder design pipeline from command line.
@@ -581,6 +682,7 @@ def main(
         num_sequences: Sequences per backbone (default: 4)
         use_mocks: Use mock implementations for testing (default: False)
         max_budget: Maximum compute budget in USD (default: 5.0)
+        dry_run: Preview deployment parameters and costs without running (default: False)
     """
     # Parse hotspot residues
     hotspots = [int(r.strip()) for r in hotspot_residues.split(",")]
@@ -600,6 +702,11 @@ def main(
         chai1=Chai1Config(),
         max_compute_usd=max_budget,
     )
+
+    # Dry run mode: print summary and exit
+    if dry_run:
+        print_dry_run_summary(config)
+        return None
 
     print("=" * 60)
     print("PROTEIN BINDER DESIGN PIPELINE")

@@ -60,6 +60,13 @@ uv run modal token new
 ### Command Line
 
 ```bash
+# Preview deployment parameters and estimated cost (no execution)
+uv run modal run pipeline.py --target-pdb /path/to/target.pdb \
+    --hotspot-residues "10,15,20,25" \
+    --num-designs 5 \
+    --num-sequences 4 \
+    --dry-run
+
 # Run with Modal CLI
 uv run modal run pipeline.py --target-pdb /path/to/target.pdb \
     --hotspot-residues "10,15,20,25" \
