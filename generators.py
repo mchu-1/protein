@@ -97,6 +97,8 @@ def run_rfdiffusion(
             f"contigmap.contigs={contigmap}",
             f"ppi.hotspot_res=[{hotspot_str}]",
             f"diffuser.T={config.num_diffusion_steps}",
+            f"denoiser.noise_scale_ca={config.noise_scale}",
+            f"denoiser.noise_scale_frame={config.noise_scale}",
             f"inference.model_directory_path={model_dir}",
         ]
 

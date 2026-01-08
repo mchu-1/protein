@@ -320,12 +320,12 @@ def run_foldseek(
         # Download database if it doesn't exist
         if not os.path.exists(db_path):
             print(f"FoldSeek database not found at {db_path}, downloading...")
-            # Download the database using foldseek's built-in downloader
-            # Use Alphafold/Swiss-Prot which is smaller (~5GB) than pdb100 (~10GB)
+            # Download PDB database - entries can be downloaded from RCSB
+            # (Alphafold entries often aren't in public AlphaFold DB)
             download_cmd = [
                 "foldseek",
                 "databases",
-                "Alphafold/Swiss-Prot",
+                "PDB",
                 db_path,
                 f"{db_dir}/tmp",
             ]
@@ -475,56 +475,64 @@ def download_decoy_structures(
     os.makedirs(output_dir, exist_ok=True)
     valid_decoys: list[DecoyHit] = []
 
+    # Use Biopython's PDBList for robust downloads
+    from Bio.PDB import PDBList
+    pdbl = PDBList(verbose=False)
+
     for decoy in decoys:
         try:
             decoy_id = decoy.decoy_id
-            pdb_path = f"{output_dir}/{decoy_id}.pdb"
-            cif_path = f"{output_dir}/{decoy_id}.cif"
-
-            if os.path.exists(pdb_path) or os.path.exists(cif_path):
-                structure_path = pdb_path if os.path.exists(pdb_path) else cif_path
-            elif decoy_id.startswith("AF-"):
-                # AlphaFold entry (format: AF-P16871-F1-model_v6 or AF-P16871-2-F1-model_v6)
-                # Extract UniProt ID (second part after AF-)
+            
+            # Extract 4-letter PDB code from FoldSeek ID
+            # Formats: 7opb-assembly3_C -> 7OPB, 4HN6_A -> 4HN6, AF-P16871-F1 -> skip
+            if decoy_id.startswith("AF-"):
+                # AlphaFold entry - extract UniProt ID
                 parts = decoy_id.split("-")
                 if len(parts) >= 2:
-                    # Handle both AF-P16871-F1 and AF-P16871-2-F1 (isoforms)
                     uniprot_id = parts[1]
-                    # Try v4 first (most common), then other versions
+                    pdb_path = f"{output_dir}/{uniprot_id}.pdb"
+                    # Try AlphaFold EBI database
                     downloaded = False
                     for version in ["v4", "v3", "v2"]:
                         url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_{version}.pdb"
                         try:
                             urllib.request.urlretrieve(url, pdb_path)
-                            structure_path = pdb_path
                             downloaded = True
                             break
                         except Exception:
                             continue
                     if not downloaded:
-                        # Try CIF format as last resort
-                        url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.cif"
-                        try:
-                            urllib.request.urlretrieve(url, cif_path)
-                            structure_path = cif_path
-                            downloaded = True
-                        except Exception:
-                            print(f"Could not download AlphaFold structure for {uniprot_id}")
-                            continue
+                        print(f"Could not download AlphaFold structure for {uniprot_id}")
+                        continue
                 else:
                     continue
             else:
-                # Standard PDB entry (format like "1ABC_A")
-                pdb_id = decoy_id.split("_")[0].lower()
-                url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
-                urllib.request.urlretrieve(url, pdb_path)
-                structure_path = pdb_path
+                # PDB entry - extract 4-letter code
+                # Format: 7opb-assembly3_C or 4HN6_A or just 4HN6
+                pdb_code = decoy_id.split("-")[0].split("_")[0].lower()[:4]
+                pdb_path = f"{output_dir}/{pdb_code}.pdb"
+                
+                if not os.path.exists(pdb_path):
+                    # Use Biopython PDBList for robust download
+                    try:
+                        downloaded_file = pdbl.retrieve_pdb_file(
+                            pdb_code, 
+                            pdir=output_dir, 
+                            file_format="pdb"
+                        )
+                        if downloaded_file and os.path.exists(downloaded_file):
+                            # Rename to consistent format
+                            os.rename(downloaded_file, pdb_path)
+                    except Exception as e:
+                        # Fallback to direct URL
+                        url = f"https://files.rcsb.org/download/{pdb_code}.pdb"
+                        urllib.request.urlretrieve(url, pdb_path)
 
-            if os.path.exists(structure_path):
+            if os.path.exists(pdb_path):
                 valid_decoys.append(
                     DecoyHit(
                         decoy_id=decoy_id,
-                        pdb_path=structure_path,
+                        pdb_path=pdb_path,
                         evalue=decoy.evalue,
                         tm_score=decoy.tm_score,
                         aligned_length=decoy.aligned_length,
@@ -710,6 +718,7 @@ def _parse_chai1_metrics(output_prefix: str) -> Optional[dict]:
 @app.function(
     image=boltz2_image,
     timeout=1800,  # 30 minutes - structure prediction takes time
+    volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def validate_sequences_parallel(
     sequences: list[SequenceDesign],
