@@ -1,6 +1,6 @@
 <proteins>
 <aim>To generate and simulate protein binders in-silico.</aim>
-<objective>max(P(functional))</objective> # in the wet lab
+<objective:binder>max(P(functional))</objective> # in the wet lab
 <input>A target protein.</input>
 <output>A _specific_ and _selective protein binder.</output>
 <language>Python</language>>
