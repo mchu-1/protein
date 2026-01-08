@@ -12,6 +12,5 @@
   # Selectivity
   - **FoldSeek**: Flagging similar structures in the proteome to the target.
   - **Chai-1**: Binder-proteome affinity (versus similar structures).
-  
 </tools>
 </proteins>
