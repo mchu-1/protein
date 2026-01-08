@@ -22,7 +22,6 @@ from typing import Optional
 import modal
 
 from common import (
-    APP_NAME,
     DATA_PATH,
     WEIGHTS_PATH,
     BackboneDesign,
@@ -42,6 +41,7 @@ from common import (
     TargetProtein,
     ValidationResult,
     ValidationStatus,
+    app,
     base_image,
     data_volume,
     generate_design_id,
@@ -66,20 +66,7 @@ from validators import (
     validate_sequences_parallel,
 )
 
-# =============================================================================
-# Modal App Definition
-# =============================================================================
-
-app = modal.App(APP_NAME)
-
-# Add local Python modules to the base image so they're available in Modal containers
-base_image_with_code = base_image.add_local_file(
-    "common.py", remote_path="/root/common.py"
-).add_local_file(
-    "generators.py", remote_path="/root/generators.py"
-).add_local_file(
-    "validators.py", remote_path="/root/validators.py"
-)
+# Note: Local modules are added to all images in common.py via _add_local_modules()
 
 # =============================================================================
 # Cost Estimation
@@ -158,7 +145,7 @@ def estimate_cost(config: PipelineConfig) -> float:
 
 
 @app.function(
-    image=base_image_with_code,
+    image=base_image,
     timeout=3600,  # 1 hour max
     volumes={DATA_PATH: data_volume},
     min_containers=1,  # Keep orchestrator warm for quick starts
@@ -669,6 +656,34 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     print()
 
 
+@app.function(
+    image=base_image,
+    volumes={DATA_PATH: data_volume},
+    timeout=60,
+)
+def upload_target_pdb(local_pdb_content: str, filename: str) -> str:
+    """
+    Upload target PDB content to the data volume.
+    
+    Args:
+        local_pdb_content: Content of the PDB file
+        filename: Original filename for naming
+        
+    Returns:
+        Path to the uploaded file on the data volume
+    """
+    import os
+    target_dir = f"{DATA_PATH}/targets"
+    os.makedirs(target_dir, exist_ok=True)
+    
+    remote_path = f"{target_dir}/{filename}"
+    with open(remote_path, "w") as f:
+        f.write(local_pdb_content)
+    
+    data_volume.commit()
+    return remote_path
+
+
 @app.local_entrypoint()
 def main(
     target_pdb: str,
@@ -693,13 +708,24 @@ def main(
         max_budget: Maximum compute budget in USD (default: 5.0)
         dry_run: Preview deployment parameters and costs without running (default: False)
     """
+    from pathlib import Path
+    
     # Parse hotspot residues
     hotspots = [int(r.strip()) for r in hotspot_residues.split(",")]
 
-    # Build configuration
+    # Read and upload target PDB to Modal volume
+    local_path = Path(target_pdb)
+    if not local_path.exists():
+        raise FileNotFoundError(f"Target PDB file not found: {target_pdb}")
+    
+    pdb_content = local_path.read_text()
+    remote_pdb_path = upload_target_pdb.remote(pdb_content, local_path.name)
+    print(f"Uploaded target PDB to: {remote_pdb_path}")
+
+    # Build configuration with remote path
     config = PipelineConfig(
         target=TargetProtein(
-            pdb_path=target_pdb,
+            pdb_path=remote_pdb_path,
             chain_id=chain_id,
             hotspot_residues=hotspots,
             name="target",
@@ -720,7 +746,7 @@ def main(
     print("=" * 60)
     print("PROTEIN BINDER DESIGN PIPELINE")
     print("=" * 60)
-    print(f"Target PDB: {target_pdb}")
+    print(f"Target PDB: {target_pdb} -> {remote_pdb_path}")
     print(f"Hotspot residues: {hotspots}")
     print(f"Designs: {num_designs} backbones × {num_sequences} sequences")
     print(f"Budget: ${max_budget:.2f}")

@@ -17,7 +17,6 @@ from typing import Optional
 import modal
 
 from common import (
-    APP_NAME,
     DATA_PATH,
     WEIGHTS_PATH,
     BackboneDesign,
@@ -25,6 +24,7 @@ from common import (
     RFDiffusionConfig,
     SequenceDesign,
     TargetProtein,
+    app,
     data_volume,
     generate_design_id,
     proteinmpnn_image,
@@ -32,12 +32,6 @@ from common import (
     weights_volume,
     write_fasta,
 )
-
-# =============================================================================
-# Modal App Definition
-# =============================================================================
-
-app = modal.App(APP_NAME)
 
 # =============================================================================
 # RFDiffusion - Backbone Generation
@@ -75,26 +69,35 @@ def run_rfdiffusion(
         f"{target.chain_id}{res}" for res in target.hotspot_residues
     )
 
+    # Determine target chain residue range from PDB file
+    target_residue_count = _get_chain_residue_count(target.pdb_path, target.chain_id)
+    
     # Build contigmap: defines binder length range and target interaction
-    # Format: [binder_length/target_chain_start-target_chain_end]
-    contigmap = f"[{config.binder_length_min}-{config.binder_length_max}/0 {target.chain_id}1-1000]"
+    # Format: [binder_length/0 target_chain_residues]
+    contigmap = f"[{config.binder_length_min}-{config.binder_length_max}/0 {target.chain_id}1-{target_residue_count}]"
 
     designs: list[BackboneDesign] = []
 
     try:
         # RFDiffusion inference command
+        # The official container has models at /app/RFdiffusion/models or mounted at WEIGHTS_PATH
+        model_dir = (
+            f"{WEIGHTS_PATH}/rfdiffusion"
+            if os.path.exists(f"{WEIGHTS_PATH}/rfdiffusion")
+            else "/app/RFdiffusion/models"
+        )
+        # Run inference script directly (not as module) since RFDiffusion isn't structured for -m
+        inference_script = "/app/RFdiffusion/scripts/run_inference.py"
         cmd = [
             "python",
-            "-m",
-            "rfdiffusion.run_inference",
+            inference_script,
             f"inference.input_pdb={target.pdb_path}",
             f"inference.output_prefix={output_dir}/design",
             f"inference.num_designs={config.num_designs}",
             f"contigmap.contigs={contigmap}",
             f"ppi.hotspot_res=[{hotspot_str}]",
             f"diffuser.T={config.num_diffusion_steps}",
-            f"inference.noise_scale={config.noise_scale}",
-            f"inference.model_directory_path={WEIGHTS_PATH}/rfdiffusion",
+            f"inference.model_directory_path={model_dir}",
         ]
 
         result = subprocess.run(
@@ -208,6 +211,26 @@ def _count_binder_residues(pdb_path: str, chain_id: str = "B") -> int:
     return count
 
 
+def _get_chain_residue_count(pdb_path: str, chain_id: str) -> int:
+    """Get the maximum residue number for a chain in a PDB file."""
+    max_res = 0
+    try:
+        with open(pdb_path, "r") as f:
+            for line in f:
+                if line.startswith("ATOM") and len(line) > 25:
+                    if line[21] == chain_id:
+                        try:
+                            res_num = int(line[22:26].strip())
+                            max_res = max(max_res, res_num)
+                        except ValueError:
+                            pass
+    except Exception:
+        pass
+    
+    # Default to a reasonable number if we couldn't parse
+    return max_res if max_res > 0 else 200
+
+
 # =============================================================================
 # ProteinMPNN - Sequence Design
 # =============================================================================
@@ -243,12 +266,19 @@ def run_proteinmpnn(
         # Prepare chains to design (design binder chain B, fix target chain A)
         chains_to_design = "B"
 
+        # ProteinMPNN path from environment (set in image) or fallback
+        proteinmpnn_path = os.environ.get("PROTEINMPNN_PATH", "/app/ProteinMPNN")
+        
         # ProteinMPNN command
+        # Note: ProteinMPNN designs all chains by default; use --pdb_path_chains to specify
+        # which chains to include. For binder design, we include both target (A) and binder (B)
         cmd = [
             "python",
-            f"{WEIGHTS_PATH}/ProteinMPNN/protein_mpnn_run.py",
+            f"{proteinmpnn_path}/protein_mpnn_run.py",
             "--pdb_path",
             backbone.pdb_path,
+            "--pdb_path_chains",
+            chains_to_design,  # Only design chain B (binder), chain A (target) is fixed
             "--out_folder",
             output_dir,
             "--num_seq_per_target",
@@ -257,10 +287,10 @@ def run_proteinmpnn(
             str(config.temperature),
             "--backbone_noise",
             str(config.backbone_noise),
-            "--chains_to_design",
-            chains_to_design,
             "--model_name",
             "v_48_020",  # Standard ProteinMPNN model
+            "--path_to_model_weights",
+            f"{proteinmpnn_path}/vanilla_model_weights",
         ]
 
         result = subprocess.run(

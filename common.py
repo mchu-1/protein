@@ -30,6 +30,9 @@ data_volume = modal.Volume.from_name("binder-data", create_if_missing=True)
 WEIGHTS_PATH = "/weights"
 DATA_PATH = "/data"
 
+# Single app instance shared across all modules
+app = modal.App(APP_NAME)
+
 # =============================================================================
 # Base Modal Images
 # =============================================================================
@@ -46,32 +49,55 @@ base_image = (
     )
 )
 
-# RFDiffusion image with PyTorch and SE3 dependencies
+# RFDiffusion image
+# The official rosettacommons/rfdiffusion image uses Python 3.9, but Modal requires 3.10+.
+# Solution: Use from_registry with add_python to overlay 3.11, then reinstall dependencies
+# under the new Python interpreter so they're available at runtime.
+# Note: The container has a venv at /app/RFdiffusion/.venv that we must deactivate.
 rfdiffusion_image = (
-    modal.Image.debian_slim(python_version="3.10")
-    .apt_install("git", "wget", "build-essential")
+    modal.Image.from_registry(
+        "rosettacommons/rfdiffusion:latest",
+        add_python="3.11",  # Overlay Python 3.11 for Modal compatibility
+    )
+    .entrypoint([])  # Clear the container's ENTRYPOINT to avoid conflicts with Modal
+    # Deactivate venv BEFORE pip installs by setting PATH to use system Python
+    .env({
+        "VIRTUAL_ENV": "",
+        "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+        "DGLBACKEND": "pytorch",
+    })
+    # Reinstall RFDiffusion's core dependencies under Python 3.11
+    # These are already in the container but installed for Python 3.9
     .pip_install(
-        "torch>=2.0.0",
-        "numpy>=1.24.0",
+        "torch==2.1.0",  # Pin torch for DGL/CUDA compatibility
+        "numpy>=1.24.0,<2.0.0",  # RFDiffusion requires numpy <2
         "scipy>=1.11.0",
         "biopython>=1.81",
         "pydantic>=2.0.0",
         "hydra-core>=1.3.0",
         "omegaconf>=2.3.0",
-        "icecream>=2.1.0",
-        "e3nn>=0.5.0",
-        "wandb>=0.15.0",
-        "opt_einsum>=3.3.0",
+        "e3nn",
+        "opt_einsum",
+        "icecream",
+        "pyrsistent",  # Required by RFDiffusion symmetry module
     )
+    # Install DGL with CUDA 12.1 support (must match torch CUDA version)
     .run_commands(
-        "pip install git+https://github.com/RosettaCommons/RFdiffusion.git@main"
+        "pip install dgl -f https://data.dgl.ai/wheels/torch-2.1/cu121/repo.html"
+    )
+    # Install se3-transformer and rfdiffusion from the container's source
+    .run_commands(
+        "pip install /app/RFdiffusion/env/SE3Transformer",
+        "pip install -e /app/RFdiffusion",
     )
 )
 
-# ProteinMPNN image (lighter weight)
+# ProteinMPNN image
+# Downloads ProteinMPNN from GitHub and installs dependencies
+PROTEINMPNN_PATH = "/app/ProteinMPNN"
 proteinmpnn_image = (
     modal.Image.debian_slim(python_version="3.10")
-    .apt_install("git")
+    .apt_install("git", "git-lfs", "wget")
     .pip_install(
         "torch>=2.0.0",
         "numpy>=1.24.0",
@@ -79,24 +105,29 @@ proteinmpnn_image = (
         "biopython>=1.81",
         "pydantic>=2.0.0",
     )
+    # Clone ProteinMPNN repository (includes model weights)
+    .run_commands(
+        "git lfs install",
+        f"git clone https://github.com/dauparas/ProteinMPNN.git {PROTEINMPNN_PATH}",
+        f"ls -la {PROTEINMPNN_PATH}/vanilla_model_weights/",  # Verify weights exist
+    )
+    .env({"PROTEINMPNN_PATH": PROTEINMPNN_PATH})
 )
 
 # Boltz-2 image with structure prediction dependencies
+# Uses the boltz CLI for structure prediction
+# Based on Modal's working example: https://modal.com/docs/examples/boltz1
 boltz2_image = (
-    modal.Image.debian_slim(python_version="3.10")
+    modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "wget", "build-essential")
     .pip_install(
-        "torch>=2.0.0",
-        "numpy>=1.24.0",
-        "scipy>=1.11.0",
+        "boltz==0.4.0",  # Use stable version compatible with Modal
         "biopython>=1.81",
         "pydantic>=2.0.0",
-        "einops>=0.7.0",
-        "fair-esm>=2.0.0",
     )
 )
 
-# Chai-1 image for docking
+# Chai-1 image for docking/structure prediction
 chai1_image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("git", "wget", "build-essential")
@@ -107,13 +138,14 @@ chai1_image = (
         "biopython>=1.81",
         "pydantic>=2.0.0",
         "einops>=0.7.0",
+        "chai_lab",  # Chai-1 structure prediction
     )
 )
 
 # FoldSeek image for proteome scanning
 foldseek_image = (
     modal.Image.debian_slim(python_version="3.10")
-    .apt_install("wget", "tar")
+    .apt_install("wget", "tar", "curl")
     .run_commands(
         "wget https://mmseqs.com/foldseek/foldseek-linux-avx2.tar.gz",
         "tar xzf foldseek-linux-avx2.tar.gz",
@@ -127,6 +159,25 @@ foldseek_image = (
         "pydantic>=2.0.0",
     )
 )
+
+
+def _add_local_modules(image: modal.Image) -> modal.Image:
+    """Add local Python modules to a Modal image for cross-module imports."""
+    return (
+        image
+        .add_local_file("common.py", remote_path="/root/common.py")
+        .add_local_file("generators.py", remote_path="/root/generators.py")
+        .add_local_file("validators.py", remote_path="/root/validators.py")
+    )
+
+
+# Apply local modules to all images so functions can import each other
+base_image = _add_local_modules(base_image)
+rfdiffusion_image = _add_local_modules(rfdiffusion_image)
+proteinmpnn_image = _add_local_modules(proteinmpnn_image)
+boltz2_image = _add_local_modules(boltz2_image)
+chai1_image = _add_local_modules(chai1_image)
+foldseek_image = _add_local_modules(foldseek_image)
 
 
 # =============================================================================

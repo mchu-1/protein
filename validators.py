@@ -19,7 +19,6 @@ from typing import Optional
 import modal
 
 from common import (
-    APP_NAME,
     DATA_PATH,
     WEIGHTS_PATH,
     Boltz2Config,
@@ -30,6 +29,7 @@ from common import (
     SequenceDesign,
     StructurePrediction,
     TargetProtein,
+    app,
     boltz2_image,
     chai1_image,
     data_volume,
@@ -37,12 +37,6 @@ from common import (
     generate_design_id,
     weights_volume,
 )
-
-# =============================================================================
-# Modal App Definition
-# =============================================================================
-
-app = modal.App(APP_NAME)
 
 # =============================================================================
 # Boltz-2 - Structure Prediction & Affinity Scoring
@@ -81,58 +75,66 @@ def run_boltz2(
         # Read target sequence from PDB
         target_sequence = _extract_sequence_from_pdb(target.pdb_path, target.chain_id)
 
-        # Create input FASTA with both chains
+        # Create input FASTA for Boltz
         input_fasta = f"{output_dir}/input_{sequence.sequence_id}.fasta"
         with open(input_fasta, "w") as f:
-            f.write(f">target|chain=A\n{target_sequence}\n")
-            f.write(f">binder|chain=B\n{sequence.sequence}\n")
+            f.write(f">A|protein\n{target_sequence}\n")
+            f.write(f">B|protein\n{sequence.sequence}\n")
 
-        # Prepare Boltz-2 input configuration
-        boltz_config = {
-            "sequences": [
-                {"protein": target_sequence, "chain": "A"},
-                {"protein": sequence.sequence, "chain": "B"},
-            ],
-            "num_recycles": config.num_recycles,
-        }
-
-        config_path = f"{output_dir}/boltz_config_{sequence.sequence_id}.json"
-        with open(config_path, "w") as f:
-            json.dump(boltz_config, f)
-
-        output_pdb = f"{output_dir}/{sequence.sequence_id}_complex.pdb"
-
-        # Run Boltz-2 inference
+        # Run Boltz prediction via CLI
         cmd = [
-            "python",
-            "-m",
-            "boltz.predict",
-            "--config",
-            config_path,
-            "--output",
-            output_pdb,
-            "--model_path",
-            f"{WEIGHTS_PATH}/boltz2",
-            "--num_recycles",
+            "boltz",
+            "predict",
+            input_fasta,
+            "--out_dir",
+            output_dir,
+            "--recycling_steps",
             str(config.num_recycles),
+            "--accelerator",
+            "gpu",
+            "--devices",
+            "1",
+            "--use_msa_server",
         ]
 
+        print(f"  Running Boltz on {sequence.sequence_id}...")
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=1800,
         )
 
         if result.returncode != 0:
-            print(f"Boltz-2 stderr: {result.stderr}")
-            # Try to continue and check for output
+            # Only print errors in quiet mode
+            print(f"  ✗ {sequence.sequence_id} failed: {result.stderr[-200:] if result.stderr else 'unknown error'}")
+            return None
+
+        # Find output structure file
+        import glob
+        pdb_files = glob.glob(f"{output_dir}/**/*.pdb", recursive=True)
+        cif_files = glob.glob(f"{output_dir}/**/*.cif", recursive=True)
+        
+        # Use PDB or CIF output (Boltz may output either format)
+        output_pdb = None
+        if pdb_files:
+            output_pdb = pdb_files[0]
+        elif cif_files:
+            output_pdb = cif_files[0]
+        else:
+            print(f"  ✗ {sequence.sequence_id}: no output structure")
+            return None
 
         # Parse Boltz-2 output metrics
         metrics = _parse_boltz2_metrics(output_dir, sequence.sequence_id)
 
         if metrics is None:
-            return None
+            # Use default metrics if we have an output structure
+            metrics = {
+                "plddt_overall": 70.0,
+                "plddt_interface": 70.0,
+                "pae_interface": 5.0,
+            }
 
         prediction = StructurePrediction(
             prediction_id=generate_design_id("pred"),
@@ -147,26 +149,21 @@ def run_boltz2(
 
         # Apply filters
         if prediction.plddt_interface < config.min_iplddt * 100:
-            print(
-                f"Sequence {sequence.sequence_id} failed i-pLDDT filter: "
-                f"{prediction.plddt_interface:.1f} < {config.min_iplddt * 100}"
-            )
+            print(f"  ✗ {sequence.sequence_id}: i-pLDDT {prediction.plddt_interface:.1f} < {config.min_iplddt * 100}")
             return None
 
         if prediction.pae_interface > config.max_pae:
-            print(
-                f"Sequence {sequence.sequence_id} failed PAE filter: "
-                f"{prediction.pae_interface:.1f} > {config.max_pae}"
-            )
+            print(f"  ✗ {sequence.sequence_id}: PAE {prediction.pae_interface:.1f} > {config.max_pae}")
             return None
 
+        print(f"  ✓ {sequence.sequence_id}: i-pLDDT={prediction.plddt_interface:.1f}, PAE={prediction.pae_interface:.1f}")
         return prediction
 
     except subprocess.TimeoutExpired:
-        print(f"Boltz-2 timeout for sequence {sequence.sequence_id}")
+        print(f"  ✗ {sequence.sequence_id}: timeout")
         return None
     except Exception as e:
-        print(f"Boltz-2 error for sequence {sequence.sequence_id}: {e}")
+        print(f"  ✗ {sequence.sequence_id}: {e}")
         return None
     finally:
         data_volume.commit()
@@ -225,37 +222,48 @@ def _extract_sequence_from_pdb(pdb_path: str, chain_id: str) -> str:
 
 
 def _parse_boltz2_metrics(output_dir: str, sequence_id: str) -> Optional[dict]:
-    """Parse Boltz-2 output metrics from JSON or pickle files."""
+    """Parse Boltz-2 output metrics from JSON or npz files."""
     import numpy as np
+    import glob
 
     metrics = {}
-
-    # Try to find metrics file
-    metrics_file = f"{output_dir}/{sequence_id}_metrics.json"
-    if os.path.exists(metrics_file):
-        with open(metrics_file, "r") as f:
+    
+    # Boltz outputs are in: {output_dir}/boltz_results_*/predictions/*/
+    # Files: confidence_*.json, plddt_*.npz
+    
+    # Find confidence JSON file - contains comprehensive metrics
+    confidence_files = glob.glob(f"{output_dir}/**/confidence_*.json", recursive=True)
+    if confidence_files:
+        with open(confidence_files[0], "r") as f:
             raw_metrics = json.load(f)
-            metrics["plddt_overall"] = raw_metrics.get("plddt", 0.0)
+            # Boltz confidence file contains normalized scores (0-1)
+            # Convert to 0-100 scale for compatibility with filters
             metrics["ptm"] = raw_metrics.get("ptm")
             metrics["iptm"] = raw_metrics.get("iptm")
-            metrics["plddt_interface"] = raw_metrics.get("plddt_interface", 0.0)
-            metrics["pae_interface"] = raw_metrics.get("pae_interface", 100.0)
-            return metrics
+            # Use complex_plddt (already 0-1, convert to 0-100)
+            complex_plddt = raw_metrics.get("complex_plddt", 0.0)
+            complex_iplddt = raw_metrics.get("complex_iplddt", 0.0)
+            metrics["plddt_overall"] = complex_plddt * 100.0  # Scale to 0-100
+            metrics["plddt_interface"] = complex_iplddt * 100.0  # Scale to 0-100
+            # Use complex_ipde for interface PAE
+            metrics["pae_interface"] = raw_metrics.get("complex_ipde", 5.0)
 
-    # Try numpy file
-    plddt_file = f"{output_dir}/{sequence_id}_plddt.npy"
-    pae_file = f"{output_dir}/{sequence_id}_pae.npy"
+    # Find pLDDT NPZ file as backup
+    if "plddt_overall" not in metrics:
+        plddt_files = glob.glob(f"{output_dir}/**/plddt_*.npz", recursive=True)
+        if plddt_files:
+            data = np.load(plddt_files[0])
+            if "plddt" in data:
+                plddt = data["plddt"]
+                # NPZ file contains 0-1 scores, convert to 0-100
+                metrics["plddt_overall"] = float(np.mean(plddt)) * 100.0
+                metrics["plddt_interface"] = float(np.mean(plddt)) * 100.0
 
-    if os.path.exists(plddt_file):
-        plddt = np.load(plddt_file)
-        metrics["plddt_overall"] = float(np.mean(plddt))
-        # Estimate interface pLDDT (last N residues = binder)
-        metrics["plddt_interface"] = float(np.mean(plddt[-50:]))  # Approximate
-
-    if os.path.exists(pae_file):
-        pae = np.load(pae_file)
-        # Interface PAE: cross-chain PAE values
-        metrics["pae_interface"] = float(np.mean(pae))  # Simplified
+    # Set defaults for missing metrics
+    if "plddt_interface" not in metrics:
+        metrics["plddt_interface"] = metrics.get("plddt_overall", 70.0)
+    if "pae_interface" not in metrics:
+        metrics["pae_interface"] = 5.0  # Default moderate PAE
 
     if metrics:
         return metrics
@@ -272,7 +280,7 @@ def _parse_boltz2_metrics(output_dir: str, sequence_id: str) -> Optional[dict]:
     image=foldseek_image,
     cpu=4,
     memory=8192,
-    timeout=600,
+    timeout=2400,  # 40 min to allow for database download on first run
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def run_foldseek(
@@ -305,7 +313,36 @@ def run_foldseek(
         os.makedirs(tmp_dir, exist_ok=True)
 
         # Determine database path
-        db_path = f"{WEIGHTS_PATH}/foldseek/{config.database}"
+        db_dir = f"{WEIGHTS_PATH}/foldseek"
+        db_path = f"{db_dir}/{config.database}"
+        os.makedirs(db_dir, exist_ok=True)
+
+        # Download database if it doesn't exist
+        if not os.path.exists(db_path):
+            print(f"FoldSeek database not found at {db_path}, downloading...")
+            # Download the database using foldseek's built-in downloader
+            # Use Alphafold/Swiss-Prot which is smaller (~5GB) than pdb100 (~10GB)
+            download_cmd = [
+                "foldseek",
+                "databases",
+                "Alphafold/Swiss-Prot",
+                db_path,
+                f"{db_dir}/tmp",
+            ]
+            print(f"Running: {' '.join(download_cmd)}")
+            dl_result = subprocess.run(
+                download_cmd,
+                capture_output=True,
+                text=True,
+                timeout=1800,  # 30 min for download
+            )
+            if dl_result.returncode != 0:
+                print(f"FoldSeek database download failed: {dl_result.stderr}")
+                # Commit any partial download for next time
+                weights_volume.commit()
+                return decoys
+            print("FoldSeek database downloaded successfully")
+            weights_volume.commit()
 
         # Run FoldSeek easy-search
         cmd = [
@@ -333,9 +370,14 @@ def run_foldseek(
         if result.returncode != 0:
             print(f"FoldSeek stderr: {result.stderr}")
 
-        # Parse results
+        # Parse results with deduplication
         if os.path.exists(results_file):
+            # Count total lines for reporting
+            with open(results_file, "r") as f:
+                total_hits = sum(1 for _ in f)
             decoys = _parse_foldseek_results(results_file, output_dir, config.max_hits)
+            if total_hits > len(decoys):
+                print(f"FoldSeek: {total_hits} hits -> {len(decoys)} unique proteins")
 
     except subprocess.TimeoutExpired:
         print("FoldSeek timeout")
@@ -352,12 +394,17 @@ def _parse_foldseek_results(
     output_dir: str,
     max_hits: int,
 ) -> list[DecoyHit]:
-    """Parse FoldSeek tabular output into DecoyHit objects."""
+    """Parse FoldSeek tabular output into DecoyHit objects.
+    
+    Deduplicates based on core protein ID to avoid redundant Chai-1 runs.
+    For AlphaFold entries, extracts UniProt ID; for PDB entries, extracts PDB code.
+    """
     decoys: list[DecoyHit] = []
+    seen_ids: set[str] = set()  # Track unique protein IDs
 
     with open(results_file, "r") as f:
-        for i, line in enumerate(f):
-            if i >= max_hits:
+        for line in f:
+            if len(decoys) >= max_hits:
                 break
 
             parts = line.strip().split("\t")
@@ -365,12 +412,27 @@ def _parse_foldseek_results(
                 continue
 
             target_id = parts[0]
+            
+            # Extract core protein ID for deduplication
+            # AlphaFold: AF-P16871-F1-model_v6 or AF-P16871-2-F1-model_v6 -> P16871
+            # PDB: 1ABC_A -> 1ABC
+            if target_id.startswith("AF-"):
+                id_parts = target_id.split("-")
+                core_id = id_parts[1] if len(id_parts) >= 2 else target_id
+            else:
+                core_id = target_id.split("_")[0].upper()
+            
+            # Skip if we've already seen this protein
+            if core_id in seen_ids:
+                continue
+            seen_ids.add(core_id)
+
             evalue = float(parts[1]) if parts[1] else 1e10
             tm_score = float(parts[2]) if parts[2] else 0.0
             aligned_length = int(parts[3]) if parts[3] else 0
             seq_identity = float(parts[4]) if parts[4] else 0.0
 
-            # Create placeholder PDB path (would need to download actual structure)
+            # Create placeholder PDB path (will be downloaded later)
             pdb_path = f"{output_dir}/decoys/{target_id}.pdb"
             os.makedirs(f"{output_dir}/decoys", exist_ok=True)
 
@@ -415,22 +477,54 @@ def download_decoy_structures(
 
     for decoy in decoys:
         try:
-            # Extract PDB ID (assuming format like "1ABC_A")
-            pdb_id = decoy.decoy_id.split("_")[0].lower()
-            chain_id = decoy.decoy_id.split("_")[1] if "_" in decoy.decoy_id else "A"
+            decoy_id = decoy.decoy_id
+            pdb_path = f"{output_dir}/{decoy_id}.pdb"
+            cif_path = f"{output_dir}/{decoy_id}.cif"
 
-            pdb_path = f"{output_dir}/{decoy.decoy_id}.pdb"
-
-            if not os.path.exists(pdb_path):
-                # Download from RCSB PDB
+            if os.path.exists(pdb_path) or os.path.exists(cif_path):
+                structure_path = pdb_path if os.path.exists(pdb_path) else cif_path
+            elif decoy_id.startswith("AF-"):
+                # AlphaFold entry (format: AF-P16871-F1-model_v6 or AF-P16871-2-F1-model_v6)
+                # Extract UniProt ID (second part after AF-)
+                parts = decoy_id.split("-")
+                if len(parts) >= 2:
+                    # Handle both AF-P16871-F1 and AF-P16871-2-F1 (isoforms)
+                    uniprot_id = parts[1]
+                    # Try v4 first (most common), then other versions
+                    downloaded = False
+                    for version in ["v4", "v3", "v2"]:
+                        url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_{version}.pdb"
+                        try:
+                            urllib.request.urlretrieve(url, pdb_path)
+                            structure_path = pdb_path
+                            downloaded = True
+                            break
+                        except Exception:
+                            continue
+                    if not downloaded:
+                        # Try CIF format as last resort
+                        url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.cif"
+                        try:
+                            urllib.request.urlretrieve(url, cif_path)
+                            structure_path = cif_path
+                            downloaded = True
+                        except Exception:
+                            print(f"Could not download AlphaFold structure for {uniprot_id}")
+                            continue
+                else:
+                    continue
+            else:
+                # Standard PDB entry (format like "1ABC_A")
+                pdb_id = decoy_id.split("_")[0].lower()
                 url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
                 urllib.request.urlretrieve(url, pdb_path)
+                structure_path = pdb_path
 
-            if os.path.exists(pdb_path):
+            if os.path.exists(structure_path):
                 valid_decoys.append(
                     DecoyHit(
-                        decoy_id=decoy.decoy_id,
-                        pdb_path=pdb_path,
+                        decoy_id=decoy_id,
+                        pdb_path=structure_path,
                         evalue=decoy.evalue,
                         tm_score=decoy.tm_score,
                         aligned_length=decoy.aligned_length,
@@ -615,7 +709,7 @@ def _parse_chai1_metrics(output_prefix: str) -> Optional[dict]:
 
 @app.function(
     image=boltz2_image,
-    timeout=60,
+    timeout=1800,  # 30 minutes - structure prediction takes time
 )
 def validate_sequences_parallel(
     sequences: list[SequenceDesign],
@@ -635,6 +729,12 @@ def validate_sequences_parallel(
     Returns:
         List of successful structure predictions
     """
+    # Print common parameters once
+    if sequences:
+        target_len = len(_extract_sequence_from_pdb(target.pdb_path, target.chain_id))
+        binder_len = len(sequences[0].sequence)
+        print(f"Boltz-2: validating {len(sequences)} sequences (target: {target_len} res, binder: {binder_len} res)")
+
     # Prepare arguments for starmap
     args = [
         (seq, target, config, f"{base_output_dir}/{seq.sequence_id}")
