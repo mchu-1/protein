@@ -161,7 +161,7 @@ def run_boltz2(
             rmsd_to_design=metrics.get("rmsd_to_design"),
         )
 
-        # AlphaProteo filters (SI 2.2)
+        # AlphaProteo filters (SI 2.2) - ONLY these 3 criteria
         # 1. Anchor Lock: min PAE at hotspots < 1.5 Å
         if prediction.pae_interaction is not None:
             if prediction.pae_interaction > config.max_pae_interaction:
@@ -180,17 +180,8 @@ def run_boltz2(
                 print(f"  ✗ {sequence.sequence_id}: RMSD {prediction.rmsd_to_design:.2f} Å > {config.max_rmsd} Å")
                 return None
 
-        # Legacy filters (still applied as backup)
-        if prediction.plddt_interface < config.min_iplddt * 100:
-            print(f"  ✗ {sequence.sequence_id}: i-pLDDT {prediction.plddt_interface:.1f} < {config.min_iplddt * 100}")
-            return None
-
-        if prediction.pae_interface > config.max_pae:
-            print(f"  ✗ {sequence.sequence_id}: PAE {prediction.pae_interface:.1f} > {config.max_pae}")
-            return None
-
-        # Build status string
-        status_parts = [f"i-pLDDT={prediction.plddt_interface:.1f}"]
+        # Build status string (AlphaProteo metrics only)
+        status_parts = []
         if prediction.pae_interaction is not None:
             status_parts.append(f"PAE@hs={prediction.pae_interaction:.2f}Å")
         if prediction.ptm_binder is not None:
@@ -567,6 +558,64 @@ def _extract_pdb_id_from_path(pdb_path: str) -> Optional[str]:
 # =============================================================================
 # FoldSeek - Proteome Scanning for Decoys
 # =============================================================================
+
+
+def get_cached_decoys(
+    target: TargetProtein,
+    cache_dir: str,
+) -> Optional[list[DecoyHit]]:
+    """
+    Check for cached FoldSeek results for a target.
+    
+    Cache key is based on PDB ID + entity ID, so same protein = same decoys.
+    
+    Args:
+        target: Target protein specification
+        cache_dir: Directory where cache files are stored
+    
+    Returns:
+        List of cached DecoyHit objects, or None if no cache exists
+    """
+    cache_key = f"{target.pdb_id.upper()}_E{target.entity_id}"
+    cache_file = f"{cache_dir}/foldseek_cache/{cache_key}_decoys.json"
+    
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                cached_data = json.load(f)
+                decoys = [DecoyHit(**d) for d in cached_data]
+                print(f"FoldSeek: Using cached results for {cache_key} ({len(decoys)} decoys)")
+                return decoys
+        except Exception as e:
+            print(f"FoldSeek: Cache read failed ({e}), will recompute")
+    
+    return None
+
+
+def save_decoys_to_cache(
+    target: TargetProtein,
+    decoys: list[DecoyHit],
+    cache_dir: str,
+) -> None:
+    """
+    Save FoldSeek results to cache for future runs.
+    
+    Args:
+        target: Target protein specification
+        decoys: List of decoy hits to cache
+        cache_dir: Directory where cache files are stored
+    """
+    cache_key = f"{target.pdb_id.upper()}_E{target.entity_id}"
+    cache_subdir = f"{cache_dir}/foldseek_cache"
+    os.makedirs(cache_subdir, exist_ok=True)
+    cache_file = f"{cache_subdir}/{cache_key}_decoys.json"
+    
+    try:
+        with open(cache_file, "w") as f:
+            json.dump([d.model_dump() for d in decoys], f, indent=2)
+        print(f"FoldSeek: Cached {len(decoys)} decoys for {cache_key}")
+    except Exception as e:
+        print(f"FoldSeek: Cache write failed ({e})")
 
 
 @app.function(
@@ -990,7 +1039,7 @@ def run_chai1(
                 if "plddt" in plddt_data:
                     plddt_interface = float(np.mean(plddt_data["plddt"])) * 100
             
-            # Fallback: check if candidates has any usable attributes
+            # Fallback: check if candidates has any usable attributes for plddt
             if plddt_interface == 0.0 and candidates is not None:
                 # Try different possible attribute names
                 for attr in ['plddt', 'per_token_plddt', 'confidence']:
@@ -1005,30 +1054,30 @@ def run_chai1(
                                 break
                             except Exception:
                                 pass
-                
-                # Extract chain_pair_iptm from scores (Chai-1 single-sequence mode)
-                chain_pair_iptm = None
-                if scores_files:
-                    with open(scores_files[0], "r") as f:
-                        scores_data = json.load(f)
-                        chain_pair_iptm = scores_data.get("chain_pair_iptm")
-                        # Fallback to iptm if chain_pair_iptm not available
-                        if chain_pair_iptm is None:
-                            chain_pair_iptm = iptm_score
-                
-                # Off-target threshold: chain_pair_iptm > 0.5 indicates cross-reactivity
-                binds_decoy = (chain_pair_iptm is not None and chain_pair_iptm > 0.5)
+            
+            # Extract chain_pair_iptm from scores (Chai-1 single-sequence mode)
+            chain_pair_iptm = None
+            if scores_files:
+                with open(scores_files[0], "r") as f:
+                    scores_data = json.load(f)
+                    chain_pair_iptm = scores_data.get("chain_pair_iptm")
+                    # Fallback to iptm if chain_pair_iptm not available
+                    if chain_pair_iptm is None:
+                        chain_pair_iptm = iptm_score
+            
+            # Off-target threshold: chain_pair_iptm > 0.5 indicates cross-reactivity
+            binds_decoy = (chain_pair_iptm is not None and chain_pair_iptm > 0.5)
 
-                return CrossReactivityResult(
-                    binder_id=sequence.sequence_id,
-                    decoy_id=decoy.decoy_id,
-                    predicted_affinity=affinity,
-                    plddt_interface=plddt_interface,
-                    binds_decoy=binds_decoy,
-                    ptm=ptm_score,
-                    iptm=iptm_score,
-                    chain_pair_iptm=chain_pair_iptm,
-                )
+            return CrossReactivityResult(
+                binder_id=sequence.sequence_id,
+                decoy_id=decoy.decoy_id,
+                predicted_affinity=affinity,
+                plddt_interface=plddt_interface,
+                binds_decoy=binds_decoy,
+                ptm=ptm_score,
+                iptm=iptm_score,
+                chain_pair_iptm=chain_pair_iptm,
+            )
                 
         except ImportError as e:
             print(f"Chai-1 import error: {e}")
@@ -1231,12 +1280,77 @@ def check_cross_reactivity_parallel(
         
         print(f"  Positive control: {len(positive_control_results)}/{len(sequences)} sequences bind target")
     
-    # Step 2: Run decoy checks with early termination optimization
+    # Step 2: Run decoy checks with tiered or early termination optimization
     if decoys:
         # Sort decoys by TM-score descending (most similar = highest risk, test first)
         sorted_decoys = sorted(decoys, key=lambda d: d.tm_score, reverse=True)
         
-        if early_termination:
+        if config.tiered_checking:
+            # Tiered decoy checking (#6 optimization)
+            # Tier 1: Highest-risk decoys (TM > tier1_min_tm) - MUST pass all
+            # Tier 2: Medium-risk decoys (TM > tier2_min_tm) - check up to tier2_max_decoys
+            # Tier 3: Lower-risk decoys - skip for budget runs
+            tier1_decoys = [d for d in sorted_decoys if d.tm_score >= config.tier1_min_tm]
+            tier2_candidates = [d for d in sorted_decoys if config.tier2_min_tm <= d.tm_score < config.tier1_min_tm]
+            tier2_decoys = tier2_candidates[:config.tier2_max_decoys]
+            
+            print(f"Chai-1 Tiered Decoy Check: {len(sequences)} sequences")
+            print(f"  Tier 1 (TM ≥ {config.tier1_min_tm}): {len(tier1_decoys)} decoys - MUST pass all")
+            print(f"  Tier 2 (TM ≥ {config.tier2_min_tm}): {len(tier2_decoys)}/{len(tier2_candidates)} decoys")
+            print(f"  Tier 3 (lower TM): skipped for cost savings")
+            
+            total_calls = 0
+            rejected_sequences: set[str] = set()
+            
+            for seq in sequences:
+                decoy_results[seq.sequence_id] = []
+                rejected = False
+                
+                # Tier 1: Must pass all high-risk decoys
+                for decoy in tier1_decoys:
+                    result = run_chai1.remote(
+                        seq, decoy, config, 
+                        f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}"
+                    )
+                    total_calls += 1
+                    
+                    if result is not None:
+                        decoy_results[seq.sequence_id].append(result)
+                        if result.binds_decoy:
+                            rejected_sequences.add(seq.sequence_id)
+                            print(f"  ✗ {seq.sequence_id}: Tier 1 fail - {decoy.decoy_id} (TM={decoy.tm_score:.2f})")
+                            rejected = True
+                            break
+                
+                if rejected:
+                    continue
+                
+                # Tier 2: Check medium-risk decoys (early termination within tier)
+                for decoy in tier2_decoys:
+                    result = run_chai1.remote(
+                        seq, decoy, config, 
+                        f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}"
+                    )
+                    total_calls += 1
+                    
+                    if result is not None:
+                        decoy_results[seq.sequence_id].append(result)
+                        if result.binds_decoy:
+                            rejected_sequences.add(seq.sequence_id)
+                            print(f"  ✗ {seq.sequence_id}: Tier 2 fail - {decoy.decoy_id} (TM={decoy.tm_score:.2f})")
+                            rejected = True
+                            break
+                
+                if not rejected:
+                    checked = len(tier1_decoys) + len(tier2_decoys)
+                    print(f"  ✓ {seq.sequence_id}: passed {checked} decoys (Tier 1+2)")
+            
+            max_possible = len(sequences) * len(sorted_decoys)
+            saved = max_possible - total_calls
+            print(f"  Tiered checking saved ~{saved} Chai-1 calls ({100*saved/max_possible:.0f}% reduction)")
+            print(f"  Result: {len(sequences) - len(rejected_sequences)}/{len(sequences)} sequences passed selectivity")
+        
+        elif early_termination:
             # Sequential per-sequence with early termination (economical mode)
             print(f"Chai-1 Decoy Check: {len(sequences)} sequences × up to {len(sorted_decoys)} decoys (early termination enabled)")
             print(f"  Decoys sorted by TM-score: {', '.join(f'{d.decoy_id[:8]}({d.tm_score:.2f})' for d in sorted_decoys[:3])}...")
@@ -1326,7 +1440,7 @@ def mock_boltz2(
     ptm_binder = random.uniform(0.6, 0.95)  # Binder-only pTM
     rmsd_to_design = random.uniform(0.5, 4.0)  # RMSD vs RFDiffusion
 
-    # Apply AlphaProteo filters
+    # Apply AlphaProteo filters (SI 2.2) - ONLY these 3 criteria
     # 1. Anchor Lock: PAE at hotspots < 1.5 Å
     if pae_interaction > config.max_pae_interaction:
         return None
@@ -1335,12 +1449,6 @@ def mock_boltz2(
         return None
     # 3. Self-Consistency: RMSD < 2.5 Å
     if rmsd_to_design > config.max_rmsd:
-        return None
-    
-    # Legacy filters
-    if plddt_interface < config.min_iplddt * 100:
-        return None
-    if pae_interface > config.max_pae:
         return None
 
     pdb_path = f"{output_dir}/{sequence.sequence_id}_complex.pdb"

@@ -23,7 +23,9 @@ import modal
 from common import (
     DATA_PATH,
     WEIGHTS_PATH,
+    AdaptiveGenerationConfig,
     BackboneDesign,
+    BackboneFilterConfig,
     BinderCandidate,
     Boltz2Config,
     Chai1Config,
@@ -34,11 +36,13 @@ from common import (
     GenerationMode,
     NoveltyConfig,
     PipelineConfig,
+    PipelineLimits,
     PipelineResult,
     PipelineStage,
     ProteinMPNNConfig,
     RFDiffusionConfig,
     SequenceDesign,
+    StageLimits,
     StructurePrediction,
     TargetProtein,
     ValidationResult,
@@ -49,26 +53,31 @@ from common import (
     generate_design_id,
     generate_protein_id,
     generate_ulid,
+    load_config_from_yaml,
     weights_volume,
 )
 from generators import (
+    filter_backbones_by_quality,
     generate_sequences_parallel,
     mock_proteinmpnn,
     mock_rfdiffusion,
     run_proteinmpnn,
     run_rfdiffusion,
+    run_rfdiffusion_single,
 )
 from validators import (
     check_cross_reactivity_parallel,
     check_novelty,
     cluster_by_tm_score,
     download_decoy_structures,
+    get_cached_decoys,
     mock_boltz2,
     mock_chai1,
     mock_foldseek,
     run_boltz2,
     run_chai1_batch,
     run_foldseek,
+    save_decoys_to_cache,
     validate_sequences_parallel,
 )
 
@@ -78,71 +87,207 @@ from validators import (
 # Cost Estimation
 # =============================================================================
 
-# Approximate costs per GPU-hour (USD)
-GPU_COSTS = {
-    "A10G": 0.60,
-    "L4": 0.80,
-    "A100": 2.50,
-    "A100-80GB": 3.50,
+# =============================================================================
+# Modal Pricing (per second) - https://modal.com/pricing
+# =============================================================================
+
+MODAL_GPU_COST_PER_SEC = {
+    "H100": 0.001097,
+    "A100-80GB": 0.000694,
+    "A100": 0.000583,  # 40GB variant
+    "L40S": 0.000542,
+    "A10G": 0.000306,
+    "L4": 0.000222,
+    "T4": 0.000164,
 }
 
-# Estimated runtime per step (seconds)
-STEP_RUNTIMES = {
-    "rfdiffusion": 60,  # per backbone
-    "proteinmpnn": 15,  # per backbone
-    "boltz2": 120,  # per sequence
-    "foldseek": 30,  # per target
-    "chai1": 90,  # per binder-decoy pair
+MODAL_CPU_COST_PER_CORE_SEC = 0.0000131
+MODAL_MEMORY_COST_PER_GIB_SEC = 0.00000222
+
+# Default timeout ceilings per step (seconds) - from @app.function decorators
+# These represent worst-case billing durations when no limits are specified
+DEFAULT_STEP_TIMEOUTS = {
+    "rfdiffusion": 600,   # generators.py: run_rfdiffusion timeout=600
+    "proteinmpnn": 300,   # generators.py: run_proteinmpnn timeout=300
+    "boltz2": 900,        # validators.py: run_boltz2 timeout=900
+    "foldseek": 120,      # validators.py: download_decoy_structures timeout=120
+    "chai1": 900,         # validators.py: run_chai1 timeout=900
+}
+
+# Default max_designs per step when no limits are specified
+# Conservative defaults tuned to keep typical runs within ~$5 USD budget
+DEFAULT_MAX_DESIGNS = {
+    "rfdiffusion": 4,     # Max backbones to generate
+    "proteinmpnn": 16,    # Max total sequences
+    "boltz2": 3,          # Max sequences to validate (Boltz-2 @ $0.74/seq)
+    "foldseek": 2,        # Max decoys
+    "chai1": 3,           # Max binder-decoy pairs (Chai-1 @ $0.74/pair)
+}
+
+# Resource allocation per step - from @app.function decorators
+STEP_RESOURCES = {
+    "rfdiffusion": {"gpu": "A10G", "cpu_cores": 2, "memory_gib": 16},
+    "proteinmpnn": {"gpu": "L4", "cpu_cores": 2, "memory_gib": 8},
+    "boltz2": {"gpu": "A100-80GB", "cpu_cores": 4, "memory_gib": 32},
+    "foldseek": {"gpu": None, "cpu_cores": 2, "memory_gib": 8},
+    "chai1": {"gpu": "A100-80GB", "cpu_cores": 4, "memory_gib": 32},
 }
 
 
-def estimate_cost(config: PipelineConfig) -> float:
+def _calculate_step_cost(step: str, duration_sec: float) -> float:
+    """Calculate cost for a single step including GPU, CPU, and memory."""
+    resources = STEP_RESOURCES[step]
+    
+    # GPU cost
+    gpu_cost = 0.0
+    if resources["gpu"]:
+        gpu_cost = MODAL_GPU_COST_PER_SEC[resources["gpu"]] * duration_sec
+    
+    # CPU cost
+    cpu_cost = MODAL_CPU_COST_PER_CORE_SEC * resources["cpu_cores"] * duration_sec
+    
+    # Memory cost
+    mem_cost = MODAL_MEMORY_COST_PER_GIB_SEC * resources["memory_gib"] * duration_sec
+    
+    return gpu_cost + cpu_cost + mem_cost
+
+
+def estimate_cost(config: PipelineConfig) -> dict:
     """
-    Estimate the compute cost for a pipeline run.
+    Estimate the worst-case compute cost ceiling for a pipeline run.
+    
+    Uses timeout ceilings and max_designs limits from config.limits to provide
+    a deterministic upper bound based on configured limits.
+    
+    Cost calculation uses min(requested, limit) for each dimension:
+    - Timeouts: Uses config.limits timeout or default
+    - Max designs: Uses min(requested designs, config.limits max_designs)
 
     Args:
         config: Pipeline configuration
 
     Returns:
-        Estimated cost in USD
+        Dict with per-step costs, limits used, and total
     """
-    num_backbones = config.rfdiffusion.num_designs
-    num_sequences_per_backbone = config.proteinmpnn.num_sequences
-    total_sequences = num_backbones * num_sequences_per_backbone
-    num_decoys = config.foldseek.max_hits
+    limits = config.limits
+    
+    # Get effective counts based on limits
+    # RFDiffusion: number of backbones
+    requested_backbones = config.rfdiffusion.num_designs
+    max_backbones = limits.get_max_designs("rfdiffusion")
+    effective_backbones = min(requested_backbones, max_backbones)
+    
+    # ProteinMPNN: total sequences = backbones × sequences_per_backbone
+    requested_sequences = effective_backbones * config.proteinmpnn.num_sequences
+    max_sequences = limits.get_max_designs("proteinmpnn")
+    effective_sequences = min(requested_sequences, max_sequences)
+    
+    # Boltz-2: sequences to validate (same as effective_sequences, capped by limit)
+    max_boltz2 = limits.get_max_designs("boltz2")
+    effective_boltz2 = min(effective_sequences, max_boltz2)
+    
+    # FoldSeek: number of decoys
+    requested_decoys = config.foldseek.max_hits
+    max_decoys = limits.get_max_designs("foldseek")
+    effective_decoys = min(requested_decoys, max_decoys)
+    
+    # Chai-1: binder-decoy pairs = sequences × decoys
+    max_chai1_pairs = limits.get_max_designs("chai1")
+    effective_chai1_pairs = min(effective_boltz2 * effective_decoys, max_chai1_pairs)
+    
+    # Get effective timeouts from limits
+    rfdiffusion_timeout = limits.get_timeout("rfdiffusion")
+    proteinmpnn_timeout = limits.get_timeout("proteinmpnn")
+    boltz2_timeout = limits.get_timeout("boltz2")
+    foldseek_timeout = limits.get_timeout("foldseek")
+    chai1_timeout = limits.get_timeout("chai1")
 
-    # Assume 50% pass Boltz-2 validation
-    passing_sequences = int(total_sequences * 0.5)
+    # Calculate per-step costs using timeout ceilings (worst-case billing)
+    costs = {}
+    
+    # RFDiffusion (A10G) - timeout for batch generation (all backbones in one call)
+    rfdiffusion_sec = rfdiffusion_timeout
+    costs["rfdiffusion"] = _calculate_step_cost("rfdiffusion", rfdiffusion_sec)
+    
+    # ProteinMPNN (L4) - timeout per backbone
+    proteinmpnn_sec = proteinmpnn_timeout * effective_backbones
+    costs["proteinmpnn"] = _calculate_step_cost("proteinmpnn", proteinmpnn_sec)
+    
+    # Boltz-2 (A100) - timeout per sequence
+    boltz2_sec = boltz2_timeout * effective_boltz2
+    costs["boltz2"] = _calculate_step_cost("boltz2", boltz2_sec)
+    
+    # FoldSeek (CPU only) - single timeout
+    foldseek_sec = foldseek_timeout
+    costs["foldseek"] = _calculate_step_cost("foldseek", foldseek_sec)
+    
+    # Chai-1 (A100) - timeout per binder-decoy pair
+    chai1_sec = chai1_timeout * effective_chai1_pairs
+    costs["chai1"] = _calculate_step_cost("chai1", chai1_sec)
+    
+    costs["total"] = sum(costs.values())
+    
+    # Include effective counts and timeouts for reporting
+    costs["_effective"] = {
+        "backbones": effective_backbones,
+        "sequences": effective_sequences,
+        "boltz2_validations": effective_boltz2,
+        "decoys": effective_decoys,
+        "chai1_pairs": effective_chai1_pairs,
+    }
+    costs["_timeouts"] = {
+        "rfdiffusion": rfdiffusion_timeout,
+        "proteinmpnn": proteinmpnn_timeout,
+        "boltz2": boltz2_timeout,
+        "foldseek": foldseek_timeout,
+        "chai1": chai1_timeout,
+    }
+    costs["_runtime_sec"] = rfdiffusion_sec + proteinmpnn_sec + boltz2_sec + foldseek_sec + chai1_sec
+    
+    return costs
 
-    # RFDiffusion cost (A10G)
-    rfdiffusion_hours = (STEP_RUNTIMES["rfdiffusion"] * num_backbones) / 3600
-    rfdiffusion_cost = rfdiffusion_hours * GPU_COSTS["A10G"]
 
-    # ProteinMPNN cost (L4)
-    proteinmpnn_hours = (STEP_RUNTIMES["proteinmpnn"] * num_backbones) / 3600
-    proteinmpnn_cost = proteinmpnn_hours * GPU_COSTS["L4"]
+# =============================================================================
+# Stage Logging
+# =============================================================================
 
-    # Boltz-2 cost (A100)
-    boltz2_hours = (STEP_RUNTIMES["boltz2"] * total_sequences) / 3600
-    boltz2_cost = boltz2_hours * GPU_COSTS["A100"]
 
-    # FoldSeek cost (CPU only, negligible)
-    foldseek_cost = 0.01
-
-    # Chai-1 cost (A100)
-    chai1_pairs = passing_sequences * num_decoys
-    chai1_hours = (STEP_RUNTIMES["chai1"] * chai1_pairs) / 3600
-    chai1_cost = chai1_hours * GPU_COSTS["A100"]
-
-    total_cost = (
-        rfdiffusion_cost
-        + proteinmpnn_cost
-        + boltz2_cost
-        + foldseek_cost
-        + chai1_cost
-    )
-
-    return total_cost
+def _log_stage_metrics(
+    stage_name: str,
+    duration_sec: float,
+    candidates: int,
+    ceiling_sec: float,
+    ceiling_cost: float,
+) -> dict:
+    """
+    Log actual vs. ceiling metrics for a pipeline stage.
+    
+    Args:
+        stage_name: Name of the stage (e.g., "RFDiffusion")
+        duration_sec: Actual duration in seconds
+        candidates: Number of candidates produced
+        ceiling_sec: Ceiling timeout in seconds
+        ceiling_cost: Ceiling cost in USD
+    
+    Returns:
+        Dict with stage metrics for inclusion in run manifest
+    """
+    actual_cost = _calculate_step_cost(stage_name.lower().replace("-", ""), duration_sec)
+    utilization = (duration_sec / ceiling_sec * 100) if ceiling_sec > 0 else 0
+    
+    print(f"  ├─ Duration: {duration_sec:.1f}s / {ceiling_sec:.0f}s ({utilization:.0f}% of ceiling)")
+    print(f"  ├─ Candidates: {candidates}")
+    print(f"  └─ Est. cost: ${actual_cost:.3f} / ${ceiling_cost:.3f} ceiling")
+    
+    return {
+        "stage": stage_name,
+        "duration_sec": duration_sec,
+        "ceiling_sec": ceiling_sec,
+        "candidates": candidates,
+        "actual_cost_usd": actual_cost,
+        "ceiling_cost_usd": ceiling_cost,
+        "utilization_pct": utilization,
+    }
 
 
 # =============================================================================
@@ -203,111 +348,201 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         os.makedirs(d, exist_ok=True)
 
     # Pre-flight cost check
-    estimated_cost = estimate_cost(config)
-    if estimated_cost > config.max_compute_usd:
+    cost_estimate = estimate_cost(config)
+    if cost_estimate["total"] > config.max_compute_usd:
         print(
-            f"WARNING: Estimated cost ${estimated_cost:.2f} exceeds budget "
+            f"WARNING: Estimated cost ${cost_estimate['total']:.2f} exceeds budget "
             f"${config.max_compute_usd:.2f}. Reducing design count."
         )
         # Scale down to fit budget
-        scale_factor = config.max_compute_usd / estimated_cost
+        scale_factor = config.max_compute_usd / cost_estimate["total"]
         config.rfdiffusion.num_designs = max(
             1, int(config.rfdiffusion.num_designs * scale_factor)
         )
         config.proteinmpnn.num_sequences = max(
             1, int(config.proteinmpnn.num_sequences * scale_factor)
         )
+        # Recalculate after scaling
+        cost_estimate = estimate_cost(config)
 
-    # Consolidated pipeline log
+    # Pipeline configuration
     t = config.target
-    residues = ", ".join(str(r) for r in t.hotspot_residues)
-    cfg = f"{config.rfdiffusion.num_designs} × {config.proteinmpnn.num_sequences}"
-    print(
-        f"{t.name} ({t.pdb_id}) · Entity {t.entity_id} · "
-        f"Residues {residues} · {run_id} · ${config.max_compute_usd:.2f} · {cfg}"
-    )
+    print(f"Target: {t.name}")
+    print(f"PDB ID: {t.pdb_id}")
+    print(f"Entity ID: {t.entity_id}")
+    print(f"Hotspot residues: {', '.join(str(r) for r in t.hotspot_residues)}")
+    print(f"ULID: {run_id}")
+    print(f"Configuration: {config.rfdiffusion.num_designs} backbones × {config.proteinmpnn.num_sequences} sequences each")
+    print(f"Budget: ${cost_estimate['total']:.2f} (cost ceiling)")
+    print(f"  ├─ RFDiffusion (A10G):  ${cost_estimate['rfdiffusion']:.3f}")
+    print(f"  ├─ ProteinMPNN (L4):    ${cost_estimate['proteinmpnn']:.3f}")
+    print(f"  ├─ Boltz-2 (A100):      ${cost_estimate['boltz2']:.3f}")
+    print(f"  ├─ FoldSeek (CPU):      ${cost_estimate['foldseek']:.3f}")
+    print(f"  └─ Chai-1 (A100):       ${cost_estimate['chai1']:.3f}")
+
+    # Write run manifest to campaign directory
+    _write_run_manifest(campaign_dir, run_id, config, cost_estimate)
 
     validation_results: list[ValidationResult] = []
     all_candidates: list[BinderCandidate] = []
+    stage_metrics: list[dict] = []  # Track actual vs ceiling for each stage
 
     # =========================================================================
     # Phase 1: Generation (Specificity)
     # =========================================================================
 
     # Step 1: RFDiffusion - Backbone Generation
-    print("\n=== Phase 1: Backbone Generation (RFDiffusion) ===")
-    backbones = _run_backbone_generation(
-        config.target,
-        config.rfdiffusion,
-        dirs["backbones"],
-        use_mocks,
-    )
-    print(f"Generated {len(backbones)} backbone designs")
-
-    validation_results.append(
-        ValidationResult(
-            stage=PipelineStage.BACKBONE_GENERATION,
-            status=ValidationStatus.PASSED if backbones else ValidationStatus.FAILED,
-            candidate_id=run_id,
-            metrics={"num_backbones": len(backbones)},
+    # Use adaptive generation if enabled, otherwise standard batch generation
+    if config.adaptive.enabled and not use_mocks:
+        print("\n=== Phase 1: Adaptive Generation (RFDiffusion + ProteinMPNN + Boltz-2) ===")
+        stage_start = time.time()
+        backbones, sequences, predictions = _run_adaptive_generation(
+            config.target,
+            config.rfdiffusion,
+            config.proteinmpnn,
+            config.boltz2,
+            config.adaptive,
+            config.backbone_filter,
+            dirs,
         )
-    )
-
-    if not backbones:
-        return _create_empty_result(run_id, config, validation_results, start_time)
-
-    # Step 2: ProteinMPNN - Sequence Design
-    print("\n=== Phase 1: Sequence Design (ProteinMPNN) ===")
-    sequences = _run_sequence_design(
-        backbones,
-        config.proteinmpnn,
-        dirs["sequences"],
-        use_mocks,
-    )
-    print(f"Designed {len(sequences)} sequences")
-
-    validation_results.append(
-        ValidationResult(
-            stage=PipelineStage.SEQUENCE_DESIGN,
-            status=ValidationStatus.PASSED if sequences else ValidationStatus.FAILED,
-            candidate_id=run_id,
-            metrics={"num_sequences": len(sequences)},
+        stage_duration = time.time() - stage_start
+        print(f"Adaptive generation complete: {len(backbones)} backbones, {len(sequences)} sequences, {len(predictions)} validated")
+        print(f"  └─ Total duration: {stage_duration:.1f}s")
+        
+        validation_results.append(
+            ValidationResult(
+                stage=PipelineStage.BACKBONE_GENERATION,
+                status=ValidationStatus.PASSED if backbones else ValidationStatus.FAILED,
+                candidate_id=run_id,
+                metrics={"num_backbones": len(backbones), "adaptive_mode": True, "duration_sec": stage_duration},
+            )
         )
-    )
-
-    if not sequences:
-        return _create_empty_result(run_id, config, validation_results, start_time)
-
-    # =========================================================================
-    # Phase 2: Validation (Specificity)
-    # =========================================================================
-
-    # Step 3: Boltz-2 - Structure Prediction & Filtering
-    print("\n=== Phase 2: Structure Validation (Boltz-2) ===")
-    predictions = _run_structure_validation(
-        sequences,
-        config.target,
-        config.boltz2,
-        dirs["validation_boltz"],
-        use_mocks,
-    )
-    print(f"Validated {len(predictions)} sequences (passed filters)")
-
-    validation_results.append(
-        ValidationResult(
-            stage=PipelineStage.STRUCTURE_VALIDATION,
-            status=ValidationStatus.PASSED if predictions else ValidationStatus.FAILED,
-            candidate_id=run_id,
-            metrics={
-                "num_passed": len(predictions),
-                "num_tested": len(sequences),
-                "pass_rate": len(predictions) / len(sequences) if sequences else 0,
-            },
+        validation_results.append(
+            ValidationResult(
+                stage=PipelineStage.SEQUENCE_DESIGN,
+                status=ValidationStatus.PASSED if sequences else ValidationStatus.FAILED,
+                candidate_id=run_id,
+                metrics={"num_sequences": len(sequences)},
+            )
         )
-    )
+        validation_results.append(
+            ValidationResult(
+                stage=PipelineStage.STRUCTURE_VALIDATION,
+                status=ValidationStatus.PASSED if predictions else ValidationStatus.FAILED,
+                candidate_id=run_id,
+                metrics={
+                    "num_passed": len(predictions),
+                    "num_tested": len(sequences),
+                    "pass_rate": len(predictions) / len(sequences) if sequences else 0,
+                },
+            )
+        )
+        
+        if not predictions:
+            return _create_empty_result(run_id, config, validation_results, start_time)
+    else:
+        # Standard batch generation
+        print("\n=== Phase 1: Backbone Generation (RFDiffusion) ===")
+        stage_start = time.time()
+        backbones = _run_backbone_generation(
+            config.target,
+            config.rfdiffusion,
+            dirs["backbones"],
+            use_mocks,
+        )
+        stage_duration = time.time() - stage_start
+        print(f"Generated {len(backbones)} backbone designs")
+        stage_metrics.append(_log_stage_metrics(
+            "rfdiffusion", stage_duration, len(backbones),
+            cost_estimate["_timeouts"]["rfdiffusion"], cost_estimate["rfdiffusion"]
+        ))
+        
+        # Step 1b: Backbone Quality Filter (#2 optimization)
+        if config.backbone_filter.enabled and backbones:
+            backbones = filter_backbones_by_quality(
+                backbones,
+                min_score=config.backbone_filter.min_score,
+                max_keep=config.backbone_filter.max_keep,
+            )
 
-    if not predictions:
-        return _create_empty_result(run_id, config, validation_results, start_time)
+        validation_results.append(
+            ValidationResult(
+                stage=PipelineStage.BACKBONE_GENERATION,
+                status=ValidationStatus.PASSED if backbones else ValidationStatus.FAILED,
+                candidate_id=run_id,
+                metrics={"num_backbones": len(backbones)},
+            )
+        )
+
+        if not backbones:
+            return _create_empty_result(run_id, config, validation_results, start_time)
+
+        # Step 2: ProteinMPNN - Sequence Design
+        print("\n=== Phase 1: Sequence Design (ProteinMPNN) ===")
+        stage_start = time.time()
+        sequences = _run_sequence_design(
+            backbones,
+            config.proteinmpnn,
+            dirs["sequences"],
+            use_mocks,
+        )
+        stage_duration = time.time() - stage_start
+        print(f"Designed {len(sequences)} sequences")
+        stage_metrics.append(_log_stage_metrics(
+            "proteinmpnn", stage_duration, len(sequences),
+            cost_estimate["_timeouts"]["proteinmpnn"] * len(backbones), cost_estimate["proteinmpnn"]
+        ))
+        
+        predictions = None  # Will be computed in Phase 2
+        
+        validation_results.append(
+            ValidationResult(
+                stage=PipelineStage.SEQUENCE_DESIGN,
+                status=ValidationStatus.PASSED if sequences else ValidationStatus.FAILED,
+                candidate_id=run_id,
+                metrics={"num_sequences": len(sequences)},
+            )
+        )
+
+        if not sequences:
+            return _create_empty_result(run_id, config, validation_results, start_time)
+
+        # =========================================================================
+        # Phase 2: Validation (Specificity) - Standard Mode
+        # =========================================================================
+
+        # Step 3: Boltz-2 - Structure Prediction & Filtering
+        print("\n=== Phase 2: Structure Validation (Boltz-2) ===")
+        stage_start = time.time()
+        predictions = _run_structure_validation(
+            sequences,
+            config.target,
+            config.boltz2,
+            dirs["validation_boltz"],
+            use_mocks,
+        )
+        stage_duration = time.time() - stage_start
+        print(f"Validated {len(predictions)} sequences (passed filters)")
+        stage_metrics.append(_log_stage_metrics(
+            "boltz2", stage_duration, len(predictions),
+            cost_estimate["_timeouts"]["boltz2"] * len(sequences), cost_estimate["boltz2"]
+        ))
+
+        validation_results.append(
+            ValidationResult(
+                stage=PipelineStage.STRUCTURE_VALIDATION,
+                status=ValidationStatus.PASSED if predictions else ValidationStatus.FAILED,
+                candidate_id=run_id,
+                metrics={
+                    "num_passed": len(predictions),
+                    "num_tested": len(sequences),
+                    "pass_rate": len(predictions) / len(sequences) if sequences else 0,
+                },
+            )
+        )
+
+        if not predictions:
+            return _create_empty_result(run_id, config, validation_results, start_time)
 
     # Step 4: Clustering - Diversity via TM-score (AlphaProteo SI 2.2)
     if config.cluster.tm_threshold > 0:
@@ -342,15 +577,22 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     # Phase 3: Negative Selection (Selectivity)
     # =========================================================================
 
-    # Step 6: FoldSeek - Find Structural Decoys
+    # Step 6: FoldSeek - Find Structural Decoys (with caching #5 optimization)
     print("\n=== Phase 3: Decoy Identification (FoldSeek) ===")
+    stage_start = time.time()
     decoys = _run_decoy_search(
         config.target,
         config.foldseek,
         f"{campaign_dir}/_decoys",
         use_mocks,
+        cache_dir=dirs["entity"],  # Cache at entity level for reuse across campaigns
     )
+    stage_duration = time.time() - stage_start
     print(f"Found {len(decoys)} structural decoys (potential off-targets)")
+    stage_metrics.append(_log_stage_metrics(
+        "foldseek", stage_duration, len(decoys),
+        cost_estimate["_timeouts"]["foldseek"], cost_estimate["foldseek"]
+    ))
 
     validation_results.append(
         ValidationResult(
@@ -373,6 +615,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
 
     if validated_sequences:
         print("\n=== Phase 3: Cross-Reactivity Check (Chai-1) ===")
+        stage_start = time.time()
         
         # Run positive control + decoy check
         positive_control_results, cross_reactivity_results = _run_cross_reactivity_check(
@@ -383,6 +626,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             use_mocks,
             target=config.target,  # Include target for positive control
         )
+        stage_duration = time.time() - stage_start
         
         # Report positive control results
         num_binding = sum(1 for r in positive_control_results.values() if r.plddt_interface > 50)
@@ -390,6 +634,14 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         
         if decoys:
             print(f"Decoy check: {len(cross_reactivity_results)} sequences checked against {len(decoys)} decoys")
+        
+        # Log Chai-1 metrics
+        num_pairs = len(validated_sequences) * len(decoys) if decoys else len(validated_sequences)
+        stage_metrics.append(_log_stage_metrics(
+            "chai1", stage_duration, num_pairs,
+            cost_estimate["_timeouts"]["chai1"] * cost_estimate["_effective"]["chai1_pairs"], 
+            cost_estimate["chai1"]
+        ))
 
         validation_results.append(
             ValidationResult(
@@ -399,6 +651,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 metrics={
                     "num_checked": len(cross_reactivity_results),
                     "positive_control_binding": num_binding,
+                    "duration_sec": stage_duration,
                 },
             )
         )
@@ -483,12 +736,32 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
 
     # Calculate actual runtime
     runtime_seconds = time.time() - start_time
+    
+    # Print stage metrics summary
+    if stage_metrics:
+        print("\n=== Stage Metrics Summary (Actual vs Ceiling) ===")
+        total_actual_cost = sum(m["actual_cost_usd"] for m in stage_metrics)
+        total_ceiling_cost = sum(m["ceiling_cost_usd"] for m in stage_metrics)
+        print(f"{'Stage':<15} {'Duration':<15} {'Candidates':<12} {'Cost':<20}")
+        print("-" * 62)
+        for m in stage_metrics:
+            dur_str = f"{m['duration_sec']:.1f}s / {m['ceiling_sec']:.0f}s"
+            cost_str = f"${m['actual_cost_usd']:.3f} / ${m['ceiling_cost_usd']:.3f}"
+            print(f"{m['stage']:<15} {dur_str:<15} {m['candidates']:<12} {cost_str:<20}")
+        print("-" * 62)
+        print(f"{'TOTAL':<15} {runtime_seconds:.1f}s{'':<8} {'':<12} ${total_actual_cost:.3f} / ${total_ceiling_cost:.3f}")
+        savings = total_ceiling_cost - total_actual_cost
+        if savings > 0:
+            print(f"  Savings: ${savings:.3f} ({savings/total_ceiling_cost*100:.0f}% under ceiling)")
 
     # Write inputs (info.json at PDB root, entity-specific config)
     _write_inputs(dirs["pdb_root"], dirs["entity"], config)
 
     # Write metrics CSV
     _write_metrics_csv(dirs["metrics"], all_candidates)
+
+    # Write stage metrics (actual vs ceiling)
+    _write_stage_metrics(campaign_dir, stage_metrics, runtime_seconds)
 
     # Create symlinks for best candidates
     _create_best_symlinks(dirs["best"], top_candidates, dirs["validation_boltz"])
@@ -502,7 +775,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         candidates=all_candidates,
         top_candidates=top_candidates,
         validation_summary=validation_results,
-        compute_cost_usd=estimated_cost,  # Would need actual tracking for precision
+        compute_cost_usd=cost_estimate["total"],
         runtime_seconds=runtime_seconds,
     )
 
@@ -527,6 +800,165 @@ def _run_backbone_generation(
     except Exception as e:
         print(f"RFDiffusion failed: {e}")
         return []
+
+
+def _run_adaptive_generation(
+    target: TargetProtein,
+    rfdiffusion_config: RFDiffusionConfig,
+    proteinmpnn_config: ProteinMPNNConfig,
+    boltz2_config: Boltz2Config,
+    adaptive_config: AdaptiveGenerationConfig,
+    backbone_filter_config: BackboneFilterConfig,
+    dirs: dict[str, str],
+) -> tuple[list[BackboneDesign], list[SequenceDesign], list[StructurePrediction]]:
+    """
+    Adaptive generation with early termination using micro-batching (#3 optimization).
+    
+    Uses GPU-efficient micro-batching: generates a batch of backbones, processes
+    all sequences in parallel, validates in parallel, then checks if threshold met.
+    This preserves GPU throughput while enabling early termination between batches.
+    
+    Args:
+        target: Target protein specification
+        rfdiffusion_config: RFDiffusion configuration
+        proteinmpnn_config: ProteinMPNN configuration
+        boltz2_config: Boltz-2 configuration
+        adaptive_config: Adaptive generation settings
+        backbone_filter_config: Backbone quality filter settings
+        dirs: Output directories
+    
+    Returns:
+        Tuple of (backbones, sequences, validated_predictions)
+    """
+    all_backbones: list[BackboneDesign] = []
+    all_sequences: list[SequenceDesign] = []
+    validated_predictions: list[StructurePrediction] = []
+    
+    batch_num = 0
+    
+    print(f"Adaptive mode: target {adaptive_config.min_validated_candidates} validated candidates")
+    print(f"  Micro-batch size: {adaptive_config.batch_size} backbones, max batches: {adaptive_config.max_batches}")
+    print(f"  (GPU-efficient: full batch processing, early termination between batches)")
+    
+    while (len(validated_predictions) < adaptive_config.min_validated_candidates 
+           and batch_num < adaptive_config.max_batches):
+        
+        batch_num += 1
+        print(f"\n--- Micro-batch {batch_num}/{adaptive_config.max_batches} ---")
+        
+        # =====================================================================
+        # Step 1: Generate batch of backbones (GPU-efficient batch processing)
+        # =====================================================================
+        batch_rfdiffusion_config = RFDiffusionConfig(
+            num_designs=adaptive_config.batch_size,
+            binder_length_min=rfdiffusion_config.binder_length_min,
+            binder_length_max=rfdiffusion_config.binder_length_max,
+            noise_scale=rfdiffusion_config.noise_scale,
+            num_diffusion_steps=rfdiffusion_config.num_diffusion_steps,
+        )
+        
+        batch_output_dir = f"{dirs['backbones']}/batch_{batch_num}"
+        
+        try:
+            batch_backbones = run_rfdiffusion.remote(target, batch_rfdiffusion_config, batch_output_dir)
+        except Exception as e:
+            print(f"  RFDiffusion batch failed: {e}")
+            continue
+        
+        if not batch_backbones:
+            print(f"  No backbones generated in batch {batch_num}")
+            continue
+        
+        print(f"  Step 1: Generated {len(batch_backbones)} backbones")
+        
+        # Apply backbone quality filter
+        if backbone_filter_config.enabled:
+            batch_backbones = filter_backbones_by_quality(
+                batch_backbones,
+                min_score=backbone_filter_config.min_score,
+                max_keep=backbone_filter_config.max_keep,
+            )
+        
+        if not batch_backbones:
+            print(f"  All backbones filtered out in batch {batch_num}")
+            continue
+        
+        all_backbones.extend(batch_backbones)
+        
+        # =====================================================================
+        # Step 2: Design sequences for ALL backbones in parallel (GPU-efficient)
+        # =====================================================================
+        try:
+            batch_sequences = generate_sequences_parallel.remote(
+                batch_backbones, 
+                proteinmpnn_config, 
+                f"{dirs['sequences']}/batch_{batch_num}"
+            )
+        except Exception as e:
+            print(f"  ProteinMPNN batch failed: {e}")
+            continue
+        
+        if not batch_sequences:
+            print(f"  No sequences designed in batch {batch_num}")
+            continue
+        
+        print(f"  Step 2: Designed {len(batch_sequences)} sequences ({len(batch_sequences)//len(batch_backbones)} per backbone)")
+        all_sequences.extend(batch_sequences)
+        
+        # =====================================================================
+        # Step 3: Validate ALL sequences in parallel (GPU-efficient)
+        # =====================================================================
+        try:
+            batch_predictions = validate_sequences_parallel.remote(
+                batch_sequences,
+                target,
+                boltz2_config,
+                f"{dirs['validation_boltz']}/batch_{batch_num}"
+            )
+        except Exception as e:
+            print(f"  Boltz-2 batch failed: {e}")
+            continue
+        
+        if batch_predictions:
+            validated_predictions.extend(batch_predictions)
+            print(f"  Step 3: Validated {len(batch_predictions)}/{len(batch_sequences)} sequences")
+            print(f"  Running total: {len(validated_predictions)}/{adaptive_config.min_validated_candidates} validated candidates")
+        else:
+            print(f"  Step 3: No sequences passed validation in this batch")
+        
+        # =====================================================================
+        # Check if we have enough validated candidates to stop
+        # =====================================================================
+        if len(validated_predictions) >= adaptive_config.min_validated_candidates:
+            print(f"\n  ✓ Early termination: reached {len(validated_predictions)} validated candidates")
+            break
+    
+    # Summary
+    total_backbones = len(all_backbones)
+    max_possible_backbones = adaptive_config.max_batches * adaptive_config.batch_size
+    max_possible_sequences = max_possible_backbones * proteinmpnn_config.num_sequences
+    
+    print(f"\nAdaptive generation summary:")
+    print(f"  Micro-batches used: {batch_num}/{adaptive_config.max_batches}")
+    print(f"  Backbones generated: {total_backbones}")
+    print(f"  Sequences designed: {len(all_sequences)}")
+    print(f"  Validated candidates: {len(validated_predictions)}")
+    
+    if batch_num < adaptive_config.max_batches:
+        saved_backbones = max_possible_backbones - total_backbones
+        saved_sequences = max_possible_sequences - len(all_sequences)
+        if saved_backbones > 0 or saved_sequences > 0:
+            print(f"  Savings from early termination:")
+            print(f"    Skipped: {saved_backbones} backbones, {saved_sequences} sequences")
+            # Estimate cost savings (rough)
+            backbone_cost_per = 600 * MODAL_GPU_COST_PER_SEC["A10G"]  # 600s timeout
+            sequence_cost_per = 300 * MODAL_GPU_COST_PER_SEC["L4"] / proteinmpnn_config.num_sequences
+            validation_cost_per = 900 * MODAL_GPU_COST_PER_SEC["A100"]
+            saved_cost = (saved_backbones * backbone_cost_per + 
+                         saved_sequences * (sequence_cost_per + validation_cost_per))
+            print(f"    Est. cost saved: ${saved_cost:.2f}")
+    
+    return all_backbones, all_sequences, validated_predictions
 
 
 def _run_sequence_design(
@@ -579,12 +1011,33 @@ def _run_decoy_search(
     config: FoldSeekConfig,
     output_dir: str,
     use_mocks: bool,
+    cache_dir: str = None,
 ) -> list[DecoyHit]:
-    """Execute decoy search step."""
+    """Execute decoy search step with optional caching (#5 optimization)."""
     if use_mocks:
         return mock_foldseek(target, config, output_dir)
 
     try:
+        # Check cache first if enabled
+        if config.cache_results and cache_dir:
+            cached_decoys = get_cached_decoys(target, cache_dir)
+            if cached_decoys is not None:
+                # Still need to download structures if not present
+                valid_decoys = []
+                for decoy in cached_decoys:
+                    if os.path.exists(decoy.pdb_path):
+                        valid_decoys.append(decoy)
+                
+                if len(valid_decoys) == len(cached_decoys):
+                    return cached_decoys
+                else:
+                    # Re-download missing structures
+                    cached_decoys = download_decoy_structures.remote(
+                        cached_decoys, f"{output_dir}/structures"
+                    )
+                    return cached_decoys
+        
+        # Run FoldSeek
         decoys = run_foldseek.remote(target, config, output_dir)
 
         # Download actual PDB structures for valid hits
@@ -592,6 +1045,10 @@ def _run_decoy_search(
             decoys = download_decoy_structures.remote(
                 decoys, f"{output_dir}/structures"
             )
+            
+            # Cache results for future runs
+            if config.cache_results and cache_dir:
+                save_decoys_to_cache(target, decoys, cache_dir)
 
         return decoys
     except Exception as e:
@@ -701,6 +1158,80 @@ def _write_inputs(pdb_root: str, entity_dir: str, config: PipelineConfig) -> Non
             }, f, indent=2)
 
 
+def _write_run_manifest(
+    campaign_dir: str, run_id: str, config: PipelineConfig, cost_estimate: dict
+) -> None:
+    """Write run_manifest.json with complete run configuration and cost breakdown."""
+    import json
+    from datetime import datetime
+
+    t = config.target
+    manifest = {
+        "ulid": run_id,
+        "timestamp": datetime.now().isoformat(),
+        "target": {
+            "pdb_id": t.pdb_id,
+            "entity_id": t.entity_id,
+            "name": t.name,
+            "chain_id": t.chain_id,
+            "hotspot_residues": t.hotspot_residues,
+        },
+        "configuration": {
+            "mode": config.mode.value,
+            "num_backbones": config.rfdiffusion.num_designs,
+            "num_sequences_per_backbone": config.proteinmpnn.num_sequences,
+            "total_sequences": config.rfdiffusion.num_designs * config.proteinmpnn.num_sequences,
+            "max_decoys": config.foldseek.max_hits,
+        },
+        "thresholds": {
+            "boltz2": {
+                "max_pae_interaction": config.boltz2.max_pae_interaction,
+                "min_ptm_binder": config.boltz2.min_ptm_binder,
+                "max_rmsd": config.boltz2.max_rmsd,
+            },
+            "chai1": {
+                "min_chain_pair_iptm": config.chai1.min_chain_pair_iptm,
+            },
+        },
+        "cost_ceiling": {
+            "total": cost_estimate["total"],
+            "rfdiffusion": cost_estimate["rfdiffusion"],
+            "proteinmpnn": cost_estimate["proteinmpnn"],
+            "boltz2": cost_estimate["boltz2"],
+            "foldseek": cost_estimate["foldseek"],
+            "chai1": cost_estimate["chai1"],
+        },
+    }
+
+    manifest_path = f"{campaign_dir}/run_manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def _write_stage_metrics(campaign_dir: str, stage_metrics: list[dict], runtime_seconds: float) -> None:
+    """Write stage_metrics.json with actual vs ceiling costs for each stage."""
+    import json
+    
+    if not stage_metrics:
+        return
+    
+    total_actual = sum(m["actual_cost_usd"] for m in stage_metrics)
+    total_ceiling = sum(m["ceiling_cost_usd"] for m in stage_metrics)
+    
+    metrics = {
+        "runtime_seconds": runtime_seconds,
+        "total_actual_cost_usd": total_actual,
+        "total_ceiling_cost_usd": total_ceiling,
+        "savings_usd": total_ceiling - total_actual,
+        "savings_pct": (total_ceiling - total_actual) / total_ceiling * 100 if total_ceiling > 0 else 0,
+        "stages": stage_metrics,
+    }
+    
+    metrics_path = f"{campaign_dir}/stage_metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+
 def _write_metrics_csv(metrics_dir: str, candidates: list[BinderCandidate]) -> None:
     """Write scores_combined.csv with all candidate metrics."""
     import csv
@@ -765,100 +1296,119 @@ def _create_best_symlinks(
 def print_dry_run_summary(config: PipelineConfig) -> None:
     """
     Print a detailed human-readable overview of deployment parameters and costs.
+    Uses limit-based ceiling forecasting for deterministic cost estimates.
     """
-    num_backbones = config.rfdiffusion.num_designs
-    num_sequences_per_backbone = config.proteinmpnn.num_sequences
-    total_sequences = num_backbones * num_sequences_per_backbone
-    num_decoys = config.foldseek.max_hits
-
-    # Assume 50% pass Boltz-2 validation (same assumption as estimate_cost)
-    passing_sequences = int(total_sequences * 0.5)
-    chai1_pairs = passing_sequences * num_decoys
-
-    # Calculate per-step costs
-    rfdiffusion_hours = (STEP_RUNTIMES["rfdiffusion"] * num_backbones) / 3600
-    rfdiffusion_cost = rfdiffusion_hours * GPU_COSTS["A10G"]
-
-    proteinmpnn_hours = (STEP_RUNTIMES["proteinmpnn"] * num_backbones) / 3600
-    proteinmpnn_cost = proteinmpnn_hours * GPU_COSTS["L4"]
-
-    boltz2_hours = (STEP_RUNTIMES["boltz2"] * total_sequences) / 3600
-    boltz2_cost = boltz2_hours * GPU_COSTS["A100"]
-
-    foldseek_cost = 0.01
-
-    chai1_hours = (STEP_RUNTIMES["chai1"] * chai1_pairs) / 3600
-    chai1_cost = chai1_hours * GPU_COSTS["A100"]
-
-    total_cost = rfdiffusion_cost + proteinmpnn_cost + boltz2_cost + foldseek_cost + chai1_cost
-
-    # Estimate total runtime (sequential worst-case)
-    est_runtime_sec = (
-        STEP_RUNTIMES["rfdiffusion"] * num_backbones
-        + STEP_RUNTIMES["proteinmpnn"] * num_backbones
-        + STEP_RUNTIMES["boltz2"] * total_sequences
-        + STEP_RUNTIMES["foldseek"]
-        + STEP_RUNTIMES["chai1"] * chai1_pairs
-    )
+    # Get accurate cost estimates with limit enforcement
+    costs = estimate_cost(config)
+    
+    # Extract effective counts (after applying limits)
+    eff = costs["_effective"]
+    timeouts = costs["_timeouts"]
+    
+    # Requested vs effective (limited) values
+    req_backbones = config.rfdiffusion.num_designs
+    req_sequences = req_backbones * config.proteinmpnn.num_sequences
+    req_decoys = config.foldseek.max_hits
+    
+    eff_backbones = eff["backbones"]
+    eff_sequences = eff["sequences"]
+    eff_boltz2 = eff["boltz2_validations"]
+    eff_decoys = eff["decoys"]
+    eff_chai1 = eff["chai1_pairs"]
+    
+    # Calculate time breakdown
+    rfdiffusion_sec = timeouts["rfdiffusion"]
+    proteinmpnn_sec = timeouts["proteinmpnn"] * eff_backbones
+    boltz2_sec = timeouts["boltz2"] * eff_boltz2
+    foldseek_sec = timeouts["foldseek"]
+    chai1_sec = timeouts["chai1"] * eff_chai1
+    
+    est_runtime_sec = costs["_runtime_sec"]
     est_runtime_min = est_runtime_sec / 60
 
+    t = config.target
+    limits = config.limits
+    
+    print()
     print("=" * 70)
-    print("  DRY RUN - DEPLOYMENT PREVIEW")
+    print("DRY RUN — DEPLOYMENT PREVIEW (Limit-Based Ceiling Forecast)")
     print("=" * 70)
     print()
-    print("┌─────────────────────────────────────────────────────────────────────┐")
-    print("│  PIPELINE CONFIGURATION                                             │")
-    print("├─────────────────────────────────────────────────────────────────────┤")
-    print(f"│  Target PDB:           {config.target.pdb_path:<43} │")
-    print(f"│  Chain ID:             {config.target.chain_id:<43} │")
-    print(f"│  Hotspot Residues:     {str(config.target.hotspot_residues):<43} │")
-    print("├─────────────────────────────────────────────────────────────────────┤")
-    print(f"│  Backbone Designs:     {num_backbones:<43} │")
-    print(f"│  Sequences/Backbone:   {num_sequences_per_backbone:<43} │")
-    print(f"│  Total Sequences:      {total_sequences:<43} │")
-    print(f"│  Max Decoys:           {num_decoys:<43} │")
-    print(f"│  Budget Limit:         ${config.max_compute_usd:<42.2f} │")
-    print("└─────────────────────────────────────────────────────────────────────┘")
+    print("TARGET")
+    print("-" * 70)
+    print(f"Name: {t.name}")
+    print(f"PDB ID: {t.pdb_id}")
+    print(f"Entity ID: {t.entity_id}")
+    print(f"Hotspot residues: {', '.join(str(r) for r in t.hotspot_residues)}")
     print()
-    print("┌─────────────────────────────────────────────────────────────────────┐")
-    print("│  PHASE 1: GENERATION                                                │")
-    print("├─────────────────────────────────────────────────────────────────────┤")
-    print(f"│  RFDiffusion     │ GPU: A10G   │ {num_backbones:>3} runs × ~60s  │  ${rfdiffusion_cost:>6.3f}  │")
-    print(f"│  ProteinMPNN     │ GPU: L4     │ {num_backbones:>3} runs × ~15s  │  ${proteinmpnn_cost:>6.3f}  │")
-    print("├─────────────────────────────────────────────────────────────────────┤")
-    print("│  PHASE 2: VALIDATION                                                │")
-    print("├─────────────────────────────────────────────────────────────────────┤")
-    print(f"│  Boltz-2         │ GPU: A100   │ {total_sequences:>3} runs × ~120s │  ${boltz2_cost:>6.3f}  │")
-    print("├─────────────────────────────────────────────────────────────────────┤")
-    print("│  PHASE 3: SELECTIVITY                                               │")
-    print("├─────────────────────────────────────────────────────────────────────┤")
-    print(f"│  FoldSeek        │ CPU         │   1 run  × ~30s  │  ${foldseek_cost:>6.3f}  │")
-    print(f"│  Chai-1          │ GPU: A100   │ {chai1_pairs:>3} runs × ~90s  │  ${chai1_cost:>6.3f}  │")
-    print("└─────────────────────────────────────────────────────────────────────┘")
+    
+    print("CONFIGURATION (Requested → Effective after limits)")
+    print("-" * 70)
+    
+    # Show requested vs effective values with limit indicators
+    backbone_limited = req_backbones > eff_backbones
+    seq_limited = req_sequences > eff_sequences
+    decoy_limited = req_decoys > eff_decoys
+    
+    backbone_str = f"{req_backbones} → {eff_backbones}" if backbone_limited else str(eff_backbones)
+    seq_str = f"{req_sequences} → {eff_sequences}" if seq_limited else str(eff_sequences)
+    decoy_str = f"{req_decoys} → {eff_decoys}" if decoy_limited else str(eff_decoys)
+    
+    print(f"Backbones:     {backbone_str}" + (" (capped by limit)" if backbone_limited else ""))
+    print(f"Sequences:     {seq_str}" + (" (capped by limit)" if seq_limited else ""))
+    print(f"Boltz-2 runs:  {eff_boltz2}")
+    print(f"Decoys:        {decoy_str}" + (" (capped by limit)" if decoy_limited else ""))
+    print(f"Chai-1 pairs:  {eff_chai1}")
     print()
-    print("┌─────────────────────────────────────────────────────────────────────┐")
-    print("│  COST SUMMARY                                                       │")
-    print("├─────────────────────────────────────────────────────────────────────┤")
-    budget_status = "✓ WITHIN BUDGET" if total_cost <= config.max_compute_usd else "⚠ EXCEEDS BUDGET"
-    print(f"│  Estimated Total Cost:      ${total_cost:<8.2f}  {budget_status:<21} │")
-    print(f"│  Estimated Runtime:         ~{est_runtime_min:<6.0f} minutes (sequential)        │")
-    print(f"│  Budget Limit:              ${config.max_compute_usd:<8.2f}                           │")
-    print("└─────────────────────────────────────────────────────────────────────┘")
+    
+    print("STAGE LIMITS")
+    print("-" * 70)
+    print(f"{'Stage':<20} {'Timeout':<15} {'Max Designs':<15}")
+    print("-" * 70)
+    for stage in ["rfdiffusion", "proteinmpnn", "boltz2", "foldseek", "chai1"]:
+        timeout = limits.get_timeout(stage)
+        max_designs = limits.get_max_designs(stage)
+        timeout_str = f"{timeout}s"
+        print(f"{stage:<20} {timeout_str:<15} {max_designs:<15}")
+    print()
+    
+    print("COST BREAKDOWN (Modal pricing, ceiling estimate)")
+    print("-" * 70)
+    print(f"{'Step':<20} {'GPU':<12} {'Runs':<10} {'Time':<12} {'Cost':>12}")
+    print("-" * 70)
+    cost_rfd = costs["rfdiffusion"]
+    cost_mpnn = costs["proteinmpnn"]
+    cost_boltz = costs["boltz2"]
+    cost_fseek = costs["foldseek"]
+    cost_chai = costs["chai1"]
+    cost_total = costs["total"]
+    print(f"{'RFDiffusion':<20} {'A10G':<12} {eff_backbones:<10} {rfdiffusion_sec:>6}s {'$' + f'{cost_rfd:.3f}':>12}")
+    print(f"{'ProteinMPNN':<20} {'L4':<12} {eff_backbones:<10} {proteinmpnn_sec:>6}s {'$' + f'{cost_mpnn:.3f}':>12}")
+    print(f"{'Boltz-2':<20} {'A100-80GB':<12} {eff_boltz2:<10} {boltz2_sec:>6}s {'$' + f'{cost_boltz:.3f}':>12}")
+    print(f"{'FoldSeek':<20} {'CPU':<12} {1:<10} {foldseek_sec:>6}s {'$' + f'{cost_fseek:.3f}':>12}")
+    print(f"{'Chai-1':<20} {'A100-80GB':<12} {eff_chai1:<10} {chai1_sec:>6}s {'$' + f'{cost_chai:.3f}':>12}")
+    print("-" * 70)
+    print(f"{'CEILING TOTAL':<20} {'':<12} {'':<10} {int(est_runtime_sec):>6}s {'$' + f'{cost_total:.2f}':>12}")
+    print()
+    
+    budget_status = "✓ WITHIN BUDGET" if costs["total"] <= config.max_compute_usd else "✗ EXCEEDS BUDGET"
+    print(f"Budget: ${config.max_compute_usd:.2f}  [{budget_status}]")
+    print(f"Max runtime: ~{est_runtime_min:.0f} minutes (sequential worst-case)")
     print()
 
-    if total_cost > config.max_compute_usd:
-        scale_factor = config.max_compute_usd / total_cost
-        suggested_designs = max(1, int(num_backbones * scale_factor))
-        suggested_sequences = max(1, int(num_sequences_per_backbone * scale_factor))
-        print("┌─────────────────────────────────────────────────────────────────────┐")
-        print("│  ⚠ BUDGET WARNING                                                   │")
-        print("├─────────────────────────────────────────────────────────────────────┤")
-        print(f"│  Consider reducing designs to ~{suggested_designs} and sequences to ~{suggested_sequences}           │")
-        print(f"│  to stay within the ${config.max_compute_usd:.2f} budget.                                │")
-        print("└─────────────────────────────────────────────────────────────────────┘")
+    if costs["total"] > config.max_compute_usd:
+        scale_factor = config.max_compute_usd / costs["total"]
+        suggested_designs = max(1, int(req_backbones * scale_factor))
+        suggested_sequences = max(1, int(config.proteinmpnn.num_sequences * scale_factor))
+        print("⚠ BUDGET WARNING")
+        print("-" * 70)
+        print("Options to reduce cost:")
+        print(f"  1. Reduce designs: --num-designs {suggested_designs} --num-sequences {suggested_sequences}")
+        print(f"  2. Lower stage limits in YAML config (limits.boltz2.max_designs, etc.)")
+        print(f"  3. Increase budget: --max-budget {cost_total * 1.1:.2f}")
         print()
 
-    print("To run this pipeline, remove the --dry-run flag.")
+    print("To run: remove --dry-run flag")
     print()
 
 
@@ -892,9 +1442,10 @@ def upload_target_pdb(local_pdb_content: str, filename: str) -> str:
 
 @app.local_entrypoint()
 def main(
-    pdb_id: str,
-    entity_id: int,
-    hotspot_residues: str,
+    pdb_id: str = None,
+    entity_id: int = None,
+    hotspot_residues: str = None,
+    config: str = None,
     mode: str = "bind",
     num_designs: int = 5,
     num_sequences: int = 4,
@@ -906,9 +1457,10 @@ def main(
     Run the protein binder design pipeline from command line.
 
     Args:
-        pdb_id: 4-letter PDB code (e.g., "3DI3")
+        pdb_id: 4-letter PDB code (e.g., "3DI3") - required unless --config is provided
         entity_id: Polymer entity ID for the target (e.g., 2 for IL7RA in 3DI3)
         hotspot_residues: Comma-separated list of hotspot residue indices
+        config: Path to YAML configuration file (overrides other arguments)
         mode: Generation mode - "bind" for binder design (default: "bind")
         num_designs: Number of backbone designs (default: 5)
         num_sequences: Sequences per backbone (default: 4)
@@ -916,86 +1468,168 @@ def main(
         max_budget: Maximum compute budget in USD (default: 5.0)
         dry_run: Preview deployment parameters and costs without running (default: False)
     
-    Example:
+    Example with CLI args:
         uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 --hotspot-residues "58,80,139" --mode bind
+    
+    Example with YAML config:
+        uv run modal run pipeline.py --config config.yaml
+        uv run modal run pipeline.py --config config.yaml --dry-run
     
     Generated proteins are named: <pdb_id>_E<entity_id>_<mode>_<ulid>
     Example: 3DI3_E2_bind_01ARZ3NDEKTSV4RRFFQ69G5FAV
     """
-    from common import get_entity_info, download_pdb
+    from common import get_entity_info, download_pdb, load_config_from_yaml
     import tempfile
     import os
     
-    # Parse and validate mode
-    mode = mode.lower().strip()
-    valid_modes = [m.value for m in GenerationMode]
-    if mode not in valid_modes:
-        raise ValueError(f"Invalid mode '{mode}'. Valid modes: {valid_modes}")
-    generation_mode = GenerationMode(mode)
-    
-    # Parse hotspot residues
-    hotspots = [int(r.strip()) for r in hotspot_residues.split(",")]
-    
-    # Validate PDB ID format
-    pdb_id = pdb_id.upper().strip()
-    if len(pdb_id) != 4:
-        raise ValueError(f"PDB ID must be 4 characters: {pdb_id}")
-
-    # Fetch entity info from RCSB
-    print(f"Fetching entity {entity_id} info for PDB {pdb_id}...")
-    entity_info = get_entity_info(pdb_id, entity_id)
-    chains = entity_info.get("chains", [])
-    
-    if not chains:
-        raise ValueError(f"No chains found for entity {entity_id} in PDB {pdb_id}")
-    
-    chain_id = chains[0]  # Use first chain for this entity
-    entity_name = entity_info.get("description", f"{pdb_id}_entity{entity_id}")
-    uniprot_ids = entity_info.get("uniprot_ids", [])
-    
-    print(f"  Entity: {entity_name}")
-    print(f"  Chain(s): {', '.join(chains)}")
-    if uniprot_ids:
-        print(f"  UniProt: {', '.join(uniprot_ids)}")
-
-    # Download PDB to temp file and upload to Modal volume
-    with tempfile.TemporaryDirectory() as tmpdir:
-        local_pdb = os.path.join(tmpdir, f"{pdb_id.lower()}.pdb")
-        print(f"Downloading PDB {pdb_id}...")
-        download_pdb(pdb_id, local_pdb)
+    # Load config from YAML if provided
+    if config is not None:
+        print(f"Loading configuration from: {config}")
+        pipeline_config = load_config_from_yaml(config)
         
-        with open(local_pdb, "r") as f:
-            pdb_content = f.read()
+        # Extract target info for entity lookup
+        t = pipeline_config.target
+        pdb_id = t.pdb_id
+        entity_id = t.entity_id
         
-        remote_pdb_path = upload_target_pdb.remote(pdb_content, f"{pdb_id.lower()}.pdb")
-        print(f"Uploaded to: {remote_pdb_path}")
+        # Fetch entity info from RCSB (local API call, no Modal)
+        print(f"Fetching entity {entity_id} info for PDB {pdb_id}...")
+        entity_info = get_entity_info(pdb_id, entity_id)
+        chains = entity_info.get("chains", [])
+        
+        if not chains:
+            raise ValueError(f"No chains found for entity {entity_id} in PDB {pdb_id}")
+        
+        chain_id = chains[0]
+        entity_name = entity_info.get("description", f"{pdb_id}_entity{entity_id}")
+        uniprot_ids = entity_info.get("uniprot_ids", [])
+        
+        print(f"  Entity: {entity_name}")
+        print(f"  Chain(s): {', '.join(chains)}")
+        if uniprot_ids:
+            print(f"  UniProt: {', '.join(uniprot_ids)}")
+        
+        # Update target with resolved chain info
+        pipeline_config.target.chain_id = chain_id
+        pipeline_config.target.name = entity_name
+        
+        if dry_run:
+            pipeline_config.target.pdb_path = f"/data/targets/{pdb_id.lower()}.pdb"  # Placeholder
+            print_dry_run_summary(pipeline_config)
+            return None
+        
+        # Download PDB and upload to Modal volume
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_pdb = os.path.join(tmpdir, f"{pdb_id.lower()}.pdb")
+            print(f"Downloading PDB {pdb_id}...")
+            download_pdb(pdb_id, local_pdb)
+            
+            with open(local_pdb, "r") as f:
+                pdb_content = f.read()
+            
+            remote_pdb_path = upload_target_pdb.remote(pdb_content, f"{pdb_id.lower()}.pdb")
+            print(f"Uploaded to: {remote_pdb_path}")
+        
+        pipeline_config.target.pdb_path = remote_pdb_path
+        
+        # Run pipeline with YAML config
+        result = run_pipeline.remote(pipeline_config, use_mocks=use_mocks)
+        
+    else:
+        # Require CLI arguments if no config file
+        if pdb_id is None or entity_id is None or hotspot_residues is None:
+            raise ValueError(
+                "Either --config must be provided, or all of: --pdb-id, --entity-id, --hotspot-residues"
+            )
+        
+        # Parse and validate mode
+        mode = mode.lower().strip()
+        valid_modes = [m.value for m in GenerationMode]
+        if mode not in valid_modes:
+            raise ValueError(f"Invalid mode '{mode}'. Valid modes: {valid_modes}")
+        generation_mode = GenerationMode(mode)
+        
+        # Parse hotspot residues
+        hotspots = [int(r.strip()) for r in hotspot_residues.split(",")]
+        
+        # Validate PDB ID format
+        pdb_id = pdb_id.upper().strip()
+        if len(pdb_id) != 4:
+            raise ValueError(f"PDB ID must be 4 characters: {pdb_id}")
 
-    # Build configuration
-    config = PipelineConfig(
-        target=TargetProtein(
-            pdb_id=pdb_id,
-            entity_id=entity_id,
-            hotspot_residues=hotspots,
-            pdb_path=remote_pdb_path,
-            chain_id=chain_id,
-            name=entity_name,
-        ),
-        mode=generation_mode,
-        rfdiffusion=RFDiffusionConfig(num_designs=num_designs),
-        proteinmpnn=ProteinMPNNConfig(num_sequences=num_sequences),
-        boltz2=Boltz2Config(),
-        foldseek=FoldSeekConfig(),
-        chai1=Chai1Config(),
-        max_compute_usd=max_budget,
-    )
+        # Fetch entity info from RCSB (local API call, no Modal)
+        print(f"Fetching entity {entity_id} info for PDB {pdb_id}...")
+        entity_info = get_entity_info(pdb_id, entity_id)
+        chains = entity_info.get("chains", [])
+        
+        if not chains:
+            raise ValueError(f"No chains found for entity {entity_id} in PDB {pdb_id}")
+        
+        chain_id = chains[0]  # Use first chain for this entity
+        entity_name = entity_info.get("description", f"{pdb_id}_entity{entity_id}")
+        uniprot_ids = entity_info.get("uniprot_ids", [])
+        
+        print(f"  Entity: {entity_name}")
+        print(f"  Chain(s): {', '.join(chains)}")
+        if uniprot_ids:
+            print(f"  UniProt: {', '.join(uniprot_ids)}")
 
-    # Dry run mode: print summary and exit
-    if dry_run:
-        print_dry_run_summary(config)
-        return None
+        # Dry run mode: print summary and exit (before any Modal calls)
+        if dry_run:
+            # Build config with placeholder path for cost estimation
+            pipeline_config = PipelineConfig(
+                target=TargetProtein(
+                    pdb_id=pdb_id,
+                    entity_id=entity_id,
+                    hotspot_residues=hotspots,
+                    pdb_path=f"/data/targets/{pdb_id.lower()}.pdb",  # Placeholder
+                    chain_id=chain_id,
+                    name=entity_name,
+                ),
+                mode=generation_mode,
+                rfdiffusion=RFDiffusionConfig(num_designs=num_designs),
+                proteinmpnn=ProteinMPNNConfig(num_sequences=num_sequences),
+                boltz2=Boltz2Config(),
+                foldseek=FoldSeekConfig(),
+                chai1=Chai1Config(),
+                max_compute_usd=max_budget,
+            )
+            print_dry_run_summary(pipeline_config)
+            return None
 
-    # Run pipeline
-    result = run_pipeline.remote(config, use_mocks=use_mocks)
+        # Download PDB to temp file and upload to Modal volume
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_pdb = os.path.join(tmpdir, f"{pdb_id.lower()}.pdb")
+            print(f"Downloading PDB {pdb_id}...")
+            download_pdb(pdb_id, local_pdb)
+            
+            with open(local_pdb, "r") as f:
+                pdb_content = f.read()
+            
+            remote_pdb_path = upload_target_pdb.remote(pdb_content, f"{pdb_id.lower()}.pdb")
+            print(f"Uploaded to: {remote_pdb_path}")
+
+        # Build configuration
+        pipeline_config = PipelineConfig(
+            target=TargetProtein(
+                pdb_id=pdb_id,
+                entity_id=entity_id,
+                hotspot_residues=hotspots,
+                pdb_path=remote_pdb_path,
+                chain_id=chain_id,
+                name=entity_name,
+            ),
+            mode=generation_mode,
+            rfdiffusion=RFDiffusionConfig(num_designs=num_designs),
+            proteinmpnn=ProteinMPNNConfig(num_sequences=num_sequences),
+            boltz2=Boltz2Config(),
+            foldseek=FoldSeekConfig(),
+            chai1=Chai1Config(),
+            max_compute_usd=max_budget,
+        )
+
+        # Run pipeline
+        result = run_pipeline.remote(pipeline_config, use_mocks=use_mocks)
 
     # Print summary
     print("\n" + "=" * 60)
@@ -1085,41 +1719,165 @@ def design_binders(
 
 
 if __name__ == "__main__":
-    # Example usage with mocks for testing
+    # Standalone CLI that can run without Modal for dry-run mode
+    import argparse
     import sys
+    
+    parser = argparse.ArgumentParser(
+        description="Protein binder design pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Dry run with CLI args (no Modal, no GPU, just cost estimation):
+  python pipeline.py --pdb-id 3DI3 --entity-id 2 --hotspot-residues 58,80,139 --dry-run
 
-    if len(sys.argv) > 1:
-        # Use provided PDB path
-        result = design_binders(
-            target_pdb_path=sys.argv[1],
-            hotspot_residues=[10, 15, 20],
-            use_mocks=True,
-        )
+  # Dry run with YAML config:
+  python pipeline.py --config config.yaml --dry-run
+
+  # Full run (use 'modal run' instead):
+  modal run pipeline.py --pdb-id 3DI3 --entity-id 2 --hotspot-residues 58,80,139
+  modal run pipeline.py --config config.yaml
+        """
+    )
+    parser.add_argument("--config", help="Path to YAML configuration file")
+    parser.add_argument("--pdb-id", help="4-letter PDB code (e.g., 3DI3)")
+    parser.add_argument("--entity-id", type=int, help="Polymer entity ID")
+    parser.add_argument("--hotspot-residues", help="Comma-separated residue indices")
+    parser.add_argument("--mode", default="bind", help="Generation mode (default: bind)")
+    parser.add_argument("--num-designs", type=int, default=5, help="Number of backbones (default: 5)")
+    parser.add_argument("--num-sequences", type=int, default=4, help="Sequences per backbone (default: 4)")
+    parser.add_argument("--max-budget", type=float, default=5.0, help="Max budget in USD (default: 5.0)")
+    parser.add_argument("--dry-run", action="store_true", help="Preview costs without running")
+    
+    args = parser.parse_args()
+    
+    # Validate that we have either --config or the required CLI args
+    if args.config is None and (args.pdb_id is None or args.entity_id is None or args.hotspot_residues is None):
+        print("Error: Either --config must be provided, or all of: --pdb-id, --entity-id, --hotspot-residues")
+        sys.exit(1)
+    
+    # For dry-run, we avoid importing Modal entirely
+    if args.dry_run:
+        # Import only what we need for cost estimation (no Modal)
+        from common import get_entity_info, GenerationMode, load_config_from_yaml
+        
+        if args.config:
+            # Load from YAML config
+            print(f"Loading configuration from: {args.config}")
+            try:
+                config = load_config_from_yaml(args.config)
+            except Exception as e:
+                print(f"Error loading config: {e}")
+                sys.exit(1)
+            
+            pdb_id = config.target.pdb_id
+            entity_id = config.target.entity_id
+            
+            # Fetch entity info (local HTTP call, no Modal)
+            print(f"Fetching entity {entity_id} info for PDB {pdb_id}...")
+            try:
+                entity_info = get_entity_info(pdb_id, entity_id)
+            except Exception as e:
+                print(f"Error fetching entity info: {e}")
+                sys.exit(1)
+            
+            chains = entity_info.get("chains", [])
+            if not chains:
+                print(f"Error: No chains found for entity {entity_id} in PDB {pdb_id}")
+                sys.exit(1)
+            
+            chain_id = chains[0]
+            entity_name = entity_info.get("description", f"{pdb_id}_entity{entity_id}")
+            uniprot_ids = entity_info.get("uniprot_ids", [])
+            
+            print(f"  Entity: {entity_name}")
+            print(f"  Chain(s): {', '.join(chains)}")
+            if uniprot_ids:
+                print(f"  UniProt: {', '.join(uniprot_ids)}")
+            
+            # Update target with resolved chain info
+            config.target.chain_id = chain_id
+            config.target.name = entity_name
+            config.target.pdb_path = f"/data/targets/{pdb_id.lower()}.pdb"  # Placeholder
+            
+        else:
+            # Build config from CLI args
+            pdb_id = args.pdb_id.upper().strip()
+            if len(pdb_id) != 4:
+                print(f"Error: PDB ID must be 4 characters: {pdb_id}")
+                sys.exit(1)
+            
+            hotspots = [int(r.strip()) for r in args.hotspot_residues.split(",")]
+            
+            mode = args.mode.lower().strip()
+            valid_modes = [m.value for m in GenerationMode]
+            if mode not in valid_modes:
+                print(f"Error: Invalid mode '{mode}'. Valid modes: {valid_modes}")
+                sys.exit(1)
+            generation_mode = GenerationMode(mode)
+            
+            # Fetch entity info (local HTTP call, no Modal)
+            print(f"Fetching entity {args.entity_id} info for PDB {pdb_id}...")
+            try:
+                entity_info = get_entity_info(pdb_id, args.entity_id)
+            except Exception as e:
+                print(f"Error fetching entity info: {e}")
+                sys.exit(1)
+            
+            chains = entity_info.get("chains", [])
+            if not chains:
+                print(f"Error: No chains found for entity {args.entity_id} in PDB {pdb_id}")
+                sys.exit(1)
+            
+            chain_id = chains[0]
+            entity_name = entity_info.get("description", f"{pdb_id}_entity{args.entity_id}")
+            uniprot_ids = entity_info.get("uniprot_ids", [])
+            
+            print(f"  Entity: {entity_name}")
+            print(f"  Chain(s): {', '.join(chains)}")
+            if uniprot_ids:
+                print(f"  UniProt: {', '.join(uniprot_ids)}")
+            
+            # Build config for cost estimation (import Pydantic models only)
+            from common import (
+                PipelineConfig, TargetProtein, RFDiffusionConfig,
+                ProteinMPNNConfig, Boltz2Config, FoldSeekConfig, Chai1Config
+            )
+            
+            config = PipelineConfig(
+                target=TargetProtein(
+                    pdb_id=pdb_id,
+                    entity_id=args.entity_id,
+                    hotspot_residues=hotspots,
+                    pdb_path=f"/data/targets/{pdb_id.lower()}.pdb",  # Placeholder
+                    chain_id=chain_id,
+                    name=entity_name,
+                ),
+                mode=generation_mode,
+                rfdiffusion=RFDiffusionConfig(num_designs=args.num_designs),
+                proteinmpnn=ProteinMPNNConfig(num_sequences=args.num_sequences),
+                boltz2=Boltz2Config(),
+                foldseek=FoldSeekConfig(),
+                chai1=Chai1Config(),
+                max_compute_usd=args.max_budget,
+            )
+        
+        # Print cost summary (local function, no Modal)
+        print_dry_run_summary(config)
+        sys.exit(0)
+    
     else:
-        print("Usage: python pipeline.py <target.pdb>")
-        print("\nRunning with mock data for demonstration...")
-
-        # Create a mock target PDB for testing
-        os.makedirs("/tmp/test_pipeline", exist_ok=True)
-        mock_pdb = "/tmp/test_pipeline/mock_target.pdb"
-        with open(mock_pdb, "w") as f:
-            f.write("HEADER    MOCK TARGET\n")
-            for i in range(100):
-                f.write(
-                    f"ATOM  {i+1:5d}  CA  ALA A{i+1:4d}    "
-                    f"{i*3.8:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00           C\n"
-                )
-            f.write("END\n")
-
-        result = design_binders(
-            target_pdb_path=mock_pdb,
-            hotspot_residues=[10, 15, 20, 25, 30],
-            num_designs=3,
-            num_sequences=2,
-            use_mocks=True,
-        )
-
-        print(f"\nGenerated {len(result.candidates)} candidates")
-        if result.best_candidate:
-            print(f"Best candidate: {result.best_candidate.candidate_id}")
-            print(f"Best score: {result.best_candidate.final_score:.2f}")
+        # Non-dry-run: tell user to use modal run
+        if args.config:
+            print("Error: For actual pipeline runs, use 'modal run':")
+            print(f"  modal run pipeline.py --config {args.config}")
+            print("\nFor dry-run (cost estimation only):")
+            print(f"  python pipeline.py --config {args.config} --dry-run")
+        else:
+            print("Error: For actual pipeline runs, use 'modal run':")
+            print(f"  modal run pipeline.py --pdb-id {args.pdb_id} --entity-id {args.entity_id} \\")
+            print(f"    --hotspot-residues \"{args.hotspot_residues}\"")
+            print("\nFor dry-run (cost estimation only):")
+            print(f"  python pipeline.py --pdb-id {args.pdb_id} --entity-id {args.entity_id} \\")
+            print(f"    --hotspot-residues \"{args.hotspot_residues}\" --dry-run")
+        sys.exit(1)

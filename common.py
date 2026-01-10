@@ -293,9 +293,9 @@ class Boltz2Config(BaseModel):
     """Configuration for Boltz-2 structure prediction.
     
     Thresholds based on AlphaProteo SI 2.2 (optimized AF3 metrics):
-    - min_pae_interaction < 1.5 Å: Anchor lock at hotspots
-    - ptm_binder > 0.80: Binder fold quality
-    - rmsd < 2.5 Å: Self-consistency vs RFDiffusion
+    1. min_pae_interaction < 1.5 Å: Anchor lock at hotspots
+    2. ptm_binder > 0.80: Binder fold quality
+    3. rmsd < 2.5 Å: Self-consistency vs RFDiffusion
     """
 
     num_recycles: int = Field(default=3, ge=1, le=10, description="Number of recycling iterations")
@@ -304,10 +304,6 @@ class Boltz2Config(BaseModel):
     max_pae_interaction: float = Field(default=1.5, ge=0.0, le=31.0, description="Max PAE at hotspots (Anchor Lock)")
     min_ptm_binder: float = Field(default=0.80, ge=0.0, le=1.0, description="Min pTM for binder-only (Fold Quality)")
     max_rmsd: float = Field(default=2.5, ge=0.0, le=10.0, description="Max RMSD vs RFDiffusion backbone (Self-Consistency)")
-    
-    # Legacy thresholds (still applied)
-    min_iplddt: float = Field(default=0.8, ge=0.0, le=1.0, description="Minimum interface pLDDT threshold")
-    max_pae: float = Field(default=5.0, ge=0.0, le=31.0, description="Maximum overall PAE threshold")
 
 
 class FoldSeekConfig(BaseModel):
@@ -319,6 +315,7 @@ class FoldSeekConfig(BaseModel):
     database: str = Field(default="pdb100", description="Database to search (pdb100, afdb50, etc.)")
     max_hits: int = Field(default=5, ge=1, le=100, description="Maximum decoys (fewer = cheaper)")
     evalue_threshold: float = Field(default=1e-3, ge=0.0, description="E-value cutoff")
+    cache_results: bool = Field(default=True, description="Cache decoy results by target (saves repeated FoldSeek calls)")
 
 
 class Chai1Config(BaseModel):
@@ -326,6 +323,11 @@ class Chai1Config(BaseModel):
 
     num_samples: int = Field(default=1, ge=1, le=5, description="Samples per binder-decoy pair")
     min_chain_pair_iptm: float = Field(default=0.5, ge=0.0, le=1.0, description="chain_pair_iptm threshold for cross-reactivity")
+    num_recycles: int = Field(default=3, ge=1, le=10, description="Number of recycling iterations")
+    tiered_checking: bool = Field(default=True, description="Use tiered decoy checking (Tier 1/2/3) for cost savings")
+    tier1_min_tm: float = Field(default=0.7, ge=0.0, le=1.0, description="Min TM-score for Tier 1 (highest risk)")
+    tier2_min_tm: float = Field(default=0.5, ge=0.0, le=1.0, description="Min TM-score for Tier 2")
+    tier2_max_decoys: int = Field(default=2, ge=1, le=10, description="Max decoys in Tier 2")
 
 
 class ClusterConfig(BaseModel):
@@ -350,6 +352,109 @@ class ScoringWeights(BaseModel):
     beta: float = Field(default=0.5, ge=0.0, description="Weight for max decoy affinity (selectivity penalty)")
 
 
+class BackboneFilterConfig(BaseModel):
+    """Configuration for backbone quality pre-screening (#2 optimization).
+    
+    Filters low-quality RFDiffusion backbones before ProteinMPNN to save downstream costs.
+    """
+
+    enabled: bool = Field(default=True, description="Enable backbone quality filtering")
+    min_score: float = Field(default=0.4, ge=0.0, le=1.0, description="Min RFDiffusion confidence score")
+    max_keep: Optional[int] = Field(default=None, ge=1, description="Max backbones to keep (None = no limit)")
+
+
+class AdaptiveGenerationConfig(BaseModel):
+    """Configuration for adaptive generation with early termination (#3 optimization).
+    
+    Uses micro-batching to preserve GPU throughput while enabling early termination.
+    Generates backbones in batches, validates all, then decides whether to continue.
+    
+    Stops generation early when enough high-quality candidates are found,
+    saving significant compute on RFDiffusion, ProteinMPNN, and Boltz-2.
+    """
+
+    enabled: bool = Field(default=True, description="Enable adaptive generation")
+    min_validated_candidates: int = Field(default=3, ge=1, description="Stop when this many pass Boltz-2")
+    batch_size: int = Field(default=4, ge=1, le=16, description="Backbones to generate per micro-batch (GPU-efficient)")
+    max_batches: int = Field(default=3, ge=1, le=10, description="Maximum micro-batches before stopping")
+
+
+# =============================================================================
+# Stage Limits Configuration
+# =============================================================================
+
+
+class StageLimits(BaseModel):
+    """Limits for a single pipeline stage.
+    
+    Used to enforce timeouts and max design counts per stage.
+    If not specified, defaults are used.
+    """
+    
+    timeout_seconds: Optional[int] = Field(
+        default=None, 
+        ge=1, 
+        description="Max seconds for this stage (None = use default)"
+    )
+    max_designs: Optional[int] = Field(
+        default=None, 
+        ge=1, 
+        description="Max designs/sequences to process in this stage (None = use default)"
+    )
+
+
+class PipelineLimits(BaseModel):
+    """Limits for all pipeline stages.
+    
+    Enforces timeouts and max design counts per stage.
+    Defaults are used if not specified in YAML config.
+    
+    Default timeouts are based on Modal @app.function decorators.
+    Default max_designs are reasonable limits for cost control.
+    """
+    
+    # Stage-specific limits
+    rfdiffusion: StageLimits = Field(default_factory=StageLimits)
+    proteinmpnn: StageLimits = Field(default_factory=StageLimits)
+    boltz2: StageLimits = Field(default_factory=StageLimits)
+    foldseek: StageLimits = Field(default_factory=StageLimits)
+    chai1: StageLimits = Field(default_factory=StageLimits)
+    
+    # Default timeout values (seconds) - from Modal @app.function decorators
+    # Kept relaxed to avoid premature termination of valid runs
+    _default_timeouts: dict = {
+        "rfdiffusion": 600,   # 10 min for batch generation
+        "proteinmpnn": 300,   # 5 min per backbone
+        "boltz2": 900,        # 15 min per sequence
+        "foldseek": 120,      # 2 min for proteome search
+        "chai1": 900,         # 15 min per binder-decoy pair
+    }
+    
+    # Default max_designs values - conservative limits for cost control
+    # Tuned to keep typical runs within ~$5 USD budget
+    _default_max_designs: dict = {
+        "rfdiffusion": 4,     # Max backbones to generate
+        "proteinmpnn": 16,    # Max total sequences (backbones × seqs_per_backbone)
+        "boltz2": 3,          # Max sequences to validate (Boltz-2 @ $0.74/seq)
+        "foldseek": 2,        # Max decoys to find
+        "chai1": 3,           # Max binder-decoy pairs (Chai-1 @ $0.74/pair)
+    }
+    
+    def get_timeout(self, stage: str) -> int:
+        """Get timeout for a stage, using default if not specified."""
+        stage_limits = getattr(self, stage, StageLimits())
+        if stage_limits.timeout_seconds is not None:
+            return stage_limits.timeout_seconds
+        return self._default_timeouts.get(stage, 600)
+    
+    def get_max_designs(self, stage: str) -> int:
+        """Get max designs for a stage, using default if not specified."""
+        stage_limits = getattr(self, stage, StageLimits())
+        if stage_limits.max_designs is not None:
+            return stage_limits.max_designs
+        return self._default_max_designs.get(stage, 100)
+
+
 class PipelineConfig(BaseModel):
     """Complete pipeline configuration."""
 
@@ -364,8 +469,15 @@ class PipelineConfig(BaseModel):
     novelty: NoveltyConfig = Field(default_factory=NoveltyConfig, description="Novelty check vs UniRef50")
     scoring: ScoringWeights = Field(default_factory=ScoringWeights)
 
+    # Cost optimization configs
+    backbone_filter: BackboneFilterConfig = Field(default_factory=BackboneFilterConfig, description="Backbone quality pre-screening")
+    adaptive: AdaptiveGenerationConfig = Field(default_factory=AdaptiveGenerationConfig, description="Adaptive generation with early termination")
+
+    # Stage limits (timeouts and max designs per stage)
+    limits: PipelineLimits = Field(default_factory=PipelineLimits, description="Per-stage timeout and design limits")
+
     # Budget control
-    max_compute_usd: float = Field(default=5.0, ge=0.1, le=10.0, description="Maximum compute budget in USD")
+    max_compute_usd: float = Field(default=5.0, ge=0.1, le=100.0, description="Maximum compute budget in USD")
 
 
 # =============================================================================
@@ -544,6 +656,69 @@ class PipelineResult(BaseModel):
         if not self.top_candidates:
             return None
         return max(self.top_candidates, key=lambda c: c.final_score)
+
+
+# =============================================================================
+# YAML Configuration Loading
+# =============================================================================
+
+
+def load_config_from_yaml(yaml_path: str) -> PipelineConfig:
+    """
+    Load pipeline configuration from a YAML file.
+    
+    The YAML file should contain a complete or partial pipeline configuration.
+    Missing fields use default values.
+    
+    Args:
+        yaml_path: Path to the YAML configuration file
+        
+    Returns:
+        PipelineConfig object
+        
+    Raises:
+        FileNotFoundError: If the YAML file doesn't exist
+        ValueError: If the YAML is malformed or contains invalid values
+    """
+    import yaml
+    
+    if not os.path.exists(yaml_path):
+        raise FileNotFoundError(f"Config file not found: {yaml_path}")
+    
+    with open(yaml_path, "r") as f:
+        raw_config = yaml.safe_load(f)
+    
+    if raw_config is None:
+        raise ValueError(f"Empty or invalid YAML file: {yaml_path}")
+    
+    # Handle mode enum conversion
+    if "mode" in raw_config and isinstance(raw_config["mode"], str):
+        raw_config["mode"] = GenerationMode(raw_config["mode"].lower())
+    
+    # Validate and create PipelineConfig
+    try:
+        config = PipelineConfig(**raw_config)
+        return config
+    except Exception as e:
+        raise ValueError(f"Invalid configuration in {yaml_path}: {e}")
+
+
+def save_config_to_yaml(config: PipelineConfig, yaml_path: str) -> None:
+    """
+    Save a pipeline configuration to a YAML file.
+    
+    Args:
+        config: PipelineConfig object to save
+        yaml_path: Path to save the YAML file
+    """
+    import yaml
+    
+    # Convert to dict, handling enums
+    config_dict = config.model_dump(mode="json")
+    
+    os.makedirs(os.path.dirname(yaml_path) or ".", exist_ok=True)
+    with open(yaml_path, "w") as f:
+        yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
 
 
 # =============================================================================

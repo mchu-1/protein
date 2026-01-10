@@ -1,0 +1,150 @@
+# =============================================================================
+# Protein Binder Design Pipeline - Example Configuration
+# =============================================================================
+#
+# This YAML file configures all pipeline parameters including:
+# - Target protein specification
+# - Generation mode and parameters
+# - Validation thresholds
+# - Stage-specific limits (timeouts and max designs)
+# - Budget controls
+#
+# Usage:
+#   modal run pipeline.py --config config.yaml
+#   python pipeline.py --config config.yaml --dry-run
+#
+# All fields are optional except 'target'. Defaults are applied for missing values.
+# =============================================================================
+
+# Target protein specification (required)
+target:
+  pdb_id: "3DI3"              # 4-letter PDB code
+  entity_id: 2                 # Polymer entity ID (check RCSB for correct entity)
+  hotspot_residues:            # Residue indices for binding interface
+    - 58
+    - 80
+    - 139
+
+# Generation mode (optional, default: "bind")
+mode: bind
+
+# =============================================================================
+# Stage Configurations
+# =============================================================================
+
+# RFDiffusion - Backbone Generation
+rfdiffusion:
+  num_designs: 10              # Number of backbones to generate
+  binder_length_min: 50        # Minimum binder length (residues)
+  binder_length_max: 100       # Maximum binder length (residues)
+  noise_scale: 1.0             # Diffusion noise scale
+  num_diffusion_steps: 50      # Number of diffusion steps
+
+# ProteinMPNN - Sequence Design
+proteinmpnn:
+  num_sequences: 8             # Sequences per backbone
+  temperature: 0.2             # Sampling temperature (lower = more conservative)
+  backbone_noise: 0.0          # Backbone coordinate noise
+
+# Boltz-2 - Structure Validation (AlphaProteo SI 2.2 thresholds)
+boltz2:
+  num_recycles: 3              # Number of recycling iterations
+  max_pae_interaction: 1.5     # Max PAE at hotspots (Å) - Anchor Lock
+  min_ptm_binder: 0.80         # Min pTM for binder-only - Fold Quality
+  max_rmsd: 2.5                # Max RMSD vs RFDiffusion (Å) - Self-Consistency
+
+# FoldSeek - Decoy Identification
+foldseek:
+  database: "pdb100"           # Database to search
+  max_hits: 5                  # Maximum decoys (fewer = cheaper Chai-1)
+  evalue_threshold: 0.001      # E-value cutoff
+  cache_results: true          # Cache decoys by target for reuse
+
+# Chai-1 - Cross-Reactivity Check
+chai1:
+  num_samples: 1               # Samples per binder-decoy pair
+  min_chain_pair_iptm: 0.5     # ipTM threshold for cross-reactivity
+  num_recycles: 3              # Number of recycling iterations
+  tiered_checking: true        # Use tiered decoy checking for cost savings
+  tier1_min_tm: 0.7            # Min TM-score for Tier 1 (highest risk)
+  tier2_min_tm: 0.5            # Min TM-score for Tier 2
+  tier2_max_decoys: 2          # Max decoys in Tier 2
+
+# =============================================================================
+# Clustering & Novelty
+# =============================================================================
+
+# TM-score clustering for diversity
+cluster:
+  tm_threshold: 0.7            # TM-score threshold for clustering
+  select_best: true            # Select best representative per cluster
+
+# Novelty check vs UniRef50
+novelty:
+  database: "uniref50"         # HMM database for novelty check
+  max_evalue: 0.00001          # Max E-value to consider a hit
+  enabled: true                # Enable novelty filtering
+
+# =============================================================================
+# Scoring Weights
+# =============================================================================
+
+scoring:
+  alpha: 1.0                   # Weight for interface pLDDT (specificity)
+  beta: 0.5                    # Weight for max decoy affinity (selectivity penalty)
+
+# =============================================================================
+# Cost Optimization
+# =============================================================================
+
+# Backbone quality pre-screening
+backbone_filter:
+  enabled: true                # Enable backbone quality filtering
+  min_score: 0.4               # Min RFDiffusion confidence score
+  max_keep: null               # Max backbones to keep (null = no limit)
+
+# Adaptive generation with early termination
+adaptive:
+  enabled: true                # Enable adaptive generation
+  min_validated_candidates: 3  # Stop when this many pass Boltz-2
+  batch_size: 4                # Backbones per micro-batch
+  max_batches: 3               # Maximum micro-batches
+
+# =============================================================================
+# Stage Limits (Timeouts and Max Designs)
+# =============================================================================
+#
+# These limits control the maximum resources consumed per stage.
+# Cost forecasting uses these values to calculate ceiling costs.
+# If not specified, conservative defaults are used (tuned for ~$5 budget).
+#
+# Timeouts are in seconds (kept relaxed). Max designs is the count limit.
+
+limits:
+  rfdiffusion:
+    timeout_seconds: 600       # Default: 600 (10 minutes) - relaxed
+    max_designs: 4             # Default: 4 backbones
+  
+  proteinmpnn:
+    timeout_seconds: 300       # Default: 300 (5 minutes per backbone) - relaxed
+    max_designs: 16            # Default: 16 total sequences
+  
+  boltz2:
+    timeout_seconds: 900       # Default: 900 (15 minutes per sequence) - relaxed
+    max_designs: 3             # Default: 3 sequences (Boltz-2 @ $0.74/seq)
+  
+  foldseek:
+    timeout_seconds: 120       # Default: 120 (2 minutes) - relaxed
+    max_designs: 2             # Default: 2 decoys
+  
+  chai1:
+    timeout_seconds: 900       # Default: 900 (15 minutes per pair) - relaxed
+    max_designs: 3             # Default: 3 binder-decoy pairs (Chai-1 @ $0.74/pair)
+
+# =============================================================================
+# Budget Control
+# =============================================================================
+
+# Maximum compute budget in USD
+# With default limits, typical runs are ~$4.96 ceiling cost
+max_compute_usd: 5.0

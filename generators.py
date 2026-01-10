@@ -316,14 +316,14 @@ def run_proteinmpnn(
         output_fasta = f"{output_dir}/seqs/{Path(backbone.pdb_path).stem}.fa"
         if os.path.exists(output_fasta):
             sequences = _parse_proteinmpnn_output(
-                output_fasta, backbone.design_id, output_dir
+                output_fasta, backbone.design_id, output_dir, backbone.pdb_path
             )
         else:
             # Try alternative output location
             alt_fasta = f"{output_dir}/{Path(backbone.pdb_path).stem}.fa"
             if os.path.exists(alt_fasta):
                 sequences = _parse_proteinmpnn_output(
-                    alt_fasta, backbone.design_id, output_dir
+                    alt_fasta, backbone.design_id, output_dir, backbone.pdb_path
                 )
 
     except Exception as e:
@@ -372,6 +372,7 @@ def _parse_proteinmpnn_output(
     fasta_path: str,
     backbone_id: str,
     output_dir: str,
+    backbone_pdb: Optional[str] = None,
 ) -> list[SequenceDesign]:
     """
     Parse ProteinMPNN output FASTA file into SequenceDesign objects.
@@ -418,6 +419,7 @@ def _parse_proteinmpnn_output(
                     fasta_path=individual_fasta,
                     score=score,
                     recovery=None,
+                    backbone_pdb=backbone_pdb,
                 )
             )
 
@@ -469,6 +471,61 @@ def generate_sequences_parallel(
         all_sequences.extend(seq_list)
 
     return all_sequences
+
+
+# =============================================================================
+# Backbone Quality Pre-Screening (#2 Optimization)
+# =============================================================================
+
+
+def filter_backbones_by_quality(
+    backbones: list[BackboneDesign],
+    min_score: float = 0.4,
+    max_keep: int = None,
+) -> list[BackboneDesign]:
+    """
+    Filter backbones by RFDiffusion confidence score.
+    
+    Prevents wasted ProteinMPNN and Boltz-2 calls on poor designs.
+    Backbones without scores are kept (assumed acceptable).
+    
+    Args:
+        backbones: List of backbone designs from RFDiffusion
+        min_score: Minimum RFDiffusion confidence score (0-1)
+        max_keep: Maximum number of backbones to keep (None = no limit)
+    
+    Returns:
+        Filtered list of high-quality backbones, sorted by score descending
+    """
+    if not backbones:
+        return backbones
+    
+    # Separate scored and unscored backbones
+    scored = [(b, b.rfdiffusion_score) for b in backbones if b.rfdiffusion_score is not None]
+    unscored = [b for b in backbones if b.rfdiffusion_score is None]
+    
+    # Filter by score threshold
+    passing_scored = [(b, s) for b, s in scored if s >= min_score]
+    rejected_count = len(scored) - len(passing_scored)
+    
+    # Sort by score descending (best first)
+    passing_scored.sort(key=lambda x: x[1], reverse=True)
+    
+    # Combine: scored first (sorted), then unscored
+    filtered = [b for b, _ in passing_scored] + unscored
+    
+    # Apply max_keep limit
+    if max_keep is not None and len(filtered) > max_keep:
+        filtered = filtered[:max_keep]
+    
+    if rejected_count > 0 or (max_keep and len(backbones) > max_keep):
+        kept = len(filtered)
+        original = len(backbones)
+        print(f"Backbone filter: {original} → {kept} (score ≥ {min_score}, max {max_keep or 'unlimited'})")
+        if rejected_count > 0:
+            print(f"  Rejected {rejected_count} backbones below score threshold")
+    
+    return filtered
 
 
 # =============================================================================
