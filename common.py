@@ -268,18 +268,24 @@ class ProteinMPNNConfig(BaseModel):
 
 
 class Boltz2Config(BaseModel):
-    """Configuration for Boltz-2 structure prediction."""
+    """Configuration for Boltz-2 structure prediction.
+    
+    Note: Stricter defaults (0.8 pLDDT, 5.0 PAE) reduce Chai-1 calls.
+    """
 
     num_recycles: int = Field(default=3, ge=1, le=10, description="Number of recycling iterations")
-    min_iplddt: float = Field(default=0.7, ge=0.0, le=1.0, description="Minimum interface pLDDT threshold")
-    max_pae: float = Field(default=10.0, ge=0.0, le=31.0, description="Maximum PAE threshold")
+    min_iplddt: float = Field(default=0.8, ge=0.0, le=1.0, description="Minimum interface pLDDT threshold (stricter = fewer Chai-1 calls)")
+    max_pae: float = Field(default=5.0, ge=0.0, le=31.0, description="Maximum PAE threshold (stricter = fewer Chai-1 calls)")
 
 
 class FoldSeekConfig(BaseModel):
-    """Configuration for FoldSeek proteome scanning."""
+    """Configuration for FoldSeek proteome scanning.
+    
+    Note: Fewer decoys (5) reduces expensive Chai-1 calls while still catching top risks.
+    """
 
     database: str = Field(default="pdb100", description="Database to search (pdb100, afdb50, etc.)")
-    max_hits: int = Field(default=10, ge=1, le=100, description="Maximum number of structural homologs")
+    max_hits: int = Field(default=5, ge=1, le=100, description="Maximum decoys (fewer = cheaper)")
     evalue_threshold: float = Field(default=1e-3, ge=0.0, description="E-value cutoff")
 
 

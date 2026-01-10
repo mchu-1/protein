@@ -813,13 +813,17 @@ def check_cross_reactivity_parallel(
     config: Chai1Config,
     base_output_dir: str,
     target: Optional[TargetProtein] = None,
+    early_termination: bool = True,
 ) -> tuple[dict[str, CrossReactivityResult], dict[str, list[CrossReactivityResult]]]:
     """
     Check cross-reactivity for multiple sequences against decoys in parallel.
     
     Optionally includes the target as a positive control to verify binding.
     
-    Note: Concurrency is limited to 2 A100 workers via run_chai1's max_containers.
+    **Economical optimizations:**
+    - Decoys are sorted by TM-score (most similar first = highest risk)
+    - Early termination: stops testing a sequence once cross-reactivity detected
+    - Concurrency limited to 2 A100 workers
 
     Args:
         sequences: List of binder sequences
@@ -827,6 +831,7 @@ def check_cross_reactivity_parallel(
         config: Chai-1 configuration
         base_output_dir: Base output directory
         target: Optional target protein for positive control check
+        early_termination: If True, stop testing decoys for a sequence once cross-reactivity found
 
     Returns:
         Tuple of:
@@ -866,31 +871,69 @@ def check_cross_reactivity_parallel(
         
         print(f"  Positive control: {len(positive_control_results)}/{len(sequences)} sequences bind target")
     
-    # Step 2: Run decoy checks
+    # Step 2: Run decoy checks with early termination optimization
     if decoys:
-        num_pairs = len(sequences) * len(decoys)
-        print(f"Chai-1 Decoy Check: {len(sequences)} sequences × {len(decoys)} decoys = {num_pairs} pairs")
-        print(f"  (concurrency limited to 2 A100 workers)")
+        # Sort decoys by TM-score descending (most similar = highest risk, test first)
+        sorted_decoys = sorted(decoys, key=lambda d: d.tm_score, reverse=True)
         
-        # Prepare all combinations for starmap
-        args = [
-            (seq, decoy, config, f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}")
-            for seq in sequences
-            for decoy in decoys
-        ]
-        
-        # Use starmap - concurrency is controlled by run_chai1's max_containers=2
-        all_results = list(run_chai1.starmap(args))
-        
-        # Group results by sequence
-        for result in all_results:
-            if result is not None:
-                if result.binder_id not in decoy_results:
-                    decoy_results[result.binder_id] = []
-                decoy_results[result.binder_id].append(result)
+        if early_termination:
+            # Sequential per-sequence with early termination (economical mode)
+            print(f"Chai-1 Decoy Check: {len(sequences)} sequences × up to {len(sorted_decoys)} decoys (early termination enabled)")
+            print(f"  Decoys sorted by TM-score: {', '.join(f'{d.decoy_id[:8]}({d.tm_score:.2f})' for d in sorted_decoys[:3])}...")
+            
+            total_calls = 0
+            rejected_sequences: set[str] = set()
+            
+            for seq in sequences:
+                decoy_results[seq.sequence_id] = []
+                
+                for decoy in sorted_decoys:
+                    # Run single prediction
+                    result = run_chai1.remote(
+                        seq, decoy, config, 
+                        f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}"
+                    )
+                    total_calls += 1
+                    
+                    if result is not None:
+                        decoy_results[seq.sequence_id].append(result)
+                        
+                        # Early termination: if cross-reactive, skip remaining decoys
+                        if result.binds_decoy:
+                            rejected_sequences.add(seq.sequence_id)
+                            print(f"  ✗ {seq.sequence_id}: cross-reactive with {decoy.decoy_id} (pLDDT={result.plddt_interface:.1f})")
+                            break
+                
+                if seq.sequence_id not in rejected_sequences:
+                    print(f"  ✓ {seq.sequence_id}: passed {len(sorted_decoys)} decoys")
+            
+            print(f"  Early termination saved ~{len(sequences) * len(sorted_decoys) - total_calls} Chai-1 calls")
+            print(f"  Result: {len(sequences) - len(rejected_sequences)}/{len(sequences)} sequences passed selectivity")
+        else:
+            # Full parallel mode (test all combinations)
+            num_pairs = len(sequences) * len(sorted_decoys)
+            print(f"Chai-1 Decoy Check: {len(sequences)} sequences × {len(sorted_decoys)} decoys = {num_pairs} pairs")
+            print(f"  (concurrency limited to 2 A100 workers)")
+            
+            # Prepare all combinations for starmap
+            args = [
+                (seq, decoy, config, f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}")
+                for seq in sequences
+                for decoy in sorted_decoys
+            ]
+            
+            # Use starmap - concurrency is controlled by run_chai1's max_containers=2
+            all_results = list(run_chai1.starmap(args))
+            
+            # Group results by sequence
+            for result in all_results:
+                if result is not None:
+                    if result.binder_id not in decoy_results:
+                        decoy_results[result.binder_id] = []
+                    decoy_results[result.binder_id].append(result)
 
-        total_success = sum(len(v) for v in decoy_results.values())
-        print(f"  Decoy check completed: {total_success}/{num_pairs} successful predictions")
+            total_success = sum(len(v) for v in decoy_results.values())
+            print(f"  Decoy check completed: {total_success}/{num_pairs} successful predictions")
     
     return positive_control_results, decoy_results
 
