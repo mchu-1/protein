@@ -721,9 +721,9 @@ def upload_target_pdb(local_pdb_content: str, filename: str) -> str:
 
 @app.local_entrypoint()
 def main(
-    target_pdb: str,
+    pdb_id: str,
+    entity_id: int,
     hotspot_residues: str,
-    chain_id: str = "A",
     num_designs: int = 5,
     num_sequences: int = 4,
     use_mocks: bool = False,
@@ -734,36 +734,68 @@ def main(
     Run the protein binder design pipeline from command line.
 
     Args:
-        target_pdb: Path to target protein PDB file
+        pdb_id: 4-letter PDB code (e.g., "3DI3")
+        entity_id: Polymer entity ID for the target (e.g., 2 for IL7RA in 3DI3)
         hotspot_residues: Comma-separated list of hotspot residue indices
-        chain_id: Target chain ID (default: A)
         num_designs: Number of backbone designs (default: 5)
         num_sequences: Sequences per backbone (default: 4)
         use_mocks: Use mock implementations for testing (default: False)
         max_budget: Maximum compute budget in USD (default: 5.0)
         dry_run: Preview deployment parameters and costs without running (default: False)
+    
+    Example:
+        uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 --hotspot-residues "42,64,123"
     """
-    from pathlib import Path
+    from common import get_entity_info, download_pdb
+    import tempfile
+    import os
     
     # Parse hotspot residues
     hotspots = [int(r.strip()) for r in hotspot_residues.split(",")]
-
-    # Read and upload target PDB to Modal volume
-    local_path = Path(target_pdb)
-    if not local_path.exists():
-        raise FileNotFoundError(f"Target PDB file not found: {target_pdb}")
     
-    pdb_content = local_path.read_text()
-    remote_pdb_path = upload_target_pdb.remote(pdb_content, local_path.name)
-    print(f"Uploaded target PDB to: {remote_pdb_path}")
+    # Validate PDB ID format
+    pdb_id = pdb_id.upper().strip()
+    if len(pdb_id) != 4:
+        raise ValueError(f"PDB ID must be 4 characters: {pdb_id}")
 
-    # Build configuration with remote path
+    # Fetch entity info from RCSB
+    print(f"Fetching entity {entity_id} info for PDB {pdb_id}...")
+    entity_info = get_entity_info(pdb_id, entity_id)
+    chains = entity_info.get("chains", [])
+    
+    if not chains:
+        raise ValueError(f"No chains found for entity {entity_id} in PDB {pdb_id}")
+    
+    chain_id = chains[0]  # Use first chain for this entity
+    entity_name = entity_info.get("description", f"{pdb_id}_entity{entity_id}")
+    uniprot_ids = entity_info.get("uniprot_ids", [])
+    
+    print(f"  Entity: {entity_name}")
+    print(f"  Chain(s): {', '.join(chains)}")
+    if uniprot_ids:
+        print(f"  UniProt: {', '.join(uniprot_ids)}")
+
+    # Download PDB to temp file and upload to Modal volume
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_pdb = os.path.join(tmpdir, f"{pdb_id.lower()}.pdb")
+        print(f"Downloading PDB {pdb_id}...")
+        download_pdb(pdb_id, local_pdb)
+        
+        with open(local_pdb, "r") as f:
+            pdb_content = f.read()
+        
+        remote_pdb_path = upload_target_pdb.remote(pdb_content, f"{pdb_id.lower()}.pdb")
+        print(f"Uploaded to: {remote_pdb_path}")
+
+    # Build configuration
     config = PipelineConfig(
         target=TargetProtein(
+            pdb_id=pdb_id,
+            entity_id=entity_id,
+            hotspot_residues=hotspots,
             pdb_path=remote_pdb_path,
             chain_id=chain_id,
-            hotspot_residues=hotspots,
-            name="target",
+            name=entity_name,
         ),
         rfdiffusion=RFDiffusionConfig(num_designs=num_designs),
         proteinmpnn=ProteinMPNNConfig(num_sequences=num_sequences),
@@ -781,7 +813,8 @@ def main(
     print("=" * 60)
     print("PROTEIN BINDER DESIGN PIPELINE")
     print("=" * 60)
-    print(f"Target PDB: {target_pdb} -> {remote_pdb_path}")
+    print(f"Target: {pdb_id} entity {entity_id} ({entity_name})")
+    print(f"Chain: {chain_id}")
     print(f"Hotspot residues: {hotspots}")
     print(f"Designs: {num_designs} backbones × {num_sequences} sequences")
     print(f"Budget: ${max_budget:.2f}")
@@ -794,6 +827,7 @@ def main(
     print("\n" + "=" * 60)
     print("PIPELINE RESULTS")
     print("=" * 60)
+    print(f"Target: {pdb_id} entity {entity_id}")
     print(f"Run ID: {result.run_id}")
     print(f"Runtime: {result.runtime_seconds:.1f} seconds")
     print(f"Estimated cost: ${result.compute_cost_usd:.2f}")

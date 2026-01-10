@@ -272,6 +272,143 @@ def _parse_boltz2_metrics(output_dir: str, sequence_id: str) -> Optional[dict]:
 
 
 # =============================================================================
+# UniProt/PDB Mapping Helpers
+# =============================================================================
+
+
+def _get_uniprot_from_pdb(pdb_id: str) -> set[str]:
+    """
+    Get UniProt accession IDs associated with a PDB entry.
+    
+    Uses the RCSB PDB API to look up the UniProt mapping.
+    
+    Args:
+        pdb_id: 4-letter PDB code (e.g., "3DI3")
+    
+    Returns:
+        Set of UniProt accession IDs (e.g., {"P16871", "P13232"})
+    """
+    import urllib.request
+    import urllib.error
+    
+    uniprot_ids: set[str] = set()
+    
+    try:
+        # RCSB GraphQL API endpoint
+        url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id.upper()}"
+        
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            
+            # Extract polymer entities which contain UniProt references
+            if "rcsb_entry_container_identifiers" in data:
+                container = data["rcsb_entry_container_identifiers"]
+                if "polymer_entity_ids" in container:
+                    for entity_id in container["polymer_entity_ids"]:
+                        entity_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id.upper()}/{entity_id}"
+                        try:
+                            with urllib.request.urlopen(entity_url, timeout=10) as entity_response:
+                                entity_data = json.loads(entity_response.read().decode())
+                                if "rcsb_polymer_entity_container_identifiers" in entity_data:
+                                    identifiers = entity_data["rcsb_polymer_entity_container_identifiers"]
+                                    if "uniprot_ids" in identifiers:
+                                        uniprot_ids.update(identifiers["uniprot_ids"])
+                        except Exception:
+                            continue
+    except urllib.error.HTTPError as e:
+        print(f"  Warning: Could not fetch UniProt mapping for PDB {pdb_id}: HTTP {e.code}")
+    except Exception as e:
+        print(f"  Warning: Could not fetch UniProt mapping for PDB {pdb_id}: {e}")
+    
+    return uniprot_ids
+
+
+def _get_pdbs_from_uniprot(uniprot_id: str) -> set[str]:
+    """
+    Get all PDB IDs associated with a UniProt accession.
+    
+    Uses the RCSB PDB search API.
+    
+    Args:
+        uniprot_id: UniProt accession (e.g., "P16871")
+    
+    Returns:
+        Set of 4-letter PDB codes (e.g., {"3DI3", "7OPB"})
+    """
+    import urllib.request
+    import urllib.error
+    
+    pdb_ids: set[str] = set()
+    
+    try:
+        # RCSB search API
+        search_url = "https://search.rcsb.org/rcsbsearch/v2/query"
+        query = {
+            "query": {
+                "type": "terminal",
+                "service": "text",
+                "parameters": {
+                    "attribute": "rcsb_polymer_entity_container_identifiers.uniprot_ids",
+                    "operator": "exact_match",
+                    "value": uniprot_id.upper()
+                }
+            },
+            "return_type": "entry",
+            "request_options": {
+                "return_all_hits": True
+            }
+        }
+        
+        req = urllib.request.Request(
+            search_url,
+            data=json.dumps(query).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            if "result_set" in data:
+                for result in data["result_set"]:
+                    if "identifier" in result:
+                        pdb_ids.add(result["identifier"].upper())
+    except urllib.error.HTTPError as e:
+        print(f"  Warning: Could not fetch PDB mapping for UniProt {uniprot_id}: HTTP {e.code}")
+    except Exception as e:
+        print(f"  Warning: Could not fetch PDB mapping for UniProt {uniprot_id}: {e}")
+    
+    return pdb_ids
+
+
+def _extract_pdb_id_from_path(pdb_path: str) -> Optional[str]:
+    """
+    Extract PDB ID from a file path.
+    
+    Handles formats like:
+    - /data/targets/3di3_target.pdb -> 3DI3
+    - /path/to/il7ra_target.pdb -> None (not a PDB ID)
+    - /path/to/3DI3.pdb -> 3DI3
+    """
+    import re
+    
+    filename = Path(pdb_path).stem.upper()
+    
+    # Try to find a 4-character PDB ID pattern
+    # PDB IDs are 4 alphanumeric characters, typically starting with a digit
+    match = re.search(r'\b([0-9][A-Z0-9]{3})\b', filename)
+    if match:
+        return match.group(1)
+    
+    # Also check for pattern at start of filename
+    if len(filename) >= 4 and filename[0].isdigit():
+        potential_id = filename[:4]
+        if all(c.isalnum() for c in potential_id):
+            return potential_id
+    
+    return None
+
+
+# =============================================================================
 # FoldSeek - Proteome Scanning for Decoys
 # =============================================================================
 
@@ -293,6 +430,9 @@ def run_foldseek(
 
     These structural homologs serve as potential off-targets (decoys)
     for selectivity filtering.
+    
+    **Filters out self-hits:** Decoys that map to the same UniProt accession
+    as the target are excluded to avoid false cross-reactivity signals.
 
     Args:
         target: Target protein structure
@@ -307,6 +447,23 @@ def run_foldseek(
     decoys: list[DecoyHit] = []
 
     try:
+        # Step 1: Get target's UniProt accessions to filter self-hits
+        # Use target.pdb_id directly (no need to extract from path)
+        target_pdb_id = target.pdb_id if hasattr(target, 'pdb_id') and target.pdb_id else _extract_pdb_id_from_path(target.pdb_path)
+        target_uniprots: set[str] = set()
+        target_pdb_ids: set[str] = set()
+        
+        if target_pdb_id:
+            print(f"FoldSeek: Target PDB ID = {target_pdb_id}")
+            target_uniprots = _get_uniprot_from_pdb(target_pdb_id)
+            if target_uniprots:
+                print(f"  Target UniProt accessions: {', '.join(target_uniprots)}")
+                # Get all PDB IDs associated with these UniProts (to filter)
+                for uniprot in target_uniprots:
+                    target_pdb_ids.update(_get_pdbs_from_uniprot(uniprot))
+                if target_pdb_ids:
+                    print(f"  Excluding {len(target_pdb_ids)} PDB entries of same protein")
+        
         # Output files
         results_file = f"{output_dir}/foldseek_results.tsv"
         tmp_dir = f"{output_dir}/tmp"
@@ -344,7 +501,7 @@ def run_foldseek(
             print("FoldSeek database downloaded successfully")
             weights_volume.commit()
 
-        # Run FoldSeek easy-search
+        # Run FoldSeek easy-search (get extra hits to allow for filtering)
         cmd = [
             "foldseek",
             "easy-search",
@@ -357,7 +514,7 @@ def run_foldseek(
             "-e",
             str(config.evalue_threshold),
             "--max-seqs",
-            str(config.max_hits * 2),  # Get extra for filtering
+            str(config.max_hits * 4),  # Get extra for filtering (self-hits + dedup)
         ]
 
         result = subprocess.run(
@@ -370,14 +527,16 @@ def run_foldseek(
         if result.returncode != 0:
             print(f"FoldSeek stderr: {result.stderr}")
 
-        # Parse results with deduplication
+        # Parse results with deduplication and self-hit filtering
         if os.path.exists(results_file):
             # Count total lines for reporting
             with open(results_file, "r") as f:
                 total_hits = sum(1 for _ in f)
-            decoys = _parse_foldseek_results(results_file, output_dir, config.max_hits)
+            decoys = _parse_foldseek_results(
+                results_file, output_dir, config.max_hits, target_pdb_ids
+            )
             if total_hits > len(decoys):
-                print(f"FoldSeek: {total_hits} hits -> {len(decoys)} unique proteins")
+                print(f"FoldSeek: {total_hits} hits -> {len(decoys)} unique off-target proteins")
 
     except subprocess.TimeoutExpired:
         print("FoldSeek timeout")
@@ -393,14 +552,25 @@ def _parse_foldseek_results(
     results_file: str,
     output_dir: str,
     max_hits: int,
+    exclude_pdb_ids: Optional[set[str]] = None,
 ) -> list[DecoyHit]:
     """Parse FoldSeek tabular output into DecoyHit objects.
     
     Deduplicates based on core protein ID to avoid redundant Chai-1 runs.
     For AlphaFold entries, extracts UniProt ID; for PDB entries, extracts PDB code.
+    
+    Args:
+        results_file: Path to FoldSeek TSV output
+        output_dir: Directory for output files
+        max_hits: Maximum number of decoys to return
+        exclude_pdb_ids: Set of PDB IDs to exclude (e.g., target protein entries)
     """
     decoys: list[DecoyHit] = []
     seen_ids: set[str] = set()  # Track unique protein IDs
+    excluded_count = 0
+    
+    if exclude_pdb_ids is None:
+        exclude_pdb_ids = set()
 
     with open(results_file, "r") as f:
         for line in f:
@@ -415,12 +585,20 @@ def _parse_foldseek_results(
             
             # Extract core protein ID for deduplication
             # AlphaFold: AF-P16871-F1-model_v6 or AF-P16871-2-F1-model_v6 -> P16871
-            # PDB: 1ABC_A -> 1ABC
+            # PDB: 7opb-assembly3_C -> 7OPB, 4HN6_A -> 4HN6
             if target_id.startswith("AF-"):
                 id_parts = target_id.split("-")
                 core_id = id_parts[1] if len(id_parts) >= 2 else target_id
+                pdb_code = None  # AlphaFold entries don't have PDB codes
             else:
-                core_id = target_id.split("_")[0].upper()
+                # Extract 4-letter PDB code
+                pdb_code = target_id.split("-")[0].split("_")[0].upper()[:4]
+                core_id = pdb_code
+            
+            # Skip if this PDB is the target protein (same UniProt)
+            if pdb_code and pdb_code in exclude_pdb_ids:
+                excluded_count += 1
+                continue
             
             # Skip if we've already seen this protein
             if core_id in seen_ids:
@@ -446,6 +624,9 @@ def _parse_foldseek_results(
                     sequence_identity=seq_identity,
                 )
             )
+    
+    if excluded_count > 0:
+        print(f"  Excluded {excluded_count} self-hits (same protein as target)")
 
     return decoys
 

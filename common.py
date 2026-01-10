@@ -224,15 +224,31 @@ class ValidationStatus(str, Enum):
 
 
 class TargetProtein(BaseModel):
-    """Input target protein specification."""
+    """Input target protein specification.
+    
+    Uses PDB ID + Entity ID for unambiguous target identification.
+    Entity ID maps to specific polymer chains within the PDB structure.
+    """
 
-    pdb_path: str = Field(..., description="Path to target PDB structure file")
-    chain_id: str = Field(default="A", description="Chain ID of interest")
+    pdb_id: str = Field(..., description="4-letter PDB code (e.g., '3DI3')")
+    entity_id: int = Field(..., ge=1, description="Polymer entity ID (e.g., 1, 2)")
     hotspot_residues: list[int] = Field(
         default_factory=list,
         description="Residue indices defining the binding interface",
     )
-    name: str = Field(default="target", description="Human-readable name for target")
+    
+    # Computed after download/initialization
+    pdb_path: Optional[str] = Field(default=None, description="Path to downloaded PDB file")
+    chain_id: Optional[str] = Field(default=None, description="Chain ID mapped from entity")
+    name: Optional[str] = Field(default=None, description="Human-readable name")
+
+    @field_validator("pdb_id")
+    @classmethod
+    def validate_pdb_id(cls, v: str) -> str:
+        v = v.upper().strip()
+        if len(v) != 4:
+            raise ValueError(f"PDB ID must be 4 characters: {v}")
+        return v
 
     @field_validator("hotspot_residues")
     @classmethod
@@ -481,3 +497,154 @@ def write_fasta(sequence: str, header: str, output_path: str) -> None:
         # Write sequence in lines of 80 characters
         for i in range(0, len(sequence), 80):
             f.write(sequence[i : i + 80] + "\n")
+
+
+# =============================================================================
+# PDB/Entity Mapping Functions
+# =============================================================================
+
+
+def get_entity_chain_mapping(pdb_id: str) -> dict[int, list[str]]:
+    """
+    Get mapping from entity ID to chain IDs for a PDB entry.
+    
+    Uses RCSB PDB API to look up entity-chain relationships.
+    
+    Args:
+        pdb_id: 4-letter PDB code (e.g., "3DI3")
+    
+    Returns:
+        Dictionary mapping entity_id -> list of chain_ids
+        e.g., {1: ["A", "C"], 2: ["B", "D"]}
+    """
+    import json
+    import urllib.request
+    import urllib.error
+    
+    entity_chains: dict[int, list[str]] = {}
+    
+    try:
+        url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id.upper()}"
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            
+            container = data.get("rcsb_entry_container_identifiers", {})
+            polymer_entity_ids = container.get("polymer_entity_ids", [])
+            
+            for entity_id in polymer_entity_ids:
+                entity_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id.upper()}/{entity_id}"
+                try:
+                    with urllib.request.urlopen(entity_url, timeout=10) as entity_response:
+                        entity_data = json.loads(entity_response.read().decode())
+                        
+                        entity_container = entity_data.get("rcsb_polymer_entity_container_identifiers", {})
+                        auth_asym_ids = entity_container.get("auth_asym_ids", [])
+                        
+                        if auth_asym_ids:
+                            entity_chains[int(entity_id)] = auth_asym_ids
+                except Exception:
+                    continue
+                    
+    except urllib.error.HTTPError as e:
+        raise ValueError(f"Could not fetch entity mapping for PDB {pdb_id}: HTTP {e.code}")
+    except Exception as e:
+        raise ValueError(f"Could not fetch entity mapping for PDB {pdb_id}: {e}")
+    
+    return entity_chains
+
+
+def get_entity_info(pdb_id: str, entity_id: int) -> dict:
+    """
+    Get information about a specific entity in a PDB entry.
+    
+    Args:
+        pdb_id: 4-letter PDB code
+        entity_id: Polymer entity ID
+    
+    Returns:
+        Dictionary with entity metadata (name, UniProt IDs, etc.)
+    """
+    import json
+    import urllib.request
+    
+    try:
+        url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id.upper()}/{entity_id}"
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            
+            info = {
+                "entity_id": entity_id,
+                "chains": data.get("rcsb_polymer_entity_container_identifiers", {}).get("auth_asym_ids", []),
+                "description": data.get("rcsb_polymer_entity", {}).get("pdbx_description", ""),
+                "uniprot_ids": data.get("rcsb_polymer_entity_container_identifiers", {}).get("uniprot_ids", []),
+            }
+            return info
+    except Exception as e:
+        raise ValueError(f"Could not fetch entity {entity_id} info for PDB {pdb_id}: {e}")
+
+
+def download_pdb(pdb_id: str, output_path: str) -> str:
+    """
+    Download a PDB file from RCSB.
+    
+    Args:
+        pdb_id: 4-letter PDB code
+        output_path: Path to save the PDB file
+    
+    Returns:
+        Path to the downloaded file
+    """
+    import urllib.request
+    
+    url = f"https://files.rcsb.org/download/{pdb_id.upper()}.pdb"
+    urllib.request.urlretrieve(url, output_path)
+    return output_path
+
+
+def initialize_target(
+    pdb_id: str,
+    entity_id: int,
+    hotspot_residues: list[int],
+    output_dir: str,
+) -> TargetProtein:
+    """
+    Initialize a TargetProtein by downloading the PDB and resolving entity to chain.
+    
+    Args:
+        pdb_id: 4-letter PDB code (e.g., "3DI3")
+        entity_id: Polymer entity ID (e.g., 2 for the receptor)
+        hotspot_residues: List of hotspot residue indices
+        output_dir: Directory to save downloaded PDB
+    
+    Returns:
+        Fully initialized TargetProtein with pdb_path and chain_id set
+    """
+    import os
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Get entity info
+    entity_info = get_entity_info(pdb_id, entity_id)
+    chains = entity_info.get("chains", [])
+    
+    if not chains:
+        raise ValueError(f"No chains found for entity {entity_id} in PDB {pdb_id}")
+    
+    # Use first chain for this entity
+    chain_id = chains[0]
+    
+    # Download PDB
+    pdb_path = os.path.join(output_dir, f"{pdb_id.lower()}.pdb")
+    download_pdb(pdb_id, pdb_path)
+    
+    # Create target
+    target = TargetProtein(
+        pdb_id=pdb_id,
+        entity_id=entity_id,
+        hotspot_residues=hotspot_residues,
+        pdb_path=pdb_path,
+        chain_id=chain_id,
+        name=entity_info.get("description", f"{pdb_id}_entity{entity_id}"),
+    )
+    
+    return target

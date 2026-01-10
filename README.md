@@ -61,38 +61,48 @@ uv run modal token new
 
 ```bash
 # Preview deployment parameters and estimated cost (no execution)
-uv run modal run pipeline.py --target-pdb /path/to/target.pdb \
-    --hotspot-residues "10,15,20,25" \
+uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 \
+    --hotspot-residues "42,64,123" \
     --num-designs 5 \
     --num-sequences 4 \
     --dry-run
 
 # Run with Modal CLI
-uv run modal run pipeline.py --target-pdb /path/to/target.pdb \
-    --hotspot-residues "10,15,20,25" \
+uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 \
+    --hotspot-residues "42,64,123" \
     --num-designs 5 \
     --num-sequences 4 \
     --max-budget 5.0
 
 # Test with mocks (no GPU required)
-uv run modal run pipeline.py --target-pdb /path/to/target.pdb \
-    --hotspot-residues "10,15,20" \
+uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 \
+    --hotspot-residues "42,64,123" \
     --use-mocks
 ```
+
+**Input Format:**
+- `--pdb-id`: 4-letter PDB code (e.g., `3DI3`)
+- `--entity-id`: Polymer entity ID identifying the target chain (e.g., `2` for IL7RA receptor in 3DI3)
+
+Use the [RCSB PDB website](https://www.rcsb.org/) to find entity IDs for your target structure.
 
 ### Python API
 
 ```python
-from pipeline import design_binders
+from common import TargetProtein, PipelineConfig, initialize_target
+from pipeline import run_pipeline
 
-result = design_binders(
-    target_pdb_path="target.pdb",
-    hotspot_residues=[10, 15, 20, 25, 30],
-    chain_id="A",
-    num_designs=5,
-    num_sequences=4,
-    max_budget=5.0,
+# Initialize target from PDB ID and entity ID
+target = initialize_target(
+    pdb_id="3DI3",
+    entity_id=2,  # IL7RA receptor
+    hotspot_residues=[42, 64, 123],
+    output_dir="/tmp/target",
 )
+
+# Run pipeline
+config = PipelineConfig(target=target)
+result = run_pipeline.remote(config)
 
 # Access results
 print(f"Best candidate: {result.best_candidate.candidate_id}")
