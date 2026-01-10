@@ -20,3 +20,6 @@ pyyaml>=6.0.0
 # Utilities
 icecream>=2.1.0
 tqdm>=4.66.0
+
+# Pipeline state tracking and observability
+networkx>=3.0

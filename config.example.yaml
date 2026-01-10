@@ -111,35 +111,32 @@ adaptive:
   max_batches: 3               # Maximum micro-batches
 
 # =============================================================================
-# Stage Limits (Timeouts and Max Designs)
+# Stage Limits
 # =============================================================================
 #
-# These limits control the maximum resources consumed per stage.
-# Cost forecasting uses these values to calculate ceiling costs.
-# If not specified, conservative defaults are used (tuned for ~$5 budget).
-#
-# Timeouts are in seconds (kept relaxed). Max designs is the count limit.
+# Limits control branching at each stage of the pipeline.
+# Timeouts are in seconds. Max designs caps the output count per stage.
 
 limits:
   rfdiffusion:
-    timeout_seconds: 600       # Default: 600 (10 minutes) - relaxed
-    max_designs: 4             # Default: 4 backbones
+    timeout_seconds: 600       # 10 minutes for batch generation
+    max_designs: 4             # Max backbones to generate
   
   proteinmpnn:
-    timeout_seconds: 300       # Default: 300 (5 minutes per backbone) - relaxed
-    max_designs: 16            # Default: 16 total sequences
+    timeout_seconds: 300       # 5 minutes per backbone
+    max_designs: 4             # Max sequences per backbone
   
   boltz2:
-    timeout_seconds: 900       # Default: 900 (15 minutes per sequence) - relaxed
-    max_designs: 3             # Default: 3 sequences (Boltz-2 @ $0.74/seq)
+    timeout_seconds: 900       # 15 minutes per validation
+    max_designs: 2             # Max sequences to validate
   
   foldseek:
-    timeout_seconds: 120       # Default: 120 (2 minutes) - relaxed
-    max_designs: 2             # Default: 2 decoys
+    timeout_seconds: 120       # 2 minutes for proteome search
+    max_designs: 2             # Max decoys to find
   
   chai1:
-    timeout_seconds: 900       # Default: 900 (15 minutes per pair) - relaxed
-    max_designs: 3             # Default: 3 binder-decoy pairs (Chai-1 @ $0.74/pair)
+    timeout_seconds: 900       # 15 minutes per pair
+    max_designs: 2             # Max sequences to check against decoys (2 seqs × 2 decoys = 4 pairs)
 
 # =============================================================================
 # Budget Control

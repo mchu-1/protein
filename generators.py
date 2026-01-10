@@ -10,11 +10,8 @@ from __future__ import annotations
 
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Optional
-
-import modal
 
 from common import (
     DATA_PATH,
@@ -60,7 +57,6 @@ def run_rfdiffusion(
     Returns:
         List of BackboneDesign objects for each generated backbone
     """
-    import numpy as np
 
     os.makedirs(output_dir, exist_ok=True)
 

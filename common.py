@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 from enum import Enum
-from pathlib import Path
 from typing import Optional
 
 import modal
@@ -46,6 +45,7 @@ base_image = (
         "biopython>=1.81",
         "pydantic>=2.0.0",
         "scipy>=1.11.0",
+        "networkx>=3.0",  # State tree graph representation
     )
 )
 
@@ -182,6 +182,7 @@ def _add_local_modules(image: modal.Image) -> modal.Image:
         .add_local_file("common.py", remote_path="/root/common.py")
         .add_local_file("generators.py", remote_path="/root/generators.py")
         .add_local_file("validators.py", remote_path="/root/validators.py")
+        .add_local_file("state_tree.py", remote_path="/root/state_tree.py")
     )
 
 

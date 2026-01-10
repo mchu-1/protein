@@ -22,27 +22,22 @@ import modal
 
 from common import (
     DATA_PATH,
-    WEIGHTS_PATH,
     AdaptiveGenerationConfig,
     BackboneDesign,
     BackboneFilterConfig,
     BinderCandidate,
     Boltz2Config,
     Chai1Config,
-    ClusterConfig,
     CrossReactivityResult,
     DecoyHit,
     FoldSeekConfig,
     GenerationMode,
-    NoveltyConfig,
     PipelineConfig,
-    PipelineLimits,
     PipelineResult,
     PipelineStage,
     ProteinMPNNConfig,
     RFDiffusionConfig,
     SequenceDesign,
-    StageLimits,
     StructurePrediction,
     TargetProtein,
     ValidationResult,
@@ -50,20 +45,21 @@ from common import (
     app,
     base_image,
     data_volume,
-    generate_design_id,
     generate_protein_id,
     generate_ulid,
     load_config_from_yaml,
-    weights_volume,
+)
+from state_tree import (
+    PipelineStateTree,
+    NodeStatus,
+    create_state_tree,
 )
 from generators import (
     filter_backbones_by_quality,
     generate_sequences_parallel,
     mock_proteinmpnn,
     mock_rfdiffusion,
-    run_proteinmpnn,
     run_rfdiffusion,
-    run_rfdiffusion_single,
 )
 from validators import (
     check_cross_reactivity_parallel,
@@ -74,8 +70,6 @@ from validators import (
     mock_boltz2,
     mock_chai1,
     mock_foldseek,
-    run_boltz2,
-    run_chai1_batch,
     run_foldseek,
     save_decoys_to_cache,
     validate_sequences_parallel,
@@ -171,29 +165,36 @@ def estimate_cost(config: PipelineConfig) -> dict:
     """
     limits = config.limits
     
-    # Get effective counts based on limits
-    # RFDiffusion: number of backbones
+    # ==========================================================================
+    # Tree Degree Indexing: limits represent branching factor at each level
+    # ==========================================================================
+    
+    # Level 1: RFDiffusion - backbones per target (degree from root)
     requested_backbones = config.rfdiffusion.num_designs
-    max_backbones = limits.get_max_designs("rfdiffusion")
-    effective_backbones = min(requested_backbones, max_backbones)
+    max_backbones_per_target = limits.get_max_designs("rfdiffusion")
+    effective_backbones = min(requested_backbones, max_backbones_per_target)
     
-    # ProteinMPNN: total sequences = backbones × sequences_per_backbone
-    requested_sequences = effective_backbones * config.proteinmpnn.num_sequences
-    max_sequences = limits.get_max_designs("proteinmpnn")
-    effective_sequences = min(requested_sequences, max_sequences)
+    # Level 2: ProteinMPNN - sequences per backbone (degree per backbone)
+    requested_seqs_per_backbone = config.proteinmpnn.num_sequences
+    max_seqs_per_backbone = limits.get_max_designs("proteinmpnn")
+    effective_seqs_per_backbone = min(requested_seqs_per_backbone, max_seqs_per_backbone)
     
-    # Boltz-2: sequences to validate (same as effective_sequences, capped by limit)
+    # Derived: total sequences in tree
+    effective_sequences = effective_backbones * effective_seqs_per_backbone
+    
+    # Level 3: Boltz-2 - total cap on validations (cost control, not degree)
     max_boltz2 = limits.get_max_designs("boltz2")
     effective_boltz2 = min(effective_sequences, max_boltz2)
     
-    # FoldSeek: number of decoys
+    # FoldSeek: decoys per target (degree from target)
     requested_decoys = config.foldseek.max_hits
-    max_decoys = limits.get_max_designs("foldseek")
-    effective_decoys = min(requested_decoys, max_decoys)
+    max_decoys_per_target = limits.get_max_designs("foldseek")
+    effective_decoys = min(requested_decoys, max_decoys_per_target)
     
-    # Chai-1: binder-decoy pairs = sequences × decoys
-    max_chai1_pairs = limits.get_max_designs("chai1")
-    effective_chai1_pairs = min(effective_boltz2 * effective_decoys, max_chai1_pairs)
+    # Level 4: Chai-1 - max sequences to check (each checked against ALL decoys)
+    max_chai1_sequences = limits.get_max_designs("chai1")
+    effective_chai1_sequences = min(effective_boltz2, max_chai1_sequences)
+    effective_chai1_pairs = effective_chai1_sequences * effective_decoys
     
     # Get effective timeouts from limits
     rfdiffusion_timeout = limits.get_timeout("rfdiffusion")
@@ -230,9 +231,11 @@ def estimate_cost(config: PipelineConfig) -> dict:
     # Include effective counts and timeouts for reporting
     costs["_effective"] = {
         "backbones": effective_backbones,
+        "seqs_per_backbone": effective_seqs_per_backbone,
         "sequences": effective_sequences,
         "boltz2_validations": effective_boltz2,
         "decoys": effective_decoys,
+        "chai1_sequences": effective_chai1_sequences,
         "chai1_pairs": effective_chai1_pairs,
     }
     costs["_timeouts"] = {
@@ -323,6 +326,12 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     start_time = time.time()
     run_id = generate_ulid()
     
+    # Initialize state tree for observability
+    state_tree = create_state_tree(
+        run_id=run_id,
+        config=config.model_dump(mode="json") if hasattr(config, 'model_dump') else None
+    )
+    
     # Organize output: data/<PDB_ID>/entity_<N>/<YYYYMMDD>_<mode>_<ulid>/
     pdb_id = config.target.pdb_id.upper()
     entity_id = config.target.entity_id
@@ -347,6 +356,52 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     for d in dirs.values():
         os.makedirs(d, exist_ok=True)
 
+    # ==========================================================================
+    # ENFORCE HARD LIMITS from config.limits (Tree Degree Indexing)
+    # ==========================================================================
+    # The pipeline creates a tree structure. Limits represent the DEGREE
+    # (branching factor) at each node level:
+    #
+    #   Target (root)
+    #   ├── [RFDiffusion] → degree = max backbones per target
+    #   │   └── [ProteinMPNN] → degree = max sequences per backbone
+    #   │       └── [Boltz-2] → 1:1 mapping, capped by total (cost control)
+    #   │           └── [Chai-1] → degree = decoys per validated sequence
+    #   └── [FoldSeek] → degree = max decoys per target
+    #
+    # ==========================================================================
+    limits = config.limits
+    
+    # Level 1: RFDiffusion - max backbones per target (degree from root)
+    max_backbones_per_target = limits.get_max_designs("rfdiffusion")
+    if config.rfdiffusion.num_designs > max_backbones_per_target:
+        print(f"[LIMIT] RFDiffusion: {config.rfdiffusion.num_designs} → {max_backbones_per_target} backbones/target")
+        config.rfdiffusion.num_designs = max_backbones_per_target
+    
+    # Level 2: ProteinMPNN - max sequences per backbone (degree per backbone node)
+    max_seqs_per_backbone = limits.get_max_designs("proteinmpnn")
+    if config.proteinmpnn.num_sequences > max_seqs_per_backbone:
+        print(f"[LIMIT] ProteinMPNN: {config.proteinmpnn.num_sequences} → {max_seqs_per_backbone} seqs/backbone")
+        config.proteinmpnn.num_sequences = max_seqs_per_backbone
+    
+    # Derived: total sequences in tree
+    total_sequences = config.rfdiffusion.num_designs * config.proteinmpnn.num_sequences
+    
+    # Level 3: Boltz-2 - max validations total (cost control, not degree)
+    # This caps how many leaf nodes we validate, not branching factor
+    max_boltz2_validations = limits.get_max_designs("boltz2")
+    
+    # FoldSeek: max decoys per target (degree from target node)
+    max_decoys_per_target = limits.get_max_designs("foldseek")
+    if config.foldseek.max_hits > max_decoys_per_target:
+        print(f"[LIMIT] FoldSeek: {config.foldseek.max_hits} → {max_decoys_per_target} decoys/target")
+        config.foldseek.max_hits = max_decoys_per_target
+    
+    # Level 4: Chai-1 - max validated sequences to check (cost control)
+    # Each validated sequence is checked against ALL decoys
+    # Limit controls how many sequences proceed to cross-reactivity check
+    max_chai1_sequences = limits.get_max_designs("chai1")
+    
     # Pre-flight cost check
     cost_estimate = estimate_cost(config)
     if cost_estimate["total"] > config.max_compute_usd:
@@ -367,13 +422,19 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
 
     # Pipeline configuration
     t = config.target
+    print(f"\n{'='*70}")
+    print(f"PIPELINE RUN: {run_id}")
+    print(f"{'='*70}")
     print(f"Target: {t.name}")
-    print(f"PDB ID: {t.pdb_id}")
-    print(f"Entity ID: {t.entity_id}")
+    print(f"PDB ID: {t.pdb_id} | Entity ID: {t.entity_id}")
     print(f"Hotspot residues: {', '.join(str(r) for r in t.hotspot_residues)}")
-    print(f"ULID: {run_id}")
-    print(f"Configuration: {config.rfdiffusion.num_designs} backbones × {config.proteinmpnn.num_sequences} sequences each")
-    print(f"Budget: ${cost_estimate['total']:.2f} (cost ceiling)")
+    print("\nConfiguration:")
+    print(f"├─ Backbones: {config.rfdiffusion.num_designs} (max: {max_backbones_per_target})")
+    print(f"│  └─ Sequences: {config.proteinmpnn.num_sequences}/backbone (max: {max_seqs_per_backbone}) → {total_sequences} total")
+    print(f"│     └─ Validations: up to {max_boltz2_validations}")
+    print(f"│        └─ Chai-1: up to {max_chai1_sequences} seqs × {config.foldseek.max_hits} decoys")
+    print(f"└─ Decoys: {config.foldseek.max_hits} (max: {max_decoys_per_target})")
+    print(f"\nBudget: ${cost_estimate['total']:.2f} (cost ceiling)")
     print(f"  ├─ RFDiffusion (A10G):  ${cost_estimate['rfdiffusion']:.3f}")
     print(f"  ├─ ProteinMPNN (L4):    ${cost_estimate['proteinmpnn']:.3f}")
     print(f"  ├─ Boltz-2 (A100):      ${cost_estimate['boltz2']:.3f}")
@@ -382,6 +443,31 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
 
     # Write run manifest to campaign directory
     _write_run_manifest(campaign_dir, run_id, config, cost_estimate)
+
+    # Add target node to state tree
+    target_node_id = state_tree.add_target(
+        pdb_id=t.pdb_id,
+        entity_id=t.entity_id,
+        name=t.name,
+        hotspot_residues=t.hotspot_residues,
+    )
+    state_tree.set_status(target_node_id, NodeStatus.COMPLETED)
+    
+    # Set ceiling costs and initial configuration in state tree
+    state_tree.set_ceiling_cost(run_id, cost_estimate["total"])
+    state_tree.set_metrics(run_id, {
+        "cost_estimate": {
+            "total": cost_estimate["total"],
+            "rfdiffusion": cost_estimate["rfdiffusion"],
+            "proteinmpnn": cost_estimate["proteinmpnn"],
+            "boltz2": cost_estimate["boltz2"],
+            "foldseek": cost_estimate["foldseek"],
+            "chai1": cost_estimate["chai1"],
+        },
+        "effective_limits": cost_estimate["_effective"],
+        "timeouts": cost_estimate["_timeouts"],
+        "max_compute_usd": config.max_compute_usd,
+    })
 
     validation_results: list[ValidationResult] = []
     all_candidates: list[BinderCandidate] = []
@@ -404,10 +490,59 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             config.adaptive,
             config.backbone_filter,
             dirs,
+            max_boltz2_per_batch=max_boltz2_validations,
         )
         stage_duration = time.time() - stage_start
         print(f"Adaptive generation complete: {len(backbones)} backbones, {len(sequences)} sequences, {len(predictions)} validated")
         print(f"  └─ Total duration: {stage_duration:.1f}s")
+        
+        # Add adaptive generation nodes to state tree
+        for backbone in backbones:
+            backbone_node_id = state_tree.add_backbone(
+                design_id=backbone.design_id,
+                parent_id=target_node_id,
+                pdb_path=backbone.pdb_path,
+                binder_length=backbone.binder_length,
+                rfdiffusion_score=backbone.rfdiffusion_score,
+            )
+            state_tree.end_timing(backbone_node_id, NodeStatus.COMPLETED)
+        
+        for seq in sequences:
+            seq_node_id = state_tree.add_sequence(
+                sequence_id=seq.sequence_id,
+                backbone_id=seq.backbone_id,
+                sequence=seq.sequence,
+                score=seq.score,
+                fasta_path=seq.fasta_path,
+            )
+            # Mark as completed or filtered based on whether it has a prediction
+            has_prediction = any(p.sequence_id == seq.sequence_id for p in predictions)
+            state_tree.end_timing(
+                seq_node_id,
+                status=NodeStatus.COMPLETED if has_prediction else NodeStatus.FILTERED,
+            )
+        
+        for pred in predictions:
+            pred_node_id = state_tree.add_prediction(
+                prediction_id=pred.prediction_id,
+                sequence_id=pred.sequence_id,
+                pdb_path=pred.pdb_path,
+                plddt_overall=pred.plddt_overall,
+                plddt_interface=pred.plddt_interface,
+                pae_interface=pred.pae_interface,
+                ptm=pred.ptm,
+                iptm=pred.iptm,
+                pae_interaction=pred.pae_interaction,
+                ptm_binder=pred.ptm_binder,
+                rmsd_to_design=pred.rmsd_to_design,
+            )
+            state_tree.end_timing(pred_node_id, NodeStatus.COMPLETED)
+        
+        # Set aggregate cost for adaptive stage
+        state_tree.set_metrics(run_id, {
+            "adaptive_mode": True,
+            "adaptive_duration_sec": stage_duration,
+        })
         
         validation_results.append(
             ValidationResult(
@@ -439,10 +574,11 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         )
         
         if not predictions:
-            return _create_empty_result(run_id, config, validation_results, start_time)
+            return _create_empty_result(run_id, config, validation_results, start_time, state_tree)
     else:
         # Standard batch generation
         print("\n=== Phase 1: Backbone Generation (RFDiffusion) ===")
+        print(f"[START] {time.strftime('%H:%M:%S')} | Generating {config.rfdiffusion.num_designs} backbones")
         stage_start = time.time()
         backbones = _run_backbone_generation(
             config.target,
@@ -451,19 +587,39 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             use_mocks,
         )
         stage_duration = time.time() - stage_start
-        print(f"Generated {len(backbones)} backbone designs")
+        print(f"[DONE]  {time.strftime('%H:%M:%S')} | Output: {len(backbones)} backbones | Duration: {stage_duration:.1f}s")
         stage_metrics.append(_log_stage_metrics(
             "rfdiffusion", stage_duration, len(backbones),
             cost_estimate["_timeouts"]["rfdiffusion"], cost_estimate["rfdiffusion"]
         ))
         
+        # Add backbone nodes to state tree
+        for backbone in backbones:
+            backbone_node_id = state_tree.add_backbone(
+                design_id=backbone.design_id,
+                parent_id=target_node_id,
+                pdb_path=backbone.pdb_path,
+                binder_length=backbone.binder_length,
+                rfdiffusion_score=backbone.rfdiffusion_score,
+            )
+            state_tree.end_timing(
+                backbone_node_id,
+                status=NodeStatus.COMPLETED,
+                cost_usd=cost_estimate["rfdiffusion"] / max(1, len(backbones)),
+            )
+        
         # Step 1b: Backbone Quality Filter (#2 optimization)
         if config.backbone_filter.enabled and backbones:
+            original_backbone_ids = {b.design_id for b in backbones}
             backbones = filter_backbones_by_quality(
                 backbones,
                 min_score=config.backbone_filter.min_score,
                 max_keep=config.backbone_filter.max_keep,
             )
+            # Mark filtered backbones in state tree
+            kept_ids = {b.design_id for b in backbones}
+            for bb_id in original_backbone_ids - kept_ids:
+                state_tree.set_status(bb_id, NodeStatus.FILTERED)
 
         validation_results.append(
             ValidationResult(
@@ -475,10 +631,11 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         )
 
         if not backbones:
-            return _create_empty_result(run_id, config, validation_results, start_time)
+            return _create_empty_result(run_id, config, validation_results, start_time, state_tree)
 
         # Step 2: ProteinMPNN - Sequence Design
         print("\n=== Phase 1: Sequence Design (ProteinMPNN) ===")
+        print(f"[START] {time.strftime('%H:%M:%S')} | Input: {len(backbones)} backbones × {config.proteinmpnn.num_sequences} seqs each")
         stage_start = time.time()
         sequences = _run_sequence_design(
             backbones,
@@ -487,11 +644,26 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             use_mocks,
         )
         stage_duration = time.time() - stage_start
-        print(f"Designed {len(sequences)} sequences")
+        print(f"[DONE]  {time.strftime('%H:%M:%S')} | Output: {len(sequences)} sequences | Duration: {stage_duration:.1f}s")
         stage_metrics.append(_log_stage_metrics(
             "proteinmpnn", stage_duration, len(sequences),
             cost_estimate["_timeouts"]["proteinmpnn"] * len(backbones), cost_estimate["proteinmpnn"]
         ))
+        
+        # Add sequence nodes to state tree
+        for seq in sequences:
+            seq_node_id = state_tree.add_sequence(
+                sequence_id=seq.sequence_id,
+                backbone_id=seq.backbone_id,
+                sequence=seq.sequence,
+                score=seq.score,
+                fasta_path=seq.fasta_path,
+            )
+            state_tree.end_timing(
+                seq_node_id,
+                status=NodeStatus.COMPLETED,
+                cost_usd=cost_estimate["proteinmpnn"] / max(1, len(sequences)),
+            )
         
         predictions = None  # Will be computed in Phase 2
         
@@ -505,28 +677,71 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         )
 
         if not sequences:
-            return _create_empty_result(run_id, config, validation_results, start_time)
+            return _create_empty_result(run_id, config, validation_results, start_time, state_tree)
 
         # =========================================================================
         # Phase 2: Validation (Specificity) - Standard Mode
         # =========================================================================
 
         # Step 3: Boltz-2 - Structure Prediction & Filtering
+        # ENFORCE Boltz-2 limit: select TOP N sequences by ProteinMPNN score (descending)
+        if len(sequences) > max_boltz2_validations:
+            # Sort by ProteinMPNN score descending (higher score = better)
+            sequences_ranked = sorted(sequences, key=lambda s: s.score, reverse=True)
+            sequences_to_validate = sequences_ranked[:max_boltz2_validations]
+            skipped_sequences = sequences_ranked[max_boltz2_validations:]
+            top_scores = [f"{s.score:.2f}" for s in sequences_to_validate]
+            print(f"[LIMIT] Boltz-2: {len(sequences)} → {max_boltz2_validations} sequences (top by score: {', '.join(top_scores)})")
+            # Mark skipped sequences in state tree
+            for seq in skipped_sequences:
+                state_tree.set_status(seq.sequence_id, NodeStatus.SKIPPED)
+                state_tree.set_metrics(seq.sequence_id, {"skipped_by": "boltz2_limit", "score": seq.score})
+        else:
+            sequences_to_validate = sequences
+        
         print("\n=== Phase 2: Structure Validation (Boltz-2) ===")
+        print(f"[START] {time.strftime('%H:%M:%S')} | Input: {len(sequences_to_validate)} sequences")
         stage_start = time.time()
         predictions = _run_structure_validation(
-            sequences,
+            sequences_to_validate,
             config.target,
             config.boltz2,
             dirs["validation_boltz"],
             use_mocks,
         )
         stage_duration = time.time() - stage_start
-        print(f"Validated {len(predictions)} sequences (passed filters)")
+        print(f"[DONE]  {time.strftime('%H:%M:%S')} | Output: {len(predictions)} passed | Duration: {stage_duration:.1f}s")
         stage_metrics.append(_log_stage_metrics(
             "boltz2", stage_duration, len(predictions),
-            cost_estimate["_timeouts"]["boltz2"] * len(sequences), cost_estimate["boltz2"]
+            cost_estimate["_timeouts"]["boltz2"] * len(sequences_to_validate), cost_estimate["boltz2"]
         ))
+        
+        # Add prediction nodes to state tree
+        for pred in predictions:
+            pred_node_id = state_tree.add_prediction(
+                prediction_id=pred.prediction_id,
+                sequence_id=pred.sequence_id,
+                pdb_path=pred.pdb_path,
+                plddt_overall=pred.plddt_overall,
+                plddt_interface=pred.plddt_interface,
+                pae_interface=pred.pae_interface,
+                ptm=pred.ptm,
+                iptm=pred.iptm,
+                pae_interaction=pred.pae_interaction,
+                ptm_binder=pred.ptm_binder,
+                rmsd_to_design=pred.rmsd_to_design,
+            )
+            state_tree.end_timing(
+                pred_node_id,
+                status=NodeStatus.COMPLETED,
+                cost_usd=cost_estimate["boltz2"] / max(1, len(predictions)),
+            )
+        
+        # Mark sequences that failed validation as filtered
+        validated_seq_ids = {p.sequence_id for p in predictions}
+        for seq in sequences_to_validate:
+            if seq.sequence_id not in validated_seq_ids:
+                state_tree.set_status(seq.sequence_id, NodeStatus.FILTERED)
 
         validation_results.append(
             ValidationResult(
@@ -542,16 +757,22 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         )
 
         if not predictions:
-            return _create_empty_result(run_id, config, validation_results, start_time)
+            return _create_empty_result(run_id, config, validation_results, start_time, state_tree)
 
     # Step 4: Clustering - Diversity via TM-score (AlphaProteo SI 2.2)
     if config.cluster.tm_threshold > 0:
         print("\n=== Phase 2b: Clustering (Diversity) ===")
+        pre_cluster_ids = {p.prediction_id for p in predictions}
         predictions = cluster_by_tm_score(
             predictions,
             tm_threshold=config.cluster.tm_threshold,
             select_best=config.cluster.select_best,
         )
+        post_cluster_ids = {p.prediction_id for p in predictions}
+        # Mark clustered-out predictions as filtered
+        for pred_id in pre_cluster_ids - post_cluster_ids:
+            state_tree.set_status(pred_id, NodeStatus.FILTERED)
+            state_tree.set_metrics(pred_id, {"filtered_by": "clustering"})
         print(f"After clustering: {len(predictions)} representatives")
 
     # Step 5: Novelty Check - pyhmmer vs UniRef50 (AlphaProteo SI 2.2)
@@ -559,6 +780,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         print("\n=== Phase 2c: Novelty Check (pyhmmer) ===")
         # Get sequences corresponding to predictions
         pred_seq_ids = {p.sequence_id for p in predictions}
+        pre_novelty_pred_ids = {p.prediction_id for p in predictions}
         novel_sequences = check_novelty(
             [s for s in sequences if s.sequence_id in pred_seq_ids],
             max_evalue=config.novelty.max_evalue,
@@ -567,11 +789,16 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         # Filter predictions to only novel sequences
         novel_seq_ids = {s.sequence_id for s in novel_sequences}
         predictions = [p for p in predictions if p.sequence_id in novel_seq_ids]
+        post_novelty_pred_ids = {p.prediction_id for p in predictions}
+        # Mark non-novel predictions as filtered
+        for pred_id in pre_novelty_pred_ids - post_novelty_pred_ids:
+            state_tree.set_status(pred_id, NodeStatus.FILTERED)
+            state_tree.set_metrics(pred_id, {"filtered_by": "novelty_check"})
         print(f"After novelty check: {len(predictions)} novel designs")
     
     if not predictions:
         print("No predictions passed clustering/novelty filters")
-        return _create_empty_result(run_id, config, validation_results, start_time)
+        return _create_empty_result(run_id, config, validation_results, start_time, state_tree)
 
     # =========================================================================
     # Phase 3: Negative Selection (Selectivity)
@@ -579,6 +806,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
 
     # Step 6: FoldSeek - Find Structural Decoys (with caching #5 optimization)
     print("\n=== Phase 3: Decoy Identification (FoldSeek) ===")
+    print(f"[START] {time.strftime('%H:%M:%S')} | Searching for up to {config.foldseek.max_hits} decoys")
     stage_start = time.time()
     decoys = _run_decoy_search(
         config.target,
@@ -588,11 +816,28 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         cache_dir=dirs["entity"],  # Cache at entity level for reuse across campaigns
     )
     stage_duration = time.time() - stage_start
-    print(f"Found {len(decoys)} structural decoys (potential off-targets)")
+    print(f"[DONE]  {time.strftime('%H:%M:%S')} | Output: {len(decoys)} decoys | Duration: {stage_duration:.1f}s")
     stage_metrics.append(_log_stage_metrics(
         "foldseek", stage_duration, len(decoys),
         cost_estimate["_timeouts"]["foldseek"], cost_estimate["foldseek"]
     ))
+    
+    # Add decoy nodes to state tree
+    for decoy in decoys:
+        decoy_node_id = state_tree.add_decoy(
+            decoy_id=decoy.decoy_id,
+            target_id=target_node_id,
+            pdb_path=decoy.pdb_path,
+            evalue=decoy.evalue,
+            tm_score=decoy.tm_score,
+            aligned_length=decoy.aligned_length,
+            sequence_identity=decoy.sequence_identity,
+        )
+        state_tree.end_timing(
+            decoy_node_id,
+            status=NodeStatus.COMPLETED,
+            cost_usd=cost_estimate["foldseek"] / max(1, len(decoys)),
+        )
 
     validation_results.append(
         ValidationResult(
@@ -614,7 +859,33 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     ]
 
     if validated_sequences:
+        # ENFORCE Chai-1 limit: select TOP N sequences by PPI score (descending)
+        # Each sequence is checked against ALL decoys
+        num_decoys = len(decoys) if decoys else 0
+        
+        if len(validated_sequences) > max_chai1_sequences:
+            # Build mapping from sequence_id to PPI score from Boltz-2 predictions
+            ppi_scores = {p.sequence_id: p.ppi_score for p in predictions}
+            
+            # Sort by PPI score descending (higher = better target binding)
+            validated_sequences_ranked = sorted(
+                validated_sequences,
+                key=lambda s: ppi_scores.get(s.sequence_id, 0),
+                reverse=True
+            )
+            validated_sequences = validated_sequences_ranked[:max_chai1_sequences]
+            skipped_for_chai1 = validated_sequences_ranked[max_chai1_sequences:]
+            top_ppi = [f"{ppi_scores.get(s.sequence_id, 0):.3f}" for s in validated_sequences]
+            print(f"[LIMIT] Chai-1: {len(validated_sequences_ranked)} → {max_chai1_sequences} sequences (top by PPI: {', '.join(top_ppi)})")
+            # Mark skipped sequences in state tree
+            for seq in skipped_for_chai1:
+                state_tree.set_metrics(seq.sequence_id, {
+                    "skipped_chai1": True,
+                    "ppi_score": ppi_scores.get(seq.sequence_id, 0),
+                })
+        
         print("\n=== Phase 3: Cross-Reactivity Check (Chai-1) ===")
+        print(f"[START] {time.strftime('%H:%M:%S')} | Input: {len(validated_sequences)} sequences × {num_decoys} decoys")
         stage_start = time.time()
         
         # Run positive control + decoy check
@@ -630,18 +901,52 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         
         # Report positive control results
         num_binding = sum(1 for r in positive_control_results.values() if r.plddt_interface > 50)
-        print(f"Positive control: {num_binding}/{len(validated_sequences)} binders bind target")
+        print(f"[DONE]  {time.strftime('%H:%M:%S')} | Positive control: {num_binding}/{len(validated_sequences)} bind target | Duration: {stage_duration:.1f}s")
         
         if decoys:
-            print(f"Decoy check: {len(cross_reactivity_results)} sequences checked against {len(decoys)} decoys")
+            print(f"        Decoy check: {len(cross_reactivity_results)} sequences checked against {num_decoys} decoys")
         
         # Log Chai-1 metrics
-        num_pairs = len(validated_sequences) * len(decoys) if decoys else len(validated_sequences)
+        num_pairs = len(validated_sequences) * num_decoys if decoys else len(validated_sequences)
         stage_metrics.append(_log_stage_metrics(
             "chai1", stage_duration, num_pairs,
             cost_estimate["_timeouts"]["chai1"] * cost_estimate["_effective"]["chai1_pairs"], 
             cost_estimate["chai1"]
         ))
+        
+        # Add positive control results to state tree (target binding check)
+        for seq_id, pc_result in positive_control_results.items():
+            pc_node_id = state_tree.add_cross_reactivity(
+                binder_id=seq_id,
+                decoy_id="TARGET_POSITIVE_CONTROL",
+                predicted_affinity=pc_result.predicted_affinity,
+                plddt_interface=pc_result.plddt_interface,
+                binds_decoy=pc_result.binds_decoy,
+                ptm=pc_result.ptm,
+                iptm=pc_result.iptm,
+                chain_pair_iptm=pc_result.chain_pair_iptm,
+            )
+            state_tree.set_metrics(pc_node_id, {"is_positive_control": True})
+            state_tree.end_timing(pc_node_id, status=NodeStatus.COMPLETED)
+        
+        # Add cross-reactivity nodes to state tree (decoy checks)
+        for seq_id, cr_results in cross_reactivity_results.items():
+            for cr in cr_results:
+                cr_node_id = state_tree.add_cross_reactivity(
+                    binder_id=seq_id,
+                    decoy_id=cr.decoy_id,
+                    predicted_affinity=cr.predicted_affinity,
+                    plddt_interface=cr.plddt_interface,
+                    binds_decoy=cr.binds_decoy,
+                    ptm=cr.ptm,
+                    iptm=cr.iptm,
+                    chain_pair_iptm=cr.chain_pair_iptm,
+                )
+                state_tree.end_timing(
+                    cr_node_id,
+                    status=NodeStatus.COMPLETED,
+                    cost_usd=cost_estimate["chai1"] / max(1, num_pairs),
+                )
 
         validation_results.append(
             ValidationResult(
@@ -722,6 +1027,15 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         )
 
         all_candidates.append(candidate)
+        
+        # Add candidate node to state tree
+        state_tree.add_candidate(
+            candidate_id=candidate_id,
+            prediction_id=prediction.prediction_id,
+            specificity_score=specificity_score,
+            selectivity_score=selectivity_score,
+            final_score=final_score,
+        )
 
     # Sort by final score (highest first)
     all_candidates.sort(key=lambda c: c.final_score, reverse=True)
@@ -753,6 +1067,15 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         savings = total_ceiling_cost - total_actual_cost
         if savings > 0:
             print(f"  Savings: ${savings:.3f} ({savings/total_ceiling_cost*100:.0f}% under ceiling)")
+        
+        # Add stage metrics to state tree
+        state_tree.set_metrics(run_id, {
+            "stage_metrics": stage_metrics,
+            "total_actual_cost_usd": total_actual_cost,
+            "total_ceiling_cost_usd": total_ceiling_cost,
+            "savings_usd": savings if savings > 0 else 0,
+            "savings_pct": (savings / total_ceiling_cost * 100) if total_ceiling_cost > 0 and savings > 0 else 0,
+        })
 
     # Write inputs (info.json at PDB root, entity-specific config)
     _write_inputs(dirs["pdb_root"], dirs["entity"], config)
@@ -765,6 +1088,26 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
 
     # Create symlinks for best candidates
     _create_best_symlinks(dirs["best"], top_candidates, dirs["validation_boltz"])
+    
+    # Add final run metrics to state tree
+    state_tree.set_metrics(run_id, {
+        "runtime_seconds": runtime_seconds,
+        "total_candidates": len(all_candidates),
+        "top_candidates_count": len(top_candidates),
+        "best_score": top_candidates[0].final_score if top_candidates else None,
+        "best_candidate_id": top_candidates[0].candidate_id if top_candidates else None,
+    })
+    
+    # Finalize state tree and export
+    state_tree.finalize(success=True)
+    state_tree_path = f"{campaign_dir}/state_tree.json"
+    state_tree.to_json(state_tree_path)
+    print(f"\nState tree exported to: {state_tree_path}")
+    print(state_tree.summary())
+    
+    # Also export Graphviz visualization
+    graphviz_path = f"{campaign_dir}/state_tree.dot"
+    state_tree.to_graphviz(graphviz_path)
 
     # Commit data volume
     data_volume.commit()
@@ -810,6 +1153,7 @@ def _run_adaptive_generation(
     adaptive_config: AdaptiveGenerationConfig,
     backbone_filter_config: BackboneFilterConfig,
     dirs: dict[str, str],
+    max_boltz2_per_batch: Optional[int] = None,
 ) -> tuple[list[BackboneDesign], list[SequenceDesign], list[StructurePrediction]]:
     """
     Adaptive generation with early termination using micro-batching (#3 optimization).
@@ -838,7 +1182,7 @@ def _run_adaptive_generation(
     
     print(f"Adaptive mode: target {adaptive_config.min_validated_candidates} validated candidates")
     print(f"  Micro-batch size: {adaptive_config.batch_size} backbones, max batches: {adaptive_config.max_batches}")
-    print(f"  (GPU-efficient: full batch processing, early termination between batches)")
+    print("  (GPU-efficient: full batch processing, early termination between batches)")
     
     while (len(validated_predictions) < adaptive_config.min_validated_candidates 
            and batch_num < adaptive_config.max_batches):
@@ -906,11 +1250,21 @@ def _run_adaptive_generation(
         all_sequences.extend(batch_sequences)
         
         # =====================================================================
-        # Step 3: Validate ALL sequences in parallel (GPU-efficient)
+        # Step 3: Validate sequences (GPU-efficient, score-ranked selection)
         # =====================================================================
+        # Apply per-batch limit with score ranking if specified
+        if max_boltz2_per_batch and len(batch_sequences) > max_boltz2_per_batch:
+            # Sort by ProteinMPNN score descending (higher = better)
+            batch_sequences_ranked = sorted(batch_sequences, key=lambda s: s.score, reverse=True)
+            sequences_for_validation = batch_sequences_ranked[:max_boltz2_per_batch]
+            top_scores = [f"{s.score:.2f}" for s in sequences_for_validation]
+            print(f"  [LIMIT] Boltz-2: {len(batch_sequences)} → {max_boltz2_per_batch} seqs (top by score: {', '.join(top_scores)})")
+        else:
+            sequences_for_validation = batch_sequences
+        
         try:
             batch_predictions = validate_sequences_parallel.remote(
-                batch_sequences,
+                sequences_for_validation,
                 target,
                 boltz2_config,
                 f"{dirs['validation_boltz']}/batch_{batch_num}"
@@ -921,10 +1275,10 @@ def _run_adaptive_generation(
         
         if batch_predictions:
             validated_predictions.extend(batch_predictions)
-            print(f"  Step 3: Validated {len(batch_predictions)}/{len(batch_sequences)} sequences")
+            print(f"  Step 3: Validated {len(batch_predictions)}/{len(sequences_for_validation)} sequences")
             print(f"  Running total: {len(validated_predictions)}/{adaptive_config.min_validated_candidates} validated candidates")
         else:
-            print(f"  Step 3: No sequences passed validation in this batch")
+            print("  Step 3: No sequences passed validation in this batch")
         
         # =====================================================================
         # Check if we have enough validated candidates to stop
@@ -938,7 +1292,7 @@ def _run_adaptive_generation(
     max_possible_backbones = adaptive_config.max_batches * adaptive_config.batch_size
     max_possible_sequences = max_possible_backbones * proteinmpnn_config.num_sequences
     
-    print(f"\nAdaptive generation summary:")
+    print("\nAdaptive generation summary:")
     print(f"  Micro-batches used: {batch_num}/{adaptive_config.max_batches}")
     print(f"  Backbones generated: {total_backbones}")
     print(f"  Sequences designed: {len(all_sequences)}")
@@ -948,7 +1302,7 @@ def _run_adaptive_generation(
         saved_backbones = max_possible_backbones - total_backbones
         saved_sequences = max_possible_sequences - len(all_sequences)
         if saved_backbones > 0 or saved_sequences > 0:
-            print(f"  Savings from early termination:")
+            print("  Savings from early termination:")
             print(f"    Skipped: {saved_backbones} backbones, {saved_sequences} sequences")
             # Estimate cost savings (rough)
             backbone_cost_per = 600 * MODAL_GPU_COST_PER_SEC["A10G"]  # 600s timeout
@@ -1112,8 +1466,13 @@ def _create_empty_result(
     config: PipelineConfig,
     validation_results: list[ValidationResult],
     start_time: float,
+    state_tree: Optional[PipelineStateTree] = None,
 ) -> PipelineResult:
     """Create an empty result when pipeline fails early."""
+    # Finalize state tree if provided
+    if state_tree is not None:
+        state_tree.finalize(success=False)
+    
     return PipelineResult(
         run_id=run_id,
         config=config,
@@ -1307,13 +1666,14 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     
     # Requested vs effective (limited) values
     req_backbones = config.rfdiffusion.num_designs
-    req_sequences = req_backbones * config.proteinmpnn.num_sequences
     req_decoys = config.foldseek.max_hits
     
     eff_backbones = eff["backbones"]
+    eff_seqs_per_backbone = eff["seqs_per_backbone"]
     eff_sequences = eff["sequences"]
     eff_boltz2 = eff["boltz2_validations"]
     eff_decoys = eff["decoys"]
+    eff_chai1_seqs = eff["chai1_sequences"]
     eff_chai1 = eff["chai1_pairs"]
     
     # Calculate time breakdown
@@ -1342,23 +1702,26 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     print(f"Hotspot residues: {', '.join(str(r) for r in t.hotspot_residues)}")
     print()
     
-    print("CONFIGURATION (Requested → Effective after limits)")
+    print("CONFIGURATION")
     print("-" * 70)
     
-    # Show requested vs effective values with limit indicators
+    # Show as tree structure
     backbone_limited = req_backbones > eff_backbones
-    seq_limited = req_sequences > eff_sequences
+    seq_per_bb_limited = config.proteinmpnn.num_sequences > eff_seqs_per_backbone
     decoy_limited = req_decoys > eff_decoys
     
     backbone_str = f"{req_backbones} → {eff_backbones}" if backbone_limited else str(eff_backbones)
-    seq_str = f"{req_sequences} → {eff_sequences}" if seq_limited else str(eff_sequences)
+    seq_per_bb_str = f"{config.proteinmpnn.num_sequences} → {eff_seqs_per_backbone}" if seq_per_bb_limited else str(eff_seqs_per_backbone)
     decoy_str = f"{req_decoys} → {eff_decoys}" if decoy_limited else str(eff_decoys)
     
-    print(f"Backbones:     {backbone_str}" + (" (capped by limit)" if backbone_limited else ""))
-    print(f"Sequences:     {seq_str}" + (" (capped by limit)" if seq_limited else ""))
-    print(f"Boltz-2 runs:  {eff_boltz2}")
-    print(f"Decoys:        {decoy_str}" + (" (capped by limit)" if decoy_limited else ""))
-    print(f"Chai-1 pairs:  {eff_chai1}")
+    def cap_tag(capped: bool) -> str:
+        return " (capped)" if capped else ""
+    
+    print(f"├─ Backbones: {backbone_str}{cap_tag(backbone_limited)}")
+    print(f"│  └─ Sequences: {seq_per_bb_str}/backbone{cap_tag(seq_per_bb_limited)} → {eff_sequences} total")
+    print(f"│     └─ Validations: {eff_boltz2}")
+    print(f"│        └─ Chai-1: {eff_chai1_seqs} seqs × {eff_decoys} decoys = {eff_chai1} pairs")
+    print(f"└─ Decoys: {decoy_str}{cap_tag(decoy_limited)}")
     print()
     
     print("STAGE LIMITS")
@@ -1404,7 +1767,7 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
         print("-" * 70)
         print("Options to reduce cost:")
         print(f"  1. Reduce designs: --num-designs {suggested_designs} --num-sequences {suggested_sequences}")
-        print(f"  2. Lower stage limits in YAML config (limits.boltz2.max_designs, etc.)")
+        print("  2. Lower stage limits in YAML config (limits.boltz2.max_designs, etc.)")
         print(f"  3. Increase budget: --max-budget {cost_total * 1.1:.2f}")
         print()
 

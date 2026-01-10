@@ -12,11 +12,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Optional
-
-import modal
 
 from common import (
     DATA_PATH,
@@ -67,7 +64,6 @@ def run_boltz2(
     Returns:
         StructurePrediction if successful, None otherwise
     """
-    import numpy as np
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -378,7 +374,6 @@ def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -
     """
     try:
         from Bio.PDB import PDBParser, MMCIFParser, Superimposer
-        import numpy as np
         
         # Parse reference (RFDiffusion backbone)
         ref_parser = PDBParser(QUIET=True)
@@ -909,7 +904,7 @@ def download_decoy_structures(
                         if downloaded_file and os.path.exists(downloaded_file):
                             # Rename to consistent format
                             os.rename(downloaded_file, pdb_path)
-                    except Exception as e:
+                    except Exception:
                         # Fallback to direct URL
                         url = f"https://files.rcsb.org/download/{pdb_code}.pdb"
                         urllib.request.urlretrieve(url, pdb_path)
@@ -967,7 +962,6 @@ def run_chai1(
     from pathlib import Path
     import numpy as np
     import json
-    import glob
     
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1297,7 +1291,7 @@ def check_cross_reactivity_parallel(
             print(f"Chai-1 Tiered Decoy Check: {len(sequences)} sequences")
             print(f"  Tier 1 (TM ≥ {config.tier1_min_tm}): {len(tier1_decoys)} decoys - MUST pass all")
             print(f"  Tier 2 (TM ≥ {config.tier2_min_tm}): {len(tier2_decoys)}/{len(tier2_candidates)} decoys")
-            print(f"  Tier 3 (lower TM): skipped for cost savings")
+            print("  Tier 3 (lower TM): skipped for cost savings")
             
             total_calls = 0
             rejected_sequences: set[str] = set()
@@ -1387,7 +1381,7 @@ def check_cross_reactivity_parallel(
             # Full parallel mode (test all combinations)
             num_pairs = len(sequences) * len(sorted_decoys)
             print(f"Chai-1 Decoy Check: {len(sequences)} sequences × {len(sorted_decoys)} decoys = {num_pairs} pairs")
-            print(f"  (concurrency limited to 2 A100 workers)")
+            print("  (concurrency limited to 2 A100 workers)")
             
             # Prepare all combinations for starmap
             args = [
@@ -1564,7 +1558,6 @@ def cluster_by_tm_score(
     
     try:
         import numpy as np
-        from Bio.PDB import PDBParser, MMCIFParser
         
         # Calculate pairwise TM-scores using structure comparison
         n = len(predictions)
@@ -1626,7 +1619,7 @@ def _calculate_tm_score(pdb1: str, pdb2: str, chain_id: str = "B") -> float:
         TM-score in range [0, 1]
     """
     try:
-        from Bio.PDB import PDBParser, MMCIFParser, Superimposer
+        from Bio.PDB import PDBParser, MMCIFParser
         import numpy as np
         
         # Parse structures
@@ -1714,7 +1707,7 @@ def check_novelty(
     
     try:
         import pyhmmer
-        from pyhmmer.easel import SequenceFile, TextSequence, Alphabet
+        from pyhmmer.easel import TextSequence, Alphabet
         from pyhmmer.plan7 import HMMFile
         
         alphabet = Alphabet.amino()
