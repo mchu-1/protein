@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 import time
-import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -49,6 +48,7 @@ from common import (
     data_volume,
     generate_design_id,
     generate_protein_id,
+    generate_ulid,
     weights_volume,
 )
 from generators import (
@@ -176,9 +176,31 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         PipelineResult with ranked binder candidates
     """
     start_time = time.time()
-    run_id = f"run_{uuid.uuid4().hex[:12]}"
-    base_output_dir = f"{DATA_PATH}/{run_id}"
-    os.makedirs(base_output_dir, exist_ok=True)
+    run_id = generate_ulid()
+    
+    # Organize output: data/<PDB_ID>/entity_<N>/<YYYYMMDD>_<mode>_<ulid>/
+    pdb_id = config.target.pdb_id.upper()
+    entity_id = config.target.entity_id
+    date_prefix = datetime.now().strftime("%Y%m%d")
+    mode_str = config.mode.value
+    campaign_id = f"{date_prefix}_{mode_str}_{run_id}"
+    
+    # Directory structure
+    pdb_root = f"{DATA_PATH}/{pdb_id}"
+    entity_dir = f"{pdb_root}/entity_{entity_id}"
+    campaign_dir = f"{entity_dir}/{campaign_id}"
+    dirs = {
+        "backbones": f"{campaign_dir}/01_backbones",
+        "sequences": f"{campaign_dir}/02_sequences",
+        "validation_boltz": f"{campaign_dir}/03_validation/boltz",
+        "validation_chai": f"{campaign_dir}/03_validation/chai",
+        "metrics": f"{campaign_dir}/99_metrics",
+        "pdb_root": pdb_root,
+        "entity": entity_dir,
+        "best": f"{entity_dir}/best_candidates",
+    }
+    for d in dirs.values():
+        os.makedirs(d, exist_ok=True)
 
     # Pre-flight cost check
     estimated_cost = estimate_cost(config)
@@ -196,10 +218,14 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             1, int(config.proteinmpnn.num_sequences * scale_factor)
         )
 
-    print(f"Starting pipeline run: {run_id}")
-    print(f"Estimated cost: ${estimated_cost:.2f}")
-    print(f"Configuration: {config.rfdiffusion.num_designs} backbones × "
-          f"{config.proteinmpnn.num_sequences} sequences each")
+    # Consolidated pipeline log
+    t = config.target
+    residues = ", ".join(str(r) for r in t.hotspot_residues)
+    cfg = f"{config.rfdiffusion.num_designs} × {config.proteinmpnn.num_sequences}"
+    print(
+        f"{t.name} ({t.pdb_id}) · Entity {t.entity_id} · "
+        f"Residues {residues} · {run_id} · ${config.max_compute_usd:.2f} · {cfg}"
+    )
 
     validation_results: list[ValidationResult] = []
     all_candidates: list[BinderCandidate] = []
@@ -213,7 +239,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     backbones = _run_backbone_generation(
         config.target,
         config.rfdiffusion,
-        f"{base_output_dir}/backbones",
+        dirs["backbones"],
         use_mocks,
     )
     print(f"Generated {len(backbones)} backbone designs")
@@ -235,7 +261,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     sequences = _run_sequence_design(
         backbones,
         config.proteinmpnn,
-        f"{base_output_dir}/sequences",
+        dirs["sequences"],
         use_mocks,
     )
     print(f"Designed {len(sequences)} sequences")
@@ -262,7 +288,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         sequences,
         config.target,
         config.boltz2,
-        f"{base_output_dir}/predictions",
+        dirs["validation_boltz"],
         use_mocks,
     )
     print(f"Validated {len(predictions)} sequences (passed filters)")
@@ -321,7 +347,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     decoys = _run_decoy_search(
         config.target,
         config.foldseek,
-        f"{base_output_dir}/decoys",
+        f"{campaign_dir}/_decoys",
         use_mocks,
     )
     print(f"Found {len(decoys)} structural decoys (potential off-targets)")
@@ -353,7 +379,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             validated_sequences,
             decoys if decoys else [],
             config.chai1,
-            f"{base_output_dir}/cross_reactivity",
+            dirs["validation_chai"],
             use_mocks,
             target=config.target,  # Include target for positive control
         )
@@ -425,8 +451,10 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             - config.scoring.beta * max_decoy_ppi * 100
         )
 
-        # Generate unique protein ID using nomenclature: <pdb_id>_<mode>_<ulid>
-        candidate_id = generate_protein_id(config.target.pdb_id, config.mode)
+        # Generate unique protein ID: <pdb_id>_E<entity_id>_<mode>_<ulid>
+        candidate_id = generate_protein_id(
+            config.target.pdb_id, config.target.entity_id, config.mode
+        )
         
         candidate = BinderCandidate(
             candidate_id=candidate_id,
@@ -455,6 +483,15 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
 
     # Calculate actual runtime
     runtime_seconds = time.time() - start_time
+
+    # Write inputs (info.json at PDB root, entity-specific config)
+    _write_inputs(dirs["pdb_root"], dirs["entity"], config)
+
+    # Write metrics CSV
+    _write_metrics_csv(dirs["metrics"], all_candidates)
+
+    # Create symlinks for best candidates
+    _create_best_symlinks(dirs["best"], top_candidates, dirs["validation_boltz"])
 
     # Commit data volume
     data_volume.commit()
@@ -631,6 +668,95 @@ def _create_empty_result(
     )
 
 
+def _write_inputs(pdb_root: str, entity_dir: str, config: PipelineConfig) -> None:
+    """Write info.json at PDB root and entity-specific config."""
+    import json
+
+    t = config.target
+
+    # PDB-level info.json (shared across entities)
+    info_path = f"{pdb_root}/info.json"
+    if not os.path.exists(info_path):
+        with open(info_path, "w") as f:
+            json.dump({"pdb_id": t.pdb_id}, f, indent=2)
+
+    # Update info.json with entity metadata
+    with open(info_path, "r") as f:
+        info = json.load(f)
+    entity_key = f"entity_{t.entity_id}"
+    if entity_key not in info:
+        info[entity_key] = {"name": t.name, "chain_id": t.chain_id}
+        with open(info_path, "w") as f:
+            json.dump(info, f, indent=2)
+
+    # Entity-level config
+    config_path = f"{entity_dir}/config.json"
+    if not os.path.exists(config_path):
+        with open(config_path, "w") as f:
+            json.dump({
+                "entity_id": t.entity_id,
+                "name": t.name,
+                "chain_id": t.chain_id,
+                "hotspot_residues": t.hotspot_residues,
+            }, f, indent=2)
+
+
+def _write_metrics_csv(metrics_dir: str, candidates: list[BinderCandidate]) -> None:
+    """Write scores_combined.csv with all candidate metrics."""
+    import csv
+
+    csv_path = f"{metrics_dir}/scores_combined.csv"
+    if not candidates:
+        return
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "candidate_id", "sequence", "ppi_score", "iptm", "ptm",
+            "pae_interaction", "ptm_binder", "rmsd", "specificity", "selectivity", "final_score"
+        ])
+        for c in candidates:
+            pred = c.structure_prediction
+            writer.writerow([
+                c.candidate_id,
+                c.sequence,
+                f"{pred.ppi_score:.3f}" if pred.ppi_score else "",
+                f"{pred.iptm:.3f}" if pred.iptm else "",
+                f"{pred.ptm:.3f}" if pred.ptm else "",
+                f"{pred.pae_interaction:.2f}" if pred.pae_interaction else "",
+                f"{pred.ptm_binder:.3f}" if pred.ptm_binder else "",
+                f"{pred.rmsd_to_design:.2f}" if pred.rmsd_to_design else "",
+                f"{c.specificity_score:.1f}",
+                f"{c.selectivity_score:.1f}",
+                f"{c.final_score:.2f}",
+            ])
+
+
+def _create_best_symlinks(
+    best_dir: str, top_candidates: list[BinderCandidate], validation_dir: str
+) -> None:
+    """Create symlinks to top candidates in best_candidates directory."""
+    import glob
+
+    for candidate in top_candidates:
+        # Find the predicted structure file
+        pattern = f"{validation_dir}/{candidate.structure_prediction.sequence_id}/**/*.pdb"
+        pdb_files = glob.glob(pattern, recursive=True)
+        if not pdb_files:
+            pattern = f"{validation_dir}/{candidate.structure_prediction.sequence_id}/**/*.cif"
+            pdb_files = glob.glob(pattern, recursive=True)
+
+        if pdb_files:
+            src = pdb_files[0]
+            ext = os.path.splitext(src)[1]
+            dst = f"{best_dir}/{candidate.candidate_id}{ext}"
+            if not os.path.exists(dst):
+                try:
+                    os.symlink(os.path.relpath(src, best_dir), dst)
+                except OSError:
+                    pass  # Symlinks may not work on all filesystems
+
+
 # =============================================================================
 # CLI Entry Point
 # =============================================================================
@@ -793,8 +919,8 @@ def main(
     Example:
         uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 --hotspot-residues "58,80,139" --mode bind
     
-    Generated proteins are named: <pdb_id>_<mode>_<ulid>
-    Example: 3DI3_bind_01ARZ3NDEKTSV4RRFFQ69G5FAV
+    Generated proteins are named: <pdb_id>_E<entity_id>_<mode>_<ulid>
+    Example: 3DI3_E2_bind_01ARZ3NDEKTSV4RRFFQ69G5FAV
     """
     from common import get_entity_info, download_pdb
     import tempfile
@@ -867,18 +993,6 @@ def main(
     if dry_run:
         print_dry_run_summary(config)
         return None
-
-    print("=" * 60)
-    print("PROTEIN BINDER DESIGN PIPELINE")
-    print("=" * 60)
-    print(f"Mode: {generation_mode.value}")
-    print(f"Target: {pdb_id} entity {entity_id} ({entity_name})")
-    print(f"Chain: {chain_id}")
-    print(f"Hotspot residues: {hotspots}")
-    print(f"Designs: {num_designs} backbones × {num_sequences} sequences")
-    print(f"Budget: ${max_budget:.2f}")
-    print(f"Naming: {pdb_id}_<mode>_<ulid>")
-    print("=" * 60)
 
     # Run pipeline
     result = run_pipeline.remote(config, use_mocks=use_mocks)

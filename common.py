@@ -587,22 +587,23 @@ def generate_ulid() -> str:
     return timestamp_str + random_str
 
 
-def generate_protein_id(pdb_id: str, mode: GenerationMode) -> str:
+def generate_protein_id(pdb_id: str, entity_id: int, mode: GenerationMode) -> str:
     """
     Generate a unique identifier for a designed protein.
     
-    Format: <pdb_id>_<mode>_<ulid>
-    Example: 3DI3_bind_01ARZ3NDEKTSV4RRFFQ69G5FAV
+    Format: <pdb_id>_E<entity_id>_<mode>_<ulid>
+    Example: 3DI3_E2_bind_01ARZ3NDEKTSV4RRFFQ69G5FAV
     
     Args:
         pdb_id: Source PDB ID (e.g., "3DI3")
+        entity_id: Entity number (e.g., 2)
         mode: Generation mode (e.g., GenerationMode.BIND)
     
     Returns:
         Unique protein identifier
     """
     ulid = generate_ulid()
-    return f"{pdb_id.upper()}_{mode.value}_{ulid}"
+    return f"{pdb_id.upper()}_E{entity_id}_{mode.value}_{ulid}"
 
 
 def generate_design_id(prefix: str = "design") -> str:

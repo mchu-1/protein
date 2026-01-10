@@ -434,7 +434,7 @@ def _parse_proteinmpnn_output(
 
 @app.function(
     image=proteinmpnn_image,
-    timeout=60,
+    timeout=900,  # 15 min for parallel sequence generation
 )
 def generate_sequences_parallel(
     backbones: list[BackboneDesign],

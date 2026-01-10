@@ -113,9 +113,9 @@ uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 \
 
 **Generated Protein Nomenclature:**
 ```
-<pdb_id>_<mode>_<ulid>
+<pdb_id>_E<entity_id>_<mode>_<ulid>
 ```
-Example: `3DI3_bind_01ARZ3NDEKTSV4RRFFQ69G5FAV`
+Example: `3DI3_E2_bind_01ARZ3NDEKTSV4RRFFQ69G5FAV`
 
 Use the [RCSB PDB website](https://www.rcsb.org/) to find entity IDs for your target structure.
 
@@ -137,9 +137,9 @@ target = initialize_target(
 config = PipelineConfig(target=target, mode=GenerationMode.BIND)
 result = run_pipeline.remote(config)
 
-# Access results - candidate ID uses nomenclature: <pdb_id>_<mode>_<ulid>
+# Access results - candidate ID uses nomenclature: <pdb_id>_E<entity_id>_<mode>_<ulid>
 print(f"Best candidate: {result.best_candidate.candidate_id}")
-# Example: 3DI3_bind_01ARZ3NDEKTSV4RRFFQ69G5FAV
+# Example: 3DI3_E2_bind_01ARZ3NDEKTSV4RRFFQ69G5FAV
 print(f"Sequence: {result.best_candidate.sequence}")
 print(f"Score: {result.best_candidate.final_score}")
 ```
@@ -151,8 +151,26 @@ print(f"Score: {result.best_candidate.final_score}")
 ├── generators.py      # RFDiffusion and ProteinMPNN functions
 ├── validators.py      # Boltz-2, FoldSeek, and Chai-1 functions
 ├── pipeline.py        # Main orchestrator DAG
-├── requirements.txt   # Python dependencies
+├── pyproject.toml     # Python dependencies and project metadata
 └── SYSTEM.md          # Detailed specification
+```
+
+## Output Filesystem
+
+Results are organized by PDB ID and entity:
+
+```
+data/
+└── <PDB_ID>/
+    ├── info.json                           # Entity metadata
+    └── entity_<N>/
+        ├── config.json                     # Hotspots, chain info
+        ├── best_candidates/                # Symlinks to top results
+        └── <YYYYMMDD>_<mode>_<ulid>/       # Campaign
+            ├── 01_backbones/
+            ├── 02_sequences/
+            ├── 03_validation/{boltz,chai}/
+            └── 99_metrics/scores_combined.csv
 ```
 
 ## Infrastructure & Cost Optimization
