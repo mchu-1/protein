@@ -31,14 +31,37 @@ The pipeline operates as a Directed Acyclic Graph (DAG) with three main phases:
 
 ## Scoring Function
 
-Candidates are ranked using the selection function:
+Based on **AlphaProteo SI 2.2** optimized metrics.
 
-$$S(x) = \alpha \cdot \text{pLDDT}_{\text{interface}}(x) - \beta \cdot \max_{d \in D} (\text{Affinity}(x, d))$$
+### On-Target Binder Scoring (Boltz-2)
+
+| Metric | Threshold | Purpose |
+|--------|-----------|---------|
+| **min_pae_interaction** | < 1.5 Å | **Anchor Lock.** Demands at least one "perfect" atomic contact with the defined hotspots. |
+| **pTM (Binder Only)** | > 0.80 | **Fold Quality.** Ensures the binder folds autonomously into a defined structure. |
+| **RMSD** | < 2.5 Å | **Self-Consistency.** Ensures Boltz-2 prediction matches the RFDiffusion design. |
+
+### Post-Processing Steps
+
+| Step | Method | Purpose |
+|------|--------|---------|
+| **Cluster** | TM-score > 0.7 | **Diversify.** Select best representative per cluster. |
+| **Novelty** | pyhmmer vs UniRef50 | **Ensure novelty.** Filter sequences with existing homologs. |
+
+### Off-Target Screening (Chai-1 Single-Sequence Mode)
+
+| Stage | Metric | Threshold | Interpretation |
+|-------|--------|-----------|----------------|
+| Cross-Reactivity | chain_pair_iptm | > 0.5 | Binder binds off-target (rejected) |
+
+### Candidate Ranking
+
+$$S(x) = \alpha \cdot \text{PPI}_{\text{target}}(x) - \beta \cdot \max_{d \in D} \text{PPI}_{\text{decoy}}(x, d)$$
 
 Where:
-- $\text{pLDDT}_{\text{interface}}$ is the confidence score from Boltz-2 on the target interface
+- $\text{PPI}(x) = 0.8 \cdot \text{ipTM} + 0.2 \cdot \text{pTM}$
 - $D$ is the set of structural decoys found by FoldSeek
-- $\alpha, \beta$ are weighting coefficients for specificity and selectivity
+- $\alpha, \beta$ are weighting coefficients (default: 1.0, 0.5)
 
 ## Installation
 
@@ -62,50 +85,61 @@ uv run modal token new
 ```bash
 # Preview deployment parameters and estimated cost (no execution)
 uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 \
-    --hotspot-residues "42,64,123" \
+    --hotspot-residues "58,80,139" \
+    --mode bind \
     --num-designs 5 \
     --num-sequences 4 \
     --dry-run
 
 # Run with Modal CLI
 uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 \
-    --hotspot-residues "42,64,123" \
+    --hotspot-residues "58,80,139" \
+    --mode bind \
     --num-designs 5 \
     --num-sequences 4 \
     --max-budget 5.0
 
 # Test with mocks (no GPU required)
 uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 \
-    --hotspot-residues "42,64,123" \
+    --hotspot-residues "58,80,139" \
+    --mode bind \
     --use-mocks
 ```
 
 **Input Format:**
 - `--pdb-id`: 4-letter PDB code (e.g., `3DI3`)
 - `--entity-id`: Polymer entity ID identifying the target chain (e.g., `2` for IL7RA receptor in 3DI3)
+- `--mode`: Generation mode - currently supports `bind` for binder design
+
+**Generated Protein Nomenclature:**
+```
+<pdb_id>_<mode>_<ulid>
+```
+Example: `3DI3_bind_01ARZ3NDEKTSV4RRFFQ69G5FAV`
 
 Use the [RCSB PDB website](https://www.rcsb.org/) to find entity IDs for your target structure.
 
 ### Python API
 
 ```python
-from common import TargetProtein, PipelineConfig, initialize_target
+from common import TargetProtein, PipelineConfig, GenerationMode, initialize_target
 from pipeline import run_pipeline
 
 # Initialize target from PDB ID and entity ID
 target = initialize_target(
     pdb_id="3DI3",
     entity_id=2,  # IL7RA receptor
-    hotspot_residues=[42, 64, 123],
+    hotspot_residues=[58, 80, 139],
     output_dir="/tmp/target",
 )
 
-# Run pipeline
-config = PipelineConfig(target=target)
+# Run pipeline with mode
+config = PipelineConfig(target=target, mode=GenerationMode.BIND)
 result = run_pipeline.remote(config)
 
-# Access results
+# Access results - candidate ID uses nomenclature: <pdb_id>_<mode>_<ulid>
 print(f"Best candidate: {result.best_candidate.candidate_id}")
+# Example: 3DI3_bind_01ARZ3NDEKTSV4RRFFQ69G5FAV
 print(f"Sequence: {result.best_candidate.sequence}")
 print(f"Score: {result.best_candidate.final_score}")
 ```

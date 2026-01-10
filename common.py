@@ -218,6 +218,12 @@ class ValidationStatus(str, Enum):
     ERROR = "error"
 
 
+class GenerationMode(str, Enum):
+    """Semantic generation modes for protein design."""
+
+    BIND = "bind"  # Design binders to target
+
+
 # =============================================================================
 # Pydantic Models - Input Schemas
 # =============================================================================
@@ -286,12 +292,22 @@ class ProteinMPNNConfig(BaseModel):
 class Boltz2Config(BaseModel):
     """Configuration for Boltz-2 structure prediction.
     
-    Note: Stricter defaults (0.8 pLDDT, 5.0 PAE) reduce Chai-1 calls.
+    Thresholds based on AlphaProteo SI 2.2 (optimized AF3 metrics):
+    - min_pae_interaction < 1.5 Å: Anchor lock at hotspots
+    - ptm_binder > 0.80: Binder fold quality
+    - rmsd < 2.5 Å: Self-consistency vs RFDiffusion
     """
 
     num_recycles: int = Field(default=3, ge=1, le=10, description="Number of recycling iterations")
-    min_iplddt: float = Field(default=0.8, ge=0.0, le=1.0, description="Minimum interface pLDDT threshold (stricter = fewer Chai-1 calls)")
-    max_pae: float = Field(default=5.0, ge=0.0, le=31.0, description="Maximum PAE threshold (stricter = fewer Chai-1 calls)")
+    
+    # AlphaProteo thresholds (SI 2.2)
+    max_pae_interaction: float = Field(default=1.5, ge=0.0, le=31.0, description="Max PAE at hotspots (Anchor Lock)")
+    min_ptm_binder: float = Field(default=0.80, ge=0.0, le=1.0, description="Min pTM for binder-only (Fold Quality)")
+    max_rmsd: float = Field(default=2.5, ge=0.0, le=10.0, description="Max RMSD vs RFDiffusion backbone (Self-Consistency)")
+    
+    # Legacy thresholds (still applied)
+    min_iplddt: float = Field(default=0.8, ge=0.0, le=1.0, description="Minimum interface pLDDT threshold")
+    max_pae: float = Field(default=5.0, ge=0.0, le=31.0, description="Maximum overall PAE threshold")
 
 
 class FoldSeekConfig(BaseModel):
@@ -306,9 +322,25 @@ class FoldSeekConfig(BaseModel):
 
 
 class Chai1Config(BaseModel):
-    """Configuration for Chai-1 cross-reactivity check."""
+    """Configuration for Chai-1 cross-reactivity check (single-sequence mode)."""
 
     num_samples: int = Field(default=1, ge=1, le=5, description="Samples per binder-decoy pair")
+    min_chain_pair_iptm: float = Field(default=0.5, ge=0.0, le=1.0, description="chain_pair_iptm threshold for cross-reactivity")
+
+
+class ClusterConfig(BaseModel):
+    """Configuration for TM-score based clustering (diversity)."""
+
+    tm_threshold: float = Field(default=0.7, ge=0.0, le=1.0, description="TM-score threshold for clustering")
+    select_best: bool = Field(default=True, description="Select best representative per cluster")
+
+
+class NoveltyConfig(BaseModel):
+    """Configuration for novelty check via pyhmmer vs UniRef50."""
+
+    database: str = Field(default="uniref50", description="HMM database for novelty check")
+    max_evalue: float = Field(default=1e-5, ge=0.0, description="Max E-value to consider a hit (lower = stricter)")
+    enabled: bool = Field(default=True, description="Enable novelty filtering")
 
 
 class ScoringWeights(BaseModel):
@@ -322,11 +354,14 @@ class PipelineConfig(BaseModel):
     """Complete pipeline configuration."""
 
     target: TargetProtein
+    mode: GenerationMode = Field(default=GenerationMode.BIND, description="Semantic generation mode")
     rfdiffusion: RFDiffusionConfig = Field(default_factory=RFDiffusionConfig)
     proteinmpnn: ProteinMPNNConfig = Field(default_factory=ProteinMPNNConfig)
     boltz2: Boltz2Config = Field(default_factory=Boltz2Config)
     foldseek: FoldSeekConfig = Field(default_factory=FoldSeekConfig)
     chai1: Chai1Config = Field(default_factory=Chai1Config)
+    cluster: ClusterConfig = Field(default_factory=ClusterConfig, description="TM-score clustering for diversity")
+    novelty: NoveltyConfig = Field(default_factory=NoveltyConfig, description="Novelty check vs UniRef50")
     scoring: ScoringWeights = Field(default_factory=ScoringWeights)
 
     # Budget control
@@ -358,6 +393,7 @@ class SequenceDesign(BaseModel):
     fasta_path: str = Field(..., description="Path to FASTA file")
     score: float = Field(..., description="ProteinMPNN log-likelihood score")
     recovery: Optional[float] = Field(None, description="Sequence recovery if applicable")
+    backbone_pdb: Optional[str] = Field(None, description="Path to RFDiffusion backbone PDB (for RMSD)")
 
     @field_validator("sequence")
     @classmethod
@@ -369,16 +405,44 @@ class SequenceDesign(BaseModel):
 
 
 class StructurePrediction(BaseModel):
-    """Output from Boltz-2 structure prediction."""
+    """Output from Boltz-2 structure prediction.
+    
+    Includes AlphaProteo SI 2.2 metrics for on-target scoring.
+    """
 
     prediction_id: str = Field(..., description="Unique identifier")
     sequence_id: str = Field(..., description="Parent sequence design ID")
     pdb_path: str = Field(..., description="Path to predicted complex PDB")
+    
+    # Standard metrics
     plddt_overall: float = Field(..., ge=0.0, le=100.0, description="Overall pLDDT score")
     plddt_interface: float = Field(..., ge=0.0, le=100.0, description="Interface pLDDT (i-pLDDT)")
     pae_interface: float = Field(..., ge=0.0, description="Interface PAE score")
-    ptm: Optional[float] = Field(None, ge=0.0, le=1.0, description="pTM score")
+    ptm: Optional[float] = Field(None, ge=0.0, le=1.0, description="pTM score (complex)")
     iptm: Optional[float] = Field(None, ge=0.0, le=1.0, description="ipTM score")
+    
+    # AlphaProteo SI 2.2 metrics
+    pae_interaction: Optional[float] = Field(None, ge=0.0, description="Min PAE at hotspot residues (Anchor Lock)")
+    ptm_binder: Optional[float] = Field(None, ge=0.0, le=1.0, description="pTM for binder-only (Fold Quality)")
+    rmsd_to_design: Optional[float] = Field(None, ge=0.0, description="RMSD vs RFDiffusion backbone (Self-Consistency)")
+
+    @property
+    def ppi_score(self) -> float:
+        """
+        Quantification of protein-protein interaction quality.
+        
+        Uses weighted average: 0.8 * ipTM + 0.2 * pTM
+        
+        Returns:
+            PPI score in range [0, 1], or 0.0 if metrics unavailable.
+        """
+        if self.iptm is not None and self.ptm is not None:
+            return 0.8 * self.iptm + 0.2 * self.ptm
+        elif self.iptm is not None:
+            return self.iptm
+        elif self.ptm is not None:
+            return self.ptm
+        return 0.0
 
 
 class DecoyHit(BaseModel):
@@ -393,13 +457,34 @@ class DecoyHit(BaseModel):
 
 
 class CrossReactivityResult(BaseModel):
-    """Output from Chai-1 cross-reactivity check."""
+    """Output from Chai-1 cross-reactivity check (single-sequence mode)."""
 
     binder_id: str = Field(..., description="Binder sequence ID")
     decoy_id: str = Field(..., description="Decoy protein ID")
     predicted_affinity: float = Field(..., description="Predicted binding affinity (lower = tighter)")
     plddt_interface: float = Field(..., ge=0.0, le=100.0, description="Interface pLDDT with decoy")
     binds_decoy: bool = Field(..., description="Whether binder likely binds decoy")
+    ptm: Optional[float] = Field(None, ge=0.0, le=1.0, description="pTM score")
+    iptm: Optional[float] = Field(None, ge=0.0, le=1.0, description="ipTM score")
+    chain_pair_iptm: Optional[float] = Field(None, ge=0.0, le=1.0, description="Chain-pair ipTM (off-target threshold: >0.5)")
+
+    @property
+    def ppi_score(self) -> float:
+        """
+        Quantification of protein-protein interaction quality.
+        
+        Uses weighted average: 0.8 * ipTM + 0.2 * pTM
+        
+        Returns:
+            PPI score in range [0, 1], or 0.0 if metrics unavailable.
+        """
+        if self.iptm is not None and self.ptm is not None:
+            return 0.8 * self.iptm + 0.2 * self.ptm
+        elif self.iptm is not None:
+            return self.iptm
+        elif self.ptm is not None:
+            return self.ptm
+        return 0.0
 
 
 class BinderCandidate(BaseModel):
@@ -466,8 +551,62 @@ class PipelineResult(BaseModel):
 # =============================================================================
 
 
+# Crockford's Base32 alphabet (excludes I, L, O, U to avoid ambiguity)
+_ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def generate_ulid() -> str:
+    """
+    Generate a ULID (Universally Unique Lexicographically Sortable Identifier).
+    
+    Format: 10 chars timestamp (ms) + 16 chars randomness = 26 chars total
+    Uses Crockford's Base32 encoding.
+    
+    Returns:
+        26-character ULID string (e.g., "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+    """
+    import time
+    import random
+    
+    # Timestamp: milliseconds since Unix epoch (48 bits -> 10 chars in base32)
+    timestamp_ms = int(time.time() * 1000)
+    
+    # Encode timestamp (10 characters)
+    timestamp_chars = []
+    for _ in range(10):
+        timestamp_chars.append(_ULID_ALPHABET[timestamp_ms & 0x1F])
+        timestamp_ms >>= 5
+    timestamp_str = "".join(reversed(timestamp_chars))
+    
+    # Randomness: 80 bits -> 16 chars in base32
+    random_chars = []
+    for _ in range(16):
+        random_chars.append(_ULID_ALPHABET[random.randint(0, 31)])
+    random_str = "".join(random_chars)
+    
+    return timestamp_str + random_str
+
+
+def generate_protein_id(pdb_id: str, mode: GenerationMode) -> str:
+    """
+    Generate a unique identifier for a designed protein.
+    
+    Format: <pdb_id>_<mode>_<ulid>
+    Example: 3DI3_bind_01ARZ3NDEKTSV4RRFFQ69G5FAV
+    
+    Args:
+        pdb_id: Source PDB ID (e.g., "3DI3")
+        mode: Generation mode (e.g., GenerationMode.BIND)
+    
+    Returns:
+        Unique protein identifier
+    """
+    ulid = generate_ulid()
+    return f"{pdb_id.upper()}_{mode.value}_{ulid}"
+
+
 def generate_design_id(prefix: str = "design") -> str:
-    """Generate a unique design identifier."""
+    """Generate a unique design identifier (legacy format)."""
     import uuid
 
     return f"{prefix}_{uuid.uuid4().hex[:8]}"

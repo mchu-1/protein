@@ -9,7 +9,7 @@
 pdb_file = il7ra_target.pdb
 pdb_source = 3DI3 (chain B, glycosylated variant)
 chain_id = A
-hotspots = [42, 64, 123]
+hotspots = [58, 80, 139]
 
 [validation_reference]
 # From experimental study (SI)

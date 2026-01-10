@@ -70,11 +70,12 @@ def run_rfdiffusion(
     )
 
     # Determine target chain residue range from PDB file
-    target_residue_count = _get_chain_residue_count(target.pdb_path, target.chain_id)
+    min_res, max_res = _get_chain_residue_range(target.pdb_path, target.chain_id)
     
     # Build contigmap: defines binder length range and target interaction
     # Format: [binder_length/0 target_chain_residues]
-    contigmap = f"[{config.binder_length_min}-{config.binder_length_max}/0 {target.chain_id}1-{target_residue_count}]"
+    # Use actual residue numbering from PDB (may not start at 1)
+    contigmap = f"[{config.binder_length_min}-{config.binder_length_max}/0 {target.chain_id}{min_res}-{max_res}]"
 
     designs: list[BackboneDesign] = []
 
@@ -213,8 +214,9 @@ def _count_binder_residues(pdb_path: str, chain_id: str = "B") -> int:
     return count
 
 
-def _get_chain_residue_count(pdb_path: str, chain_id: str) -> int:
-    """Get the maximum residue number for a chain in a PDB file."""
+def _get_chain_residue_range(pdb_path: str, chain_id: str) -> tuple[int, int]:
+    """Get the (min, max) residue numbers for a chain in a PDB file."""
+    min_res = float('inf')
     max_res = 0
     try:
         with open(pdb_path, "r") as f:
@@ -223,14 +225,20 @@ def _get_chain_residue_count(pdb_path: str, chain_id: str) -> int:
                     if line[21] == chain_id:
                         try:
                             res_num = int(line[22:26].strip())
+                            min_res = min(min_res, res_num)
                             max_res = max(max_res, res_num)
                         except ValueError:
                             pass
     except Exception:
         pass
     
-    # Default to a reasonable number if we couldn't parse
-    return max_res if max_res > 0 else 200
+    # Default to reasonable values if we couldn't parse
+    if min_res == float('inf'):
+        min_res = 1
+    if max_res == 0:
+        max_res = 200
+    
+    return (int(min_res), max_res)
 
 
 # =============================================================================

@@ -30,7 +30,7 @@ The pipeline operates in a directed acyclic graph (DAG) structure:
 3.  **Folding & Affinity (Boltz-2):**
     - Input: Designed sequence + Target sequence.
     - Action: Predict complex structure.
-    - Metric: Filter by interface pLDDT (i-pLDDT) and Predicted Aligned Error (PAE).
+    - Metric: Filter by interface pLDDT (i-pLDDT), PAE, and **ipSAE > 0.8** for specificity.
 
 ### Phase 3: Negative Selection (Selectivity)
 *This is the critical step for high-fidelity output.*
@@ -38,10 +38,11 @@ The pipeline operates in a directed acyclic graph (DAG) structure:
     - Input: Target protein structure.
     - Action: Search the PDB/AFDB for structural homologs (potential off-targets).
     - Output: List of top $N$ structurally similar "decoys".
-5.  **Cross-Reactivity Check (Chai-1):**
+5.  **Cross-Reactivity Check (Chai-1 Single-Sequence Mode):**
     - Input: Designed Binder + Decoy Structures.
-    - Action: Dock the binder against decoys.
-    - Objective: Ensure $\Delta G_{\text{target}} \ll \Delta G_{\text{decoy}}$.
+    - Action: Score off-target interactions.
+    - Metric: **chain_pair_iptm > 0.5** indicates cross-reactivity.
+    - Objective: Reject binders that bind structural homologs.
 
 ---
 
@@ -66,16 +67,43 @@ To respect the $5 USD budget, you must strictly adhere to these infrastructure p
 
 ## 5. Mathematical Optimization Goal
 
-The selection function $S(x)$ for a binder $x$ is defined as:
+Based on **AlphaProteo SI 2.2** optimized metrics.
+
+### On-Target Binder Scoring (Boltz-2)
+
+| Metric | Threshold | Purpose |
+|--------|-----------|---------|
+| min_pae_interaction | < 1.5 Å | **Anchor Lock.** Perfect contact at hotspots. |
+| pTM (Binder Only) | > 0.80 | **Fold Quality.** Autonomous folding. |
+| RMSD | < 2.5 Å | **Self-Consistency.** Matches RFDiffusion design. |
+
+### Post-Processing
+
+| Step | Method | Purpose |
+|------|--------|---------|
+| Cluster | TM-score > 0.7 | Diversify binders. |
+| Novelty | pyhmmer vs UniRef50 | Filter existing homologs. |
+
+### PPI Quality Score
 
 $$
-S(x) = \alpha \cdot \text{pLDDT}_{\text{interface}}(x) - \beta \cdot \max_{d \in D} (\text{Affinity}(x, d))
+\text{PPI}(x) = 0.8 \cdot \text{ipTM}(x) + 0.2 \cdot \text{pTM}(x)
+$$
+
+### Off-Target Screening (Chai-1 Single-Sequence Mode)
+
+- **chain_pair_iptm > 0.5**: Cross-reactivity detected → reject binder.
+
+### Selection Function
+
+$$
+S(x) = \alpha \cdot \text{PPI}_{\text{target}}(x) - \beta \cdot \max_{d \in D} \text{PPI}_{\text{decoy}}(x, d)
 $$
 
 Where:
-- $`\text{pLDDT}_{\text{interface}}`$ is the confidence score from Boltz-2 on the target.
+- $`\text{PPI}_{\text{target}}`$ is the PPI score with the target (specificity).
 - $`D`$ is the set of structural decoys found by FoldSeek.
-- $`\alpha, \beta`$ are weighting weights favoring specificity and selectivity respectively.
+- $`\alpha, \beta`$ are weighting coefficients (default: 1.0, 0.5).
 
 ---
 

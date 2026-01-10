@@ -125,8 +125,18 @@ def run_boltz2(
             print(f"  ✗ {sequence.sequence_id}: no output structure")
             return None
 
-        # Parse Boltz-2 output metrics
-        metrics = _parse_boltz2_metrics(output_dir, sequence.sequence_id)
+        # Parse Boltz-2 output metrics with AlphaProteo metrics
+        # Pass hotspots for pae_interaction, backbone for RMSD
+        target_len = len(target_sequence)
+        backbone_pdb = getattr(sequence, 'backbone_pdb', None)  # Set by pipeline if available
+        
+        metrics = _parse_boltz2_metrics(
+            output_dir=output_dir,
+            sequence_id=sequence.sequence_id,
+            hotspot_residues=target.hotspot_residues,
+            backbone_pdb=backbone_pdb,
+            target_len=target_len,
+        )
 
         if metrics is None:
             # Use default metrics if we have an output structure
@@ -145,9 +155,32 @@ def run_boltz2(
             pae_interface=metrics.get("pae_interface", 100.0),
             ptm=metrics.get("ptm"),
             iptm=metrics.get("iptm"),
+            # AlphaProteo SI 2.2 metrics
+            pae_interaction=metrics.get("pae_interaction"),
+            ptm_binder=metrics.get("ptm_binder"),
+            rmsd_to_design=metrics.get("rmsd_to_design"),
         )
 
-        # Apply filters
+        # AlphaProteo filters (SI 2.2)
+        # 1. Anchor Lock: min PAE at hotspots < 1.5 Å
+        if prediction.pae_interaction is not None:
+            if prediction.pae_interaction > config.max_pae_interaction:
+                print(f"  ✗ {sequence.sequence_id}: PAE@hotspots {prediction.pae_interaction:.2f} Å > {config.max_pae_interaction} Å")
+                return None
+        
+        # 2. Fold Quality: binder-only pTM > 0.80
+        if prediction.ptm_binder is not None:
+            if prediction.ptm_binder < config.min_ptm_binder:
+                print(f"  ✗ {sequence.sequence_id}: pTM(binder) {prediction.ptm_binder:.3f} < {config.min_ptm_binder}")
+                return None
+        
+        # 3. Self-Consistency: RMSD vs RFDiffusion < 2.5 Å
+        if prediction.rmsd_to_design is not None:
+            if prediction.rmsd_to_design > config.max_rmsd:
+                print(f"  ✗ {sequence.sequence_id}: RMSD {prediction.rmsd_to_design:.2f} Å > {config.max_rmsd} Å")
+                return None
+
+        # Legacy filters (still applied as backup)
         if prediction.plddt_interface < config.min_iplddt * 100:
             print(f"  ✗ {sequence.sequence_id}: i-pLDDT {prediction.plddt_interface:.1f} < {config.min_iplddt * 100}")
             return None
@@ -156,7 +189,15 @@ def run_boltz2(
             print(f"  ✗ {sequence.sequence_id}: PAE {prediction.pae_interface:.1f} > {config.max_pae}")
             return None
 
-        print(f"  ✓ {sequence.sequence_id}: i-pLDDT={prediction.plddt_interface:.1f}, PAE={prediction.pae_interface:.1f}")
+        # Build status string
+        status_parts = [f"i-pLDDT={prediction.plddt_interface:.1f}"]
+        if prediction.pae_interaction is not None:
+            status_parts.append(f"PAE@hs={prediction.pae_interaction:.2f}Å")
+        if prediction.ptm_binder is not None:
+            status_parts.append(f"pTM(b)={prediction.ptm_binder:.3f}")
+        if prediction.rmsd_to_design is not None:
+            status_parts.append(f"RMSD={prediction.rmsd_to_design:.2f}Å")
+        print(f"  ✓ {sequence.sequence_id}: {', '.join(status_parts)}")
         return prediction
 
     except subprocess.TimeoutExpired:
@@ -221,15 +262,28 @@ def _extract_sequence_from_pdb(pdb_path: str, chain_id: str) -> str:
     raise ValueError(f"Chain {chain_id} not found in {pdb_path}")
 
 
-def _parse_boltz2_metrics(output_dir: str, sequence_id: str) -> Optional[dict]:
-    """Parse Boltz-2 output metrics from JSON or npz files."""
+def _parse_boltz2_metrics(
+    output_dir: str,
+    sequence_id: str,
+    hotspot_residues: Optional[list[int]] = None,
+    backbone_pdb: Optional[str] = None,
+    target_len: int = 0,
+) -> Optional[dict]:
+    """
+    Parse Boltz-2 output metrics from JSON or npz files.
+    
+    Includes AlphaProteo SI 2.2 metrics:
+    - pae_interaction: min PAE at hotspot residues
+    - ptm_binder: pTM for binder chain only
+    - rmsd_to_design: RMSD vs RFDiffusion backbone
+    """
     import numpy as np
     import glob
 
     metrics = {}
     
     # Boltz outputs are in: {output_dir}/boltz_results_*/predictions/*/
-    # Files: confidence_*.json, plddt_*.npz
+    # Files: confidence_*.json, plddt_*.npz, pae_*.npz
     
     # Find confidence JSON file - contains comprehensive metrics
     confidence_files = glob.glob(f"{output_dir}/**/confidence_*.json", recursive=True)
@@ -247,6 +301,52 @@ def _parse_boltz2_metrics(output_dir: str, sequence_id: str) -> Optional[dict]:
             metrics["plddt_interface"] = complex_iplddt * 100.0  # Scale to 0-100
             # Use complex_ipde for interface PAE
             metrics["pae_interface"] = raw_metrics.get("complex_ipde", 5.0)
+            
+            # AlphaProteo: binder-only pTM (chain_ptm for second chain)
+            if "chain_ptm" in raw_metrics and isinstance(raw_metrics["chain_ptm"], list):
+                # Assuming binder is second chain (after target)
+                if len(raw_metrics["chain_ptm"]) > 1:
+                    metrics["ptm_binder"] = raw_metrics["chain_ptm"][1]
+                elif len(raw_metrics["chain_ptm"]) == 1:
+                    metrics["ptm_binder"] = raw_metrics["chain_ptm"][0]
+    
+    # Parse PAE matrix for hotspot-specific PAE (Anchor Lock)
+    if hotspot_residues:
+        pae_files = glob.glob(f"{output_dir}/**/pae_*.npz", recursive=True)
+        if pae_files:
+            try:
+                pae_data = np.load(pae_files[0])
+                if "pae" in pae_data:
+                    pae_matrix = pae_data["pae"]  # Shape: [N, N]
+                    # Extract PAE between binder residues and hotspot residues on target
+                    # Hotspots are on target (first chain), binder is second chain
+                    # PAE[i, j] = error of residue i when aligned on residue j
+                    if pae_matrix.ndim == 2 and target_len > 0:
+                        binder_start = target_len
+                        hotspot_pae_values = []
+                        for hs in hotspot_residues:
+                            hs_idx = hs - 1  # 0-indexed
+                            if 0 <= hs_idx < target_len:
+                                # PAE from binder residues to this hotspot
+                                binder_to_hs = pae_matrix[binder_start:, hs_idx]
+                                hotspot_pae_values.extend(binder_to_hs.tolist())
+                        if hotspot_pae_values:
+                            # Use minimum PAE at hotspots (best contact)
+                            metrics["pae_interaction"] = float(np.min(hotspot_pae_values))
+            except Exception as e:
+                print(f"  Warning: Could not parse PAE matrix: {e}")
+    
+    # Calculate RMSD vs RFDiffusion backbone (Self-Consistency)
+    if backbone_pdb:
+        predicted_pdbs = glob.glob(f"{output_dir}/**/*.cif", recursive=True) + \
+                        glob.glob(f"{output_dir}/**/*.pdb", recursive=True)
+        if predicted_pdbs:
+            try:
+                rmsd = _calculate_backbone_rmsd(backbone_pdb, predicted_pdbs[0])
+                if rmsd is not None:
+                    metrics["rmsd_to_design"] = rmsd
+            except Exception as e:
+                print(f"  Warning: Could not calculate RMSD: {e}")
 
     # Find pLDDT NPZ file as backup
     if "plddt_overall" not in metrics:
@@ -269,6 +369,72 @@ def _parse_boltz2_metrics(output_dir: str, sequence_id: str) -> Optional[dict]:
         return metrics
 
     return None
+
+
+def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -> Optional[float]:
+    """
+    Calculate backbone RMSD between RFDiffusion design and Boltz-2 prediction.
+    
+    Uses CA atoms for alignment and RMSD calculation.
+    
+    Args:
+        ref_pdb: Path to RFDiffusion backbone PDB
+        pred_pdb: Path to Boltz-2 predicted structure (PDB or CIF)
+        chain_id: Chain ID of binder (default: B)
+    
+    Returns:
+        RMSD in Angstroms, or None if calculation fails
+    """
+    try:
+        from Bio.PDB import PDBParser, MMCIFParser, Superimposer
+        import numpy as np
+        
+        # Parse reference (RFDiffusion backbone)
+        ref_parser = PDBParser(QUIET=True)
+        ref_structure = ref_parser.get_structure("ref", ref_pdb)
+        
+        # Parse prediction (Boltz-2, might be CIF)
+        if pred_pdb.endswith(".cif"):
+            pred_parser = MMCIFParser(QUIET=True)
+        else:
+            pred_parser = PDBParser(QUIET=True)
+        pred_structure = pred_parser.get_structure("pred", pred_pdb)
+        
+        # Extract CA atoms from binder chain
+        ref_atoms = []
+        pred_atoms = []
+        
+        for model in ref_structure:
+            for chain in model:
+                if chain.id == chain_id:
+                    for residue in chain:
+                        if residue.id[0] == " " and "CA" in residue:
+                            ref_atoms.append(residue["CA"])
+        
+        for model in pred_structure:
+            for chain in model:
+                if chain.id == chain_id:
+                    for residue in chain:
+                        if residue.id[0] == " " and "CA" in residue:
+                            pred_atoms.append(residue["CA"])
+        
+        if not ref_atoms or not pred_atoms:
+            return None
+        
+        # Truncate to shorter length
+        min_len = min(len(ref_atoms), len(pred_atoms))
+        ref_atoms = ref_atoms[:min_len]
+        pred_atoms = pred_atoms[:min_len]
+        
+        # Superimpose and calculate RMSD
+        super_imposer = Superimposer()
+        super_imposer.set_atoms(ref_atoms, pred_atoms)
+        
+        return super_imposer.rms
+        
+    except Exception as e:
+        print(f"  Warning: RMSD calculation failed: {e}")
+        return None
 
 
 # =============================================================================
@@ -327,7 +493,7 @@ def _get_pdbs_from_uniprot(uniprot_id: str) -> set[str]:
     """
     Get all PDB IDs associated with a UniProt accession.
     
-    Uses the RCSB PDB search API.
+    Uses the UniProt REST API to fetch cross-references to PDB.
     
     Args:
         uniprot_id: UniProt accession (e.g., "P16871")
@@ -341,39 +507,29 @@ def _get_pdbs_from_uniprot(uniprot_id: str) -> set[str]:
     pdb_ids: set[str] = set()
     
     try:
-        # RCSB search API
-        search_url = "https://search.rcsb.org/rcsbsearch/v2/query"
-        query = {
-            "query": {
-                "type": "terminal",
-                "service": "text",
-                "parameters": {
-                    "attribute": "rcsb_polymer_entity_container_identifiers.uniprot_ids",
-                    "operator": "exact_match",
-                    "value": uniprot_id.upper()
-                }
-            },
-            "return_type": "entry",
-            "request_options": {
-                "return_all_hits": True
-            }
-        }
+        # Use UniProt REST API - stable and reliable
+        url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id.upper()}.json"
         
-        req = urllib.request.Request(
-            search_url,
-            data=json.dumps(query).encode('utf-8'),
-            headers={'Content-Type': 'application/json'},
-            method='POST'
-        )
+        req = urllib.request.Request(url)
+        req.add_header('Accept', 'application/json')
         
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, timeout=15) as response:
             data = json.loads(response.read().decode())
-            if "result_set" in data:
-                for result in data["result_set"]:
-                    if "identifier" in result:
-                        pdb_ids.add(result["identifier"].upper())
+            
+            # Extract PDB cross-references from UniProt entry
+            if "uniProtKBCrossReferences" in data:
+                for xref in data["uniProtKBCrossReferences"]:
+                    if xref.get("database") == "PDB":
+                        pdb_id = xref.get("id", "").upper()
+                        if len(pdb_id) == 4:
+                            pdb_ids.add(pdb_id)
+                    
     except urllib.error.HTTPError as e:
-        print(f"  Warning: Could not fetch PDB mapping for UniProt {uniprot_id}: HTTP {e.code}")
+        if e.code == 404:
+            # UniProt ID not found - that's okay
+            pass
+        else:
+            print(f"  Warning: Could not fetch PDB mapping for UniProt {uniprot_id}: HTTP {e.code}")
     except Exception as e:
         print(f"  Warning: Could not fetch PDB mapping for UniProt {uniprot_id}: {e}")
     
@@ -808,17 +964,24 @@ def run_chai1(
             # Chai-1 saves scores.json and plddt files in output directory
             plddt_interface = 0.0
             affinity = 0.0
+            ptm_score = None
+            iptm_score = None
             
             # Look for scores file
             scores_files = list(output_subdir.glob("**/scores*.json")) + list(output_subdir.glob("scores.json"))
             if scores_files:
                 with open(scores_files[0], "r") as f:
                     scores_data = json.load(f)
+                    # Extract pTM and ipTM scores
+                    if "ptm" in scores_data:
+                        ptm_score = float(scores_data["ptm"])
+                    if "iptm" in scores_data:
+                        iptm_score = float(scores_data["iptm"])
                     # Extract aggregate score if available
                     if "aggregate_score" in scores_data:
                         affinity = -float(scores_data["aggregate_score"])
-                    elif "ptm" in scores_data:
-                        affinity = -float(scores_data["ptm"]) * 10  # Scale pTM as affinity proxy
+                    elif ptm_score is not None:
+                        affinity = -ptm_score * 10  # Scale pTM as affinity proxy
             
             # Look for pLDDT in npz files
             plddt_files = list(output_subdir.glob("**/plddt*.npz")) + list(output_subdir.glob("plddt.npz"))
@@ -843,8 +1006,18 @@ def run_chai1(
                             except Exception:
                                 pass
                 
-                # Determine if binder likely binds decoy
-                binds_decoy = plddt_interface > 60 and affinity < -5.0
+                # Extract chain_pair_iptm from scores (Chai-1 single-sequence mode)
+                chain_pair_iptm = None
+                if scores_files:
+                    with open(scores_files[0], "r") as f:
+                        scores_data = json.load(f)
+                        chain_pair_iptm = scores_data.get("chain_pair_iptm")
+                        # Fallback to iptm if chain_pair_iptm not available
+                        if chain_pair_iptm is None:
+                            chain_pair_iptm = iptm_score
+                
+                # Off-target threshold: chain_pair_iptm > 0.5 indicates cross-reactivity
+                binds_decoy = (chain_pair_iptm is not None and chain_pair_iptm > 0.5)
 
                 return CrossReactivityResult(
                     binder_id=sequence.sequence_id,
@@ -852,6 +1025,9 @@ def run_chai1(
                     predicted_affinity=affinity,
                     plddt_interface=plddt_interface,
                     binds_decoy=binds_decoy,
+                    ptm=ptm_score,
+                    iptm=iptm_score,
+                    chain_pair_iptm=chain_pair_iptm,
                 )
                 
         except ImportError as e:
@@ -863,6 +1039,9 @@ def run_chai1(
                 predicted_affinity=0.0,
                 plddt_interface=0.0,
                 binds_decoy=False,
+                ptm=None,
+                iptm=None,
+                chain_pair_iptm=None,
             )
             
         return None
@@ -1140,8 +1319,25 @@ def mock_boltz2(
     # Generate mock metrics
     plddt_interface = random.uniform(50, 95)
     pae_interface = random.uniform(2, 15)
+    iptm_score = random.uniform(0.4, 0.95)
+    
+    # AlphaProteo SI 2.2 metrics
+    pae_interaction = random.uniform(0.5, 3.0)  # PAE at hotspots
+    ptm_binder = random.uniform(0.6, 0.95)  # Binder-only pTM
+    rmsd_to_design = random.uniform(0.5, 4.0)  # RMSD vs RFDiffusion
 
-    # Apply filters
+    # Apply AlphaProteo filters
+    # 1. Anchor Lock: PAE at hotspots < 1.5 Å
+    if pae_interaction > config.max_pae_interaction:
+        return None
+    # 2. Fold Quality: binder pTM > 0.80
+    if ptm_binder < config.min_ptm_binder:
+        return None
+    # 3. Self-Consistency: RMSD < 2.5 Å
+    if rmsd_to_design > config.max_rmsd:
+        return None
+    
+    # Legacy filters
     if plddt_interface < config.min_iplddt * 100:
         return None
     if pae_interface > config.max_pae:
@@ -1160,7 +1356,10 @@ def mock_boltz2(
         plddt_interface=plddt_interface,
         pae_interface=pae_interface,
         ptm=random.uniform(0.5, 0.9),
-        iptm=random.uniform(0.4, 0.85),
+        iptm=iptm_score,
+        pae_interaction=pae_interaction,
+        ptm_binder=ptm_binder,
+        rmsd_to_design=rmsd_to_design,
     )
 
 
@@ -1210,7 +1409,11 @@ def mock_chai1(
 
     plddt_interface = random.uniform(30, 80)
     affinity = random.uniform(-8, -2)
-    binds_decoy = plddt_interface > 60 and affinity < -5.0
+    ptm_score = random.uniform(0.3, 0.8)
+    iptm_score = random.uniform(0.2, 0.7)
+    chain_pair_iptm = random.uniform(0.2, 0.7)
+    # Off-target threshold: chain_pair_iptm > 0.5 indicates cross-reactivity
+    binds_decoy = chain_pair_iptm > 0.5
 
     return CrossReactivityResult(
         binder_id=sequence.sequence_id,
@@ -1218,4 +1421,240 @@ def mock_chai1(
         predicted_affinity=affinity,
         plddt_interface=plddt_interface,
         binds_decoy=binds_decoy,
+        ptm=ptm_score,
+        iptm=iptm_score,
+        chain_pair_iptm=chain_pair_iptm,
     )
+
+
+# =============================================================================
+# Clustering - TM-score based diversity (AlphaProteo Step 4)
+# =============================================================================
+
+
+def cluster_by_tm_score(
+    predictions: list[StructurePrediction],
+    tm_threshold: float = 0.7,
+    select_best: bool = True,
+) -> list[StructurePrediction]:
+    """
+    Cluster predicted structures by TM-score and select representatives.
+    
+    Uses FoldSeek for fast TM-score calculation between structures.
+    Structures with TM-score > threshold are grouped into same cluster.
+    
+    Args:
+        predictions: List of validated structure predictions
+        tm_threshold: TM-score threshold for clustering (default: 0.7)
+        select_best: If True, select best (highest ppi_score) per cluster
+    
+    Returns:
+        List of representative predictions (one per cluster)
+    """
+    if len(predictions) <= 1:
+        return predictions
+    
+    try:
+        import numpy as np
+        from Bio.PDB import PDBParser, MMCIFParser
+        
+        # Calculate pairwise TM-scores using structure comparison
+        n = len(predictions)
+        tm_matrix = np.zeros((n, n))
+        
+        for i in range(n):
+            tm_matrix[i, i] = 1.0
+            for j in range(i + 1, n):
+                tm = _calculate_tm_score(predictions[i].pdb_path, predictions[j].pdb_path)
+                tm_matrix[i, j] = tm
+                tm_matrix[j, i] = tm
+        
+        # Greedy clustering
+        assigned = [False] * n
+        clusters: list[list[int]] = []
+        
+        # Sort by ppi_score (best first)
+        sorted_indices = sorted(range(n), key=lambda i: predictions[i].ppi_score, reverse=True)
+        
+        for i in sorted_indices:
+            if assigned[i]:
+                continue
+            
+            # Start new cluster with this structure as representative
+            cluster = [i]
+            assigned[i] = True
+            
+            # Add similar structures to this cluster
+            for j in sorted_indices:
+                if not assigned[j] and tm_matrix[i, j] > tm_threshold:
+                    cluster.append(j)
+                    assigned[j] = True
+            
+            clusters.append(cluster)
+        
+        # Select representatives
+        if select_best:
+            # Return the first (best ppi_score) member of each cluster
+            representatives = [predictions[cluster[0]] for cluster in clusters]
+        else:
+            # Return all predictions but with cluster info
+            representatives = [predictions[cluster[0]] for cluster in clusters]
+        
+        print(f"Clustering: {n} structures → {len(clusters)} clusters (TM > {tm_threshold})")
+        return representatives
+        
+    except Exception as e:
+        print(f"Warning: Clustering failed ({e}), returning all predictions")
+        return predictions
+
+
+def _calculate_tm_score(pdb1: str, pdb2: str, chain_id: str = "B") -> float:
+    """
+    Calculate TM-score between two structures.
+    
+    Uses simplified CA-based alignment.
+    
+    Returns:
+        TM-score in range [0, 1]
+    """
+    try:
+        from Bio.PDB import PDBParser, MMCIFParser, Superimposer
+        import numpy as np
+        
+        # Parse structures
+        parser1 = MMCIFParser(QUIET=True) if pdb1.endswith(".cif") else PDBParser(QUIET=True)
+        parser2 = MMCIFParser(QUIET=True) if pdb2.endswith(".cif") else PDBParser(QUIET=True)
+        
+        struct1 = parser1.get_structure("s1", pdb1)
+        struct2 = parser2.get_structure("s2", pdb2)
+        
+        # Extract CA atoms from binder chain
+        def get_ca_coords(structure, chain_id):
+            coords = []
+            for model in structure:
+                for chain in model:
+                    if chain.id == chain_id:
+                        for residue in chain:
+                            if residue.id[0] == " " and "CA" in residue:
+                                coords.append(residue["CA"].get_coord())
+            return np.array(coords)
+        
+        ca1 = get_ca_coords(struct1, chain_id)
+        ca2 = get_ca_coords(struct2, chain_id)
+        
+        if len(ca1) == 0 or len(ca2) == 0:
+            return 0.0
+        
+        # Align lengths
+        min_len = min(len(ca1), len(ca2))
+        ca1 = ca1[:min_len]
+        ca2 = ca2[:min_len]
+        
+        # Calculate RMSD after superposition
+        centroid1 = np.mean(ca1, axis=0)
+        centroid2 = np.mean(ca2, axis=0)
+        ca1_centered = ca1 - centroid1
+        ca2_centered = ca2 - centroid2
+        
+        # SVD for optimal rotation
+        H = ca1_centered.T @ ca2_centered
+        U, S, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+        
+        # Apply rotation
+        ca2_aligned = ca2_centered @ R.T
+        
+        # Calculate TM-score
+        d0 = 1.24 * (min_len - 15) ** (1/3) - 1.8 if min_len > 15 else 0.5
+        d0 = max(d0, 0.5)
+        
+        distances = np.linalg.norm(ca1_centered - ca2_aligned, axis=1)
+        tm_score = np.sum(1 / (1 + (distances / d0) ** 2)) / min_len
+        
+        return float(tm_score)
+        
+    except Exception:
+        return 0.0
+
+
+# =============================================================================
+# Novelty Check - pyhmmer vs UniRef50 (AlphaProteo Step 5)
+# =============================================================================
+
+
+def check_novelty(
+    sequences: list[SequenceDesign],
+    max_evalue: float = 1e-5,
+    database: str = "uniref50",
+) -> list[SequenceDesign]:
+    """
+    Filter sequences for novelty using pyhmmer against UniRef50.
+    
+    Sequences with significant hits (E-value < threshold) are filtered out
+    as they likely resemble existing proteins.
+    
+    Args:
+        sequences: List of designed sequences
+        max_evalue: Maximum E-value to consider a hit (lower = stricter)
+        database: HMM database to search (default: uniref50)
+    
+    Returns:
+        List of novel sequences (no significant UniRef50 hits)
+    """
+    if not sequences:
+        return sequences
+    
+    try:
+        import pyhmmer
+        from pyhmmer.easel import SequenceFile, TextSequence, Alphabet
+        from pyhmmer.plan7 import HMMFile
+        
+        alphabet = Alphabet.amino()
+        novel_sequences = []
+        
+        # Path to UniRef50 HMM database (should be pre-downloaded)
+        hmm_db_path = f"/weights/hmm/{database}.hmm"
+        
+        if not os.path.exists(hmm_db_path):
+            print(f"Warning: HMM database not found at {hmm_db_path}, skipping novelty check")
+            return sequences
+        
+        with HMMFile(hmm_db_path) as hmm_file:
+            hmms = list(hmm_file)
+        
+        for seq in sequences:
+            # Create query sequence
+            query = TextSequence(
+                name=seq.sequence_id.encode(),
+                sequence=seq.sequence.encode(),
+            )
+            digital_seq = query.digitize(alphabet)
+            
+            # Search against HMM database
+            hits_found = False
+            for hmm in hmms:
+                pipeline = pyhmmer.plan7.Pipeline(alphabet)
+                hits = pipeline.search_hmm(hmm, [digital_seq])
+                
+                for hit in hits:
+                    if hit.evalue < max_evalue:
+                        hits_found = True
+                        print(f"  {seq.sequence_id}: hit {hit.name.decode()} (E={hit.evalue:.2e}) - NOT NOVEL")
+                        break
+                
+                if hits_found:
+                    break
+            
+            if not hits_found:
+                novel_sequences.append(seq)
+                print(f"  {seq.sequence_id}: no significant hits - NOVEL")
+        
+        print(f"Novelty: {len(novel_sequences)}/{len(sequences)} sequences are novel (E > {max_evalue})")
+        return novel_sequences
+        
+    except ImportError:
+        print("Warning: pyhmmer not installed, skipping novelty check")
+        return sequences
+    except Exception as e:
+        print(f"Warning: Novelty check failed ({e}), returning all sequences")
+        return sequences

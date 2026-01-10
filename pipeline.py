@@ -28,9 +28,12 @@ from common import (
     BinderCandidate,
     Boltz2Config,
     Chai1Config,
+    ClusterConfig,
     CrossReactivityResult,
     DecoyHit,
     FoldSeekConfig,
+    GenerationMode,
+    NoveltyConfig,
     PipelineConfig,
     PipelineResult,
     PipelineStage,
@@ -45,6 +48,7 @@ from common import (
     base_image,
     data_volume,
     generate_design_id,
+    generate_protein_id,
     weights_volume,
 )
 from generators import (
@@ -56,6 +60,8 @@ from generators import (
 )
 from validators import (
     check_cross_reactivity_parallel,
+    check_novelty,
+    cluster_by_tm_score,
     download_decoy_structures,
     mock_boltz2,
     mock_chai1,
@@ -277,11 +283,40 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     if not predictions:
         return _create_empty_result(run_id, config, validation_results, start_time)
 
+    # Step 4: Clustering - Diversity via TM-score (AlphaProteo SI 2.2)
+    if config.cluster.tm_threshold > 0:
+        print("\n=== Phase 2b: Clustering (Diversity) ===")
+        predictions = cluster_by_tm_score(
+            predictions,
+            tm_threshold=config.cluster.tm_threshold,
+            select_best=config.cluster.select_best,
+        )
+        print(f"After clustering: {len(predictions)} representatives")
+
+    # Step 5: Novelty Check - pyhmmer vs UniRef50 (AlphaProteo SI 2.2)
+    if config.novelty.enabled:
+        print("\n=== Phase 2c: Novelty Check (pyhmmer) ===")
+        # Get sequences corresponding to predictions
+        pred_seq_ids = {p.sequence_id for p in predictions}
+        novel_sequences = check_novelty(
+            [s for s in sequences if s.sequence_id in pred_seq_ids],
+            max_evalue=config.novelty.max_evalue,
+            database=config.novelty.database,
+        )
+        # Filter predictions to only novel sequences
+        novel_seq_ids = {s.sequence_id for s in novel_sequences}
+        predictions = [p for p in predictions if p.sequence_id in novel_seq_ids]
+        print(f"After novelty check: {len(predictions)} novel designs")
+    
+    if not predictions:
+        print("No predictions passed clustering/novelty filters")
+        return _create_empty_result(run_id, config, validation_results, start_time)
+
     # =========================================================================
     # Phase 3: Negative Selection (Selectivity)
     # =========================================================================
 
-    # Step 4: FoldSeek - Find Structural Decoys
+    # Step 6: FoldSeek - Find Structural Decoys
     print("\n=== Phase 3: Decoy Identification (FoldSeek) ===")
     decoys = _run_decoy_search(
         config.target,
@@ -368,23 +403,33 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         # Get cross-reactivity results for this sequence
         cr_results = cross_reactivity_results.get(sequence.sequence_id, [])
 
-        # Compute scores
-        specificity_score = prediction.plddt_interface
+        # Compute specificity using PPI score: 0.8 * ipTM + 0.2 * pTM
+        # Scale to 0-100 for compatibility with existing scoring
+        ppi_score = prediction.ppi_score  # Range [0, 1]
+        specificity_score = ppi_score * 100 if ppi_score > 0 else prediction.plddt_interface
 
-        # Selectivity: penalize if binder binds any decoy
-        max_decoy_affinity = 0.0
+        # Selectivity: penalize if binder binds any decoy (using decoy PPI scores)
+        max_decoy_ppi = 0.0
         if cr_results:
-            max_decoy_affinity = max(abs(r.predicted_affinity) for r in cr_results)
-        selectivity_score = 100.0 - max_decoy_affinity * 10  # Heuristic scaling
+            decoy_ppi_scores = [r.ppi_score for r in cr_results if r.ppi_score > 0]
+            if decoy_ppi_scores:
+                max_decoy_ppi = max(decoy_ppi_scores)
+            else:
+                # Fallback to affinity-based scoring
+                max_decoy_ppi = max(abs(r.predicted_affinity) / 10 for r in cr_results)
+        selectivity_score = 100.0 - max_decoy_ppi * 100  # Penalize high decoy PPI
 
-        # Final score using the S(x) formula
+        # Final score using S(x) = α * PPI_target - β * max(PPI_decoy)
         final_score = (
             config.scoring.alpha * specificity_score
-            - config.scoring.beta * max_decoy_affinity
+            - config.scoring.beta * max_decoy_ppi * 100
         )
 
+        # Generate unique protein ID using nomenclature: <pdb_id>_<mode>_<ulid>
+        candidate_id = generate_protein_id(config.target.pdb_id, config.mode)
+        
         candidate = BinderCandidate(
-            candidate_id=generate_design_id("candidate"),
+            candidate_id=candidate_id,
             sequence=sequence.sequence,
             backbone_design=backbone,
             sequence_design=sequence,
@@ -724,6 +769,7 @@ def main(
     pdb_id: str,
     entity_id: int,
     hotspot_residues: str,
+    mode: str = "bind",
     num_designs: int = 5,
     num_sequences: int = 4,
     use_mocks: bool = False,
@@ -737,6 +783,7 @@ def main(
         pdb_id: 4-letter PDB code (e.g., "3DI3")
         entity_id: Polymer entity ID for the target (e.g., 2 for IL7RA in 3DI3)
         hotspot_residues: Comma-separated list of hotspot residue indices
+        mode: Generation mode - "bind" for binder design (default: "bind")
         num_designs: Number of backbone designs (default: 5)
         num_sequences: Sequences per backbone (default: 4)
         use_mocks: Use mock implementations for testing (default: False)
@@ -744,11 +791,21 @@ def main(
         dry_run: Preview deployment parameters and costs without running (default: False)
     
     Example:
-        uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 --hotspot-residues "42,64,123"
+        uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 --hotspot-residues "58,80,139" --mode bind
+    
+    Generated proteins are named: <pdb_id>_<mode>_<ulid>
+    Example: 3DI3_bind_01ARZ3NDEKTSV4RRFFQ69G5FAV
     """
     from common import get_entity_info, download_pdb
     import tempfile
     import os
+    
+    # Parse and validate mode
+    mode = mode.lower().strip()
+    valid_modes = [m.value for m in GenerationMode]
+    if mode not in valid_modes:
+        raise ValueError(f"Invalid mode '{mode}'. Valid modes: {valid_modes}")
+    generation_mode = GenerationMode(mode)
     
     # Parse hotspot residues
     hotspots = [int(r.strip()) for r in hotspot_residues.split(",")]
@@ -797,6 +854,7 @@ def main(
             chain_id=chain_id,
             name=entity_name,
         ),
+        mode=generation_mode,
         rfdiffusion=RFDiffusionConfig(num_designs=num_designs),
         proteinmpnn=ProteinMPNNConfig(num_sequences=num_sequences),
         boltz2=Boltz2Config(),
@@ -813,11 +871,13 @@ def main(
     print("=" * 60)
     print("PROTEIN BINDER DESIGN PIPELINE")
     print("=" * 60)
+    print(f"Mode: {generation_mode.value}")
     print(f"Target: {pdb_id} entity {entity_id} ({entity_name})")
     print(f"Chain: {chain_id}")
     print(f"Hotspot residues: {hotspots}")
     print(f"Designs: {num_designs} backbones × {num_sequences} sequences")
     print(f"Budget: ${max_budget:.2f}")
+    print(f"Naming: {pdb_id}_<mode>_<ulid>")
     print("=" * 60)
 
     # Run pipeline
@@ -837,13 +897,23 @@ def main(
     if result.top_candidates:
         print("\n--- TOP 5 CANDIDATES ---")
         for i, candidate in enumerate(result.top_candidates[:5]):
+            pred = candidate.structure_prediction
+            ppi = pred.ppi_score
             print(f"\n{i+1}. {candidate.candidate_id}")
             print(f"   Sequence: {candidate.sequence[:50]}...")
+            print(f"   PPI Score: {ppi:.3f} (0.8·ipTM + 0.2·pTM)")
             print(f"   Specificity: {candidate.specificity_score:.1f}")
             print(f"   Selectivity: {candidate.selectivity_score:.1f}")
             print(f"   Final Score: {candidate.final_score:.2f}")
-            print(f"   i-pLDDT: {candidate.structure_prediction.plddt_interface:.1f}")
-            print(f"   PAE: {candidate.structure_prediction.pae_interface:.1f}")
+            # AlphaProteo metrics
+            if pred.pae_interaction is not None:
+                print(f"   PAE@hotspots: {pred.pae_interaction:.2f} Å (< 1.5)")
+            if pred.ptm_binder is not None:
+                print(f"   pTM(binder): {pred.ptm_binder:.3f} (> 0.80)")
+            if pred.rmsd_to_design is not None:
+                print(f"   RMSD: {pred.rmsd_to_design:.2f} Å (< 2.5)")
+            if pred.iptm is not None and pred.ptm is not None:
+                print(f"   ipTM: {pred.iptm:.3f}, pTM: {pred.ptm:.3f}")
 
             if candidate.decoy_results:
                 binding_decoys = sum(1 for r in candidate.decoy_results if r.binds_decoy)

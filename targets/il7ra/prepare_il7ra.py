@@ -234,9 +234,9 @@ def main():
     print("Pipeline command:")
     hotspot_str = ",".join(str(h) for h in new_hotspots) if new_hotspots else "58,80,139"
     print(f"  uv run modal run pipeline.py \\")
-    print(f"      --target-pdb {final_pdb} \\")
+    print(f"      --pdb-id 3DI3 \\")
+    print(f"      --entity-id 2 \\")
     print(f"      --hotspot-residues \"{hotspot_str}\" \\")
-    print(f"      --chain-id A \\")
     print(f"      --dry-run")
     print()
     
