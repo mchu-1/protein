@@ -452,8 +452,13 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     )
     state_tree.set_status(target_node_id, NodeStatus.COMPLETED)
     
-    # Set ceiling costs and initial configuration in state tree
-    state_tree.set_ceiling_cost(run_id, cost_estimate["total"])
+    # Set ceiling (passive observability) values in state tree
+    # These represent worst-case estimates based on timeouts × max_designs
+    state_tree.set_ceilings(
+        run_id,
+        ceiling_cost_usd=cost_estimate["total"],
+        ceiling_timing_sec=cost_estimate["_runtime_sec"],
+    )
     state_tree.set_metrics(run_id, {
         "cost_estimate": {
             "total": cost_estimate["total"],
@@ -1047,46 +1052,43 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     if top_candidates:
         print(f"Top candidate score: {top_candidates[0].final_score:.2f}")
 
-    # Calculate actual runtime
+    # Calculate actual runtime (wall-clock)
     runtime_seconds = time.time() - start_time
     
-    # Print stage metrics summary
-    if stage_metrics:
-        print("\n=== Stage Metrics Summary (Actual vs Ceiling) ===")
-        total_actual_cost = sum(m["actual_cost_usd"] for m in stage_metrics)
-        total_ceiling_cost = sum(m["ceiling_cost_usd"] for m in stage_metrics)
-        print(f"{'Stage':<15} {'Duration':<15} {'Candidates':<12} {'Cost':<20}")
-        print("-" * 62)
-        for m in stage_metrics:
-            dur_str = f"{m['duration_sec']:.1f}s / {m['ceiling_sec']:.0f}s"
-            cost_str = f"${m['actual_cost_usd']:.3f} / ${m['ceiling_cost_usd']:.3f}"
-            print(f"{m['stage']:<15} {dur_str:<15} {m['candidates']:<12} {cost_str:<20}")
-        print("-" * 62)
-        print(f"{'TOTAL':<15} {runtime_seconds:.1f}s{'':<8} {'':<12} ${total_actual_cost:.3f} / ${total_ceiling_cost:.3f}")
-        savings = total_ceiling_cost - total_actual_cost
-        if savings > 0:
-            print(f"  Savings: ${savings:.3f} ({savings/total_ceiling_cost*100:.0f}% under ceiling)")
+    # Finalize state tree first to aggregate all metrics
+    state_tree.finalize(success=True)
+    
+    # Get actual metrics from state tree (single source of truth)
+    actual_cost = state_tree.get_total_cost()
+    actual_timing = state_tree.get_total_timing()
+    timing_by_stage = state_tree.get_timing_by_stage()
+    cost_by_stage = state_tree.get_cost_by_stage()
+    ceiling_cost = cost_estimate["total"]
+    
+    # Print stage metrics summary (derived from state tree)
+    print("\n=== Stage Metrics Summary (Actual vs Ceiling) ===")
+    print(f"{'Stage':<15} {'Time (actual/ceil)':<20} {'Cost (actual/ceil)':<25}")
+    print("-" * 60)
+    
+    for stage in ["rfdiffusion", "proteinmpnn", "boltz2", "foldseek", "chai1"]:
+        stage_time = timing_by_stage.get(stage, 0.0)
+        stage_cost = cost_by_stage.get(stage, 0.0)
+        ceiling_time = cost_estimate["_timeouts"].get(stage, 0)
+        # Calculate ceiling cost for this stage
+        stage_ceiling = cost_estimate.get(stage, 0.0)
         
-        # Add stage metrics to state tree
-        state_tree.set_metrics(run_id, {
-            "stage_metrics": stage_metrics,
-            "total_actual_cost_usd": total_actual_cost,
-            "total_ceiling_cost_usd": total_ceiling_cost,
-            "savings_usd": savings if savings > 0 else 0,
-            "savings_pct": (savings / total_ceiling_cost * 100) if total_ceiling_cost > 0 and savings > 0 else 0,
-        })
-
-    # Write inputs (info.json at PDB root, entity-specific config)
-    _write_inputs(dirs["pdb_root"], dirs["entity"], config)
-
-    # Write metrics CSV
-    _write_metrics_csv(dirs["metrics"], all_candidates)
-
-    # Write stage metrics (actual vs ceiling)
-    _write_stage_metrics(campaign_dir, stage_metrics, runtime_seconds)
-
-    # Create symlinks for best candidates
-    _create_best_symlinks(dirs["best"], top_candidates, dirs["validation_boltz"])
+        time_str = f"{stage_time:.1f}s / {ceiling_time}s"
+        cost_str = f"${stage_cost:.3f} / ${stage_ceiling:.3f}"
+        print(f"{stage:<15} {time_str:<20} {cost_str:<25}")
+    
+    print("-" * 60)
+    print(f"{'TOTAL':<15} {actual_timing:.1f}s / {cost_estimate['_runtime_sec']:.0f}s      ${actual_cost:.3f} / ${ceiling_cost:.3f}")
+    
+    savings = ceiling_cost - actual_cost
+    if savings > 0:
+        print(f"  Savings: ${savings:.3f} ({savings/ceiling_cost*100:.0f}% under ceiling)")
+    
+    print(f"\nWall-clock runtime: {runtime_seconds:.1f}s")
     
     # Add final run metrics to state tree
     state_tree.set_metrics(run_id, {
@@ -1095,10 +1097,24 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         "top_candidates_count": len(top_candidates),
         "best_score": top_candidates[0].final_score if top_candidates else None,
         "best_candidate_id": top_candidates[0].candidate_id if top_candidates else None,
+        "ceiling_cost_usd": ceiling_cost,
+        "savings_usd": savings if savings > 0 else 0,
+        "savings_pct": (savings / ceiling_cost * 100) if ceiling_cost > 0 and savings > 0 else 0,
     })
+
+    # Write inputs (info.json at PDB root, entity-specific config)
+    _write_inputs(dirs["pdb_root"], dirs["entity"], config)
+
+    # Write metrics CSV
+    _write_metrics_csv(dirs["metrics"], all_candidates)
+
+    # Write stage metrics (actual vs ceiling) - now uses state tree data
+    _write_stage_metrics_from_tree(campaign_dir, state_tree, cost_estimate, runtime_seconds)
+
+    # Create symlinks for best candidates
+    _create_best_symlinks(dirs["best"], top_candidates, dirs["validation_boltz"])
     
-    # Finalize state tree and export
-    state_tree.finalize(success=True)
+    # Export state tree
     state_tree_path = f"{campaign_dir}/state_tree.json"
     state_tree.to_json(state_tree_path)
     print(f"\nState tree exported to: {state_tree_path}")
@@ -1117,7 +1133,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         candidates=all_candidates,
         top_candidates=top_candidates,
         validation_summary=validation_results,
-        compute_cost_usd=cost_estimate["total"],
+        compute_cost_usd=actual_cost,  # Actual cost from state tree
         runtime_seconds=runtime_seconds,
     )
 
@@ -1567,7 +1583,7 @@ def _write_run_manifest(
 
 
 def _write_stage_metrics(campaign_dir: str, stage_metrics: list[dict], runtime_seconds: float) -> None:
-    """Write stage_metrics.json with actual vs ceiling costs for each stage."""
+    """Write stage_metrics.json with actual vs ceiling costs for each stage (legacy)."""
     import json
     
     if not stage_metrics:
@@ -1583,6 +1599,52 @@ def _write_stage_metrics(campaign_dir: str, stage_metrics: list[dict], runtime_s
         "savings_usd": total_ceiling - total_actual,
         "savings_pct": (total_ceiling - total_actual) / total_ceiling * 100 if total_ceiling > 0 else 0,
         "stages": stage_metrics,
+    }
+    
+    metrics_path = f"{campaign_dir}/stage_metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+
+def _write_stage_metrics_from_tree(
+    campaign_dir: str, 
+    state_tree: PipelineStateTree, 
+    cost_estimate: dict, 
+    runtime_seconds: float
+) -> None:
+    """
+    Write stage_metrics.json with actual vs ceiling costs derived from state tree.
+    
+    This version uses the state tree as the single source of truth for actual
+    timing and cost metrics, ensuring consistency across all outputs.
+    """
+    import json
+    
+    timing_by_stage = state_tree.get_timing_by_stage()
+    cost_by_stage = state_tree.get_cost_by_stage()
+    
+    stages = []
+    for stage in ["rfdiffusion", "proteinmpnn", "boltz2", "foldseek", "chai1"]:
+        stages.append({
+            "stage": stage,
+            "actual_timing_sec": timing_by_stage.get(stage, 0.0),
+            "ceiling_timing_sec": cost_estimate["_timeouts"].get(stage, 0),
+            "actual_cost_usd": cost_by_stage.get(stage, 0.0),
+            "ceiling_cost_usd": cost_estimate.get(stage, 0.0),
+        })
+    
+    metrics = {
+        "runtime_seconds": runtime_seconds,
+        "total_actual_timing_sec": state_tree.get_total_timing(),
+        "total_ceiling_timing_sec": cost_estimate["_runtime_sec"],
+        "total_actual_cost_usd": state_tree.get_total_cost(),
+        "total_ceiling_cost_usd": cost_estimate["total"],
+        "savings_usd": cost_estimate["total"] - state_tree.get_total_cost(),
+        "savings_pct": (
+            (cost_estimate["total"] - state_tree.get_total_cost()) / cost_estimate["total"] * 100
+            if cost_estimate["total"] > 0 else 0
+        ),
+        "stages": stages,
     }
     
     metrics_path = f"{campaign_dir}/stage_metrics.json"

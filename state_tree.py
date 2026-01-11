@@ -120,7 +120,12 @@ class TimingTrace:
 
 @dataclass
 class CostTrace:
-    """Cost tracking for a node."""
+    """Cost tracking for a node.
+    
+    Tracks both actual (estimated_cost_usd, gpu_seconds, etc.) and ceiling values.
+    - Actual: Derived from real execution timing
+    - Ceiling: Pre-computed worst-case based on timeouts and limits
+    """
     
     stage: Optional[StageType] = None
     gpu_type: Optional[str] = None
@@ -128,7 +133,10 @@ class CostTrace:
     cpu_core_seconds: float = 0.0
     memory_gib_seconds: float = 0.0
     estimated_cost_usd: float = 0.0
+    
+    # Ceiling values (passive observability - worst-case from config)
     ceiling_cost_usd: float = 0.0
+    ceiling_timing_sec: float = 0.0
     
     # Modal pricing constants
     _GPU_COST_PER_SEC = {
@@ -207,6 +215,7 @@ class NodeData:
                 "memory_gib_seconds": self.cost.memory_gib_seconds,
                 "estimated_cost_usd": self.cost.estimated_cost_usd,
                 "ceiling_cost_usd": self.cost.ceiling_cost_usd,
+                "ceiling_timing_sec": self.cost.ceiling_timing_sec,
             },
             "stage": self.stage.value if self.stage else None,
             "data": self.data,
@@ -541,10 +550,23 @@ class PipelineStateTree:
             node_data.metrics.update(metrics)
     
     def set_ceiling_cost(self, node_id: str, ceiling_usd: float) -> None:
-        """Set the ceiling (budget) cost for a node."""
+        """Set the ceiling (budget) cost for a node (passive observability)."""
         if node_id in self.graph:
             node_data: NodeData = self.graph.nodes[node_id]["data"]
             node_data.cost.ceiling_cost_usd = ceiling_usd
+    
+    def set_ceiling_timing(self, node_id: str, ceiling_sec: float) -> None:
+        """Set the ceiling (worst-case) timing for a node (passive observability)."""
+        if node_id in self.graph:
+            node_data: NodeData = self.graph.nodes[node_id]["data"]
+            node_data.cost.ceiling_timing_sec = ceiling_sec
+    
+    def set_ceilings(self, node_id: str, ceiling_cost_usd: float, ceiling_timing_sec: float) -> None:
+        """Set both ceiling cost and timing for a node (passive observability)."""
+        if node_id in self.graph:
+            node_data: NodeData = self.graph.nodes[node_id]["data"]
+            node_data.cost.ceiling_cost_usd = ceiling_cost_usd
+            node_data.cost.ceiling_timing_sec = ceiling_timing_sec
     
     # =========================================================================
     # Query Methods
@@ -660,7 +682,7 @@ class PipelineStateTree:
         return costs
     
     def get_timing_by_stage(self) -> dict[str, float]:
-        """Get total duration by pipeline stage."""
+        """Get total duration by pipeline stage (active observability)."""
         timings: dict[str, float] = {s.value: 0.0 for s in StageType}
         
         for node_id in self.graph.nodes:
@@ -669,6 +691,34 @@ class PipelineStateTree:
                 timings[node_data.stage.value] += node_data.timing.duration_sec
         
         return timings
+    
+    # =========================================================================
+    # Ceiling (Passive Observability) Query Methods
+    # =========================================================================
+    
+    def get_ceiling_cost(self) -> float:
+        """
+        Get the pre-computed ceiling cost for the run (passive observability).
+        
+        This is the worst-case cost based on timeouts × max_designs, set at run start.
+        Compare with get_total_cost() (active) to see actual savings.
+        """
+        if self.root_id in self.graph:
+            root_data: NodeData = self.graph.nodes[self.root_id]["data"]
+            return root_data.cost.ceiling_cost_usd
+        return 0.0
+    
+    def get_ceiling_timing(self) -> float:
+        """
+        Get the pre-computed ceiling timing for the run (passive observability).
+        
+        This is the worst-case billable seconds based on timeouts × max_designs.
+        Compare with get_total_timing() (active) to see actual time savings.
+        """
+        if self.root_id in self.graph:
+            root_data: NodeData = self.graph.nodes[self.root_id]["data"]
+            return root_data.cost.ceiling_timing_sec
+        return 0.0
     
     def get_status_summary(self) -> dict[str, dict[str, int]]:
         """Get count of nodes by type and status."""
@@ -698,11 +748,20 @@ class PipelineStateTree:
         root_data.timing.duration_sec = self.get_run_duration()
         root_data.status = NodeStatus.COMPLETED if success else NodeStatus.FAILED
         
-        # Aggregate metrics
+        # Aggregate metrics - includes both passive (ceiling) and active (actual)
         root_data.metrics = {
+            # Active observability (actual execution)
             "total_cost_usd": self.get_total_cost(),
+            "total_timing_sec": self.get_total_timing(),
             "cost_by_stage": self.get_cost_by_stage(),
             "timing_by_stage": self.get_timing_by_stage(),
+            # Passive observability (pre-computed ceiling)
+            "ceiling_cost_usd": self.get_ceiling_cost(),
+            "ceiling_timing_sec": self.get_ceiling_timing(),
+            # Savings (ceiling - actual)
+            "cost_savings_usd": self.get_ceiling_cost() - self.get_total_cost(),
+            "timing_savings_sec": self.get_ceiling_timing() - self.get_total_timing(),
+            # Tree statistics
             "status_summary": self.get_status_summary(),
             "node_count": len(self.graph.nodes),
             "edge_count": len(self.graph.edges),
@@ -728,7 +787,12 @@ class PipelineStateTree:
             "run_id": self.run_id,
             "created_at": datetime.now().isoformat(),
             "run_duration_sec": self.get_run_duration(),
+            # Active observability (actual execution)
+            "total_timing_sec": self.get_total_timing(),
             "total_cost_usd": self.get_total_cost(),
+            # Passive observability (pre-computed ceiling)
+            "ceiling_timing_sec": self.get_ceiling_timing(),
+            "ceiling_cost_usd": self.get_ceiling_cost(),
             "nodes": nodes,
             "edges": edges,
             "summary": {
@@ -842,22 +906,52 @@ class PipelineStateTree:
     
     def summary(self) -> str:
         """Generate a human-readable summary of the state tree."""
+        # Get passive (ceiling) and active (actual) metrics
+        ceiling_cost = self.get_ceiling_cost()
+        ceiling_timing = self.get_ceiling_timing()
+        actual_cost = self.get_total_cost()
+        actual_timing = self.get_total_timing()
+        
         lines = [
             f"Pipeline State Tree: {self.run_id}",
             "=" * 60,
-            f"Duration: {self.get_run_duration():.1f}s",
-            f"Total Cost: ${self.get_total_cost():.3f}",
             "",
-            "Nodes by Type:",
+            "Observability Summary:",
+            f"  Wall-Clock Duration: {self.get_run_duration():.1f}s",
         ]
         
+        # Show passive vs active comparison if ceiling was set
+        if ceiling_timing > 0 or ceiling_cost > 0:
+            lines.append("")
+            lines.append("  PASSIVE (Ceiling)     ACTIVE (Actual)     Savings")
+            lines.append("  -----------------     ---------------     -------")
+            
+            time_savings = ceiling_timing - actual_timing
+            time_pct = (time_savings / ceiling_timing * 100) if ceiling_timing > 0 else 0
+            lines.append(f"  Time:  {ceiling_timing:>8.1f}s       {actual_timing:>8.1f}s          {time_savings:>6.1f}s ({time_pct:.0f}%)")
+            
+            cost_savings = ceiling_cost - actual_cost
+            cost_pct = (cost_savings / ceiling_cost * 100) if ceiling_cost > 0 else 0
+            lines.append(f"  Cost:  ${ceiling_cost:>7.3f}        ${actual_cost:>7.3f}          ${cost_savings:>5.3f} ({cost_pct:.0f}%)")
+        else:
+            lines.append(f"  Billable Time: {actual_timing:.1f}s")
+            lines.append(f"  Total Cost: ${actual_cost:.3f}")
+        
+        lines.append("")
+        lines.append("Nodes by Type:")
         for node_type in NodeType:
             count = len(self._nodes_by_type.get(node_type, []))
             if count > 0:
                 lines.append(f"  {node_type.value}: {count}")
         
         lines.append("")
-        lines.append("Cost by Stage:")
+        lines.append("Timing by Stage (Active):")
+        for stage, timing in self.get_timing_by_stage().items():
+            if timing > 0:
+                lines.append(f"  {stage}: {timing:.1f}s")
+        
+        lines.append("")
+        lines.append("Cost by Stage (Active):")
         for stage, cost in self.get_cost_by_stage().items():
             if cost > 0:
                 lines.append(f"  {stage}: ${cost:.3f}")
@@ -938,7 +1032,7 @@ def load_state_tree(json_path: str) -> PipelineStateTree:
         node_data.timing.end_time = timing.get("end_time")
         node_data.timing.duration_sec = timing.get("duration_sec")
         
-        # Restore cost
+        # Restore cost (active and passive observability values)
         cost = node_dict.get("cost", {})
         node_data.cost.stage = StageType(cost["stage"]) if cost.get("stage") else None
         node_data.cost.gpu_type = cost.get("gpu_type")
@@ -947,6 +1041,7 @@ def load_state_tree(json_path: str) -> PipelineStateTree:
         node_data.cost.memory_gib_seconds = cost.get("memory_gib_seconds", 0.0)
         node_data.cost.estimated_cost_usd = cost.get("estimated_cost_usd", 0.0)
         node_data.cost.ceiling_cost_usd = cost.get("ceiling_cost_usd", 0.0)
+        node_data.cost.ceiling_timing_sec = cost.get("ceiling_timing_sec", 0.0)
         
         tree.graph.add_node(node_id, data=node_data)
         tree._nodes_by_type[node_data.node_type].append(node_id)
