@@ -817,7 +817,6 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         config.foldseek,
         f"{campaign_dir}/_decoys",
         use_mocks,
-        cache_dir=dirs["entity"],  # Cache at entity level for reuse across campaigns
     )
     stage_duration = time.time() - stage_start
     print(f"[DONE]  {time.strftime('%H:%M:%S')} | Output: {len(decoys)} decoys | Duration: {stage_duration:.1f}s")
@@ -1380,22 +1379,18 @@ def _run_decoy_search(
     config: FoldSeekConfig,
     output_dir: str,
     use_mocks: bool,
-    cache_dir: str = None,
 ) -> list[DecoyHit]:
-    """Execute decoy search step with optional caching (#5 optimization)."""
+    """Execute decoy search step with TTL caching via Modal Dict."""
     if use_mocks:
         return mock_foldseek(target, config, output_dir)
 
     try:
-        # Check cache first if enabled
-        if config.cache_results and cache_dir:
-            cached_decoys = get_cached_decoys(target, cache_dir)
+        # Check cache first if enabled (uses Modal Dict - no cache_dir needed)
+        if config.cache_results:
+            cached_decoys = get_cached_decoys(target)
             if cached_decoys is not None:
-                # Still need to download structures if not present
-                valid_decoys = []
-                for decoy in cached_decoys:
-                    if os.path.exists(decoy.pdb_path):
-                        valid_decoys.append(decoy)
+                # Verify PDB structures exist, re-download if missing
+                valid_decoys = [d for d in cached_decoys if os.path.exists(d.pdb_path)]
                 
                 if len(valid_decoys) == len(cached_decoys):
                     return cached_decoys
@@ -1415,9 +1410,9 @@ def _run_decoy_search(
                 decoys, f"{output_dir}/structures"
             )
             
-            # Cache results for future runs
-            if config.cache_results and cache_dir:
-                save_decoys_to_cache(target, decoys, cache_dir)
+            # Cache results for future runs (TTL: 7 days, refreshed on read)
+            if config.cache_results:
+                save_decoys_to_cache(target, decoys)
 
         return decoys
     except Exception as e:

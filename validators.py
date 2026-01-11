@@ -555,60 +555,52 @@ def _extract_pdb_id_from_path(pdb_path: str) -> Optional[str]:
 # =============================================================================
 
 
-def get_cached_decoys(
-    target: TargetProtein,
-    cache_dir: str,
-) -> Optional[list[DecoyHit]]:
+def get_cached_decoys(target: TargetProtein) -> Optional[list[DecoyHit]]:
     """
-    Check for cached FoldSeek results for a target.
+    Check for cached FoldSeek results using Modal Dict (TTL key-value store).
     
     Cache key is based on PDB ID + entity ID, so same protein = same decoys.
+    Reading extends TTL by 7 days (LRU-like behavior).
     
     Args:
         target: Target protein specification
-        cache_dir: Directory where cache files are stored
     
     Returns:
         List of cached DecoyHit objects, or None if no cache exists
     """
+    from common import foldseek_cache
+    
     cache_key = f"{target.pdb_id.upper()}_E{target.entity_id}"
-    cache_file = f"{cache_dir}/foldseek_cache/{cache_key}_decoys.json"
     
-    if os.path.exists(cache_file):
-        try:
-            with open(cache_file, "r") as f:
-                cached_data = json.load(f)
-                decoys = [DecoyHit(**d) for d in cached_data]
-                print(f"FoldSeek: Using cached results for {cache_key} ({len(decoys)} decoys)")
-                return decoys
-        except Exception as e:
-            print(f"FoldSeek: Cache read failed ({e}), will recompute")
+    try:
+        cached_data = foldseek_cache.get(cache_key)
+        if cached_data is not None:
+            decoys = [DecoyHit(**d) for d in cached_data]
+            print(f"FoldSeek: Cache HIT for {cache_key} ({len(decoys)} decoys)")
+            return decoys
+    except Exception as e:
+        print(f"FoldSeek: Cache read failed ({e}), will recompute")
     
+    print(f"FoldSeek: Cache MISS for {cache_key}")
     return None
 
 
-def save_decoys_to_cache(
-    target: TargetProtein,
-    decoys: list[DecoyHit],
-    cache_dir: str,
-) -> None:
+def save_decoys_to_cache(target: TargetProtein, decoys: list[DecoyHit]) -> None:
     """
-    Save FoldSeek results to cache for future runs.
+    Save FoldSeek results to Modal Dict cache (7-day TTL, refreshed on read).
     
     Args:
         target: Target protein specification
         decoys: List of decoy hits to cache
-        cache_dir: Directory where cache files are stored
     """
+    from common import foldseek_cache
+    
     cache_key = f"{target.pdb_id.upper()}_E{target.entity_id}"
-    cache_subdir = f"{cache_dir}/foldseek_cache"
-    os.makedirs(cache_subdir, exist_ok=True)
-    cache_file = f"{cache_subdir}/{cache_key}_decoys.json"
     
     try:
-        with open(cache_file, "w") as f:
-            json.dump([d.model_dump() for d in decoys], f, indent=2)
-        print(f"FoldSeek: Cached {len(decoys)} decoys for {cache_key}")
+        # Store as list of dicts for JSON serialization
+        foldseek_cache.put(cache_key, [d.model_dump() for d in decoys])
+        print(f"FoldSeek: Cached {len(decoys)} decoys for {cache_key} (TTL: 7 days)")
     except Exception as e:
         print(f"FoldSeek: Cache write failed ({e})")
 

@@ -26,6 +26,10 @@ APP_NAME = "protein-binder-pipeline"
 weights_volume = modal.Volume.from_name("binder-weights", create_if_missing=True)
 data_volume = modal.Volume.from_name("binder-data", create_if_missing=True)
 
+# TTL key-value cache for FoldSeek decoy results (7-day TTL, refreshed on read)
+# Uses Modal Dict for cloud-native caching with automatic LRU-like expiry
+foldseek_cache = modal.Dict.from_name("foldseek-decoy-cache", create_if_missing=True)
+
 WEIGHTS_PATH = "/weights"
 DATA_PATH = "/data"
 
