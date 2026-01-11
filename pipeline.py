@@ -416,9 +416,9 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     mode_str = config.mode.value
     campaign_id = f"{date_prefix}_{mode_str}_{run_id}"
     
-    # Directory structure
+    # Directory structure (E<N> format matches candidate IDs: PDB_E<N>_mode_ULID)
     pdb_root = f"{DATA_PATH}/{pdb_id}"
-    entity_dir = f"{pdb_root}/entity_{entity_id}"
+    entity_dir = f"{pdb_root}/E{entity_id}"
     campaign_dir = f"{entity_dir}/{campaign_id}"
     dirs = {
         "backbones": f"{campaign_dir}/01_backbones",

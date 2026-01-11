@@ -972,14 +972,15 @@ def run_chai1(
             print(f"  ✗ Could not extract sequence from {decoy.pdb_path}")
             return None
 
-        # Prepare Chai-1 input FASTA
-        input_fasta = f"{output_dir}/chai1_input_{sequence.sequence_id}_{decoy.decoy_id}.fasta"
+        # Prepare Chai-1 input FASTA (directory already contains seq_id/decoy_id context)
+        input_fasta = f"{output_dir}/input.fasta"
         with open(input_fasta, "w") as f:
             # Chai-1 uses "protein|name=X" format for chain specification
             f.write(f">protein|name=decoy\n{decoy_sequence}\n")
             f.write(f">protein|name=binder\n{sequence.sequence}\n")
 
-        output_subdir = Path(f"{output_dir}/pred_{sequence.sequence_id}_{decoy.decoy_id}")
+        # Use output_dir directly - caller already includes seq_id/decoy_id in path
+        output_subdir = Path(output_dir)
 
         # Use chai_lab Python API
         try:
