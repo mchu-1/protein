@@ -5,6 +5,7 @@ This module implements a directed graph representation of pipeline run state,
 enabling:
 - Hierarchical tracking of designs (backbone → sequence → prediction → candidate)
 - Cost observability per node and aggregated by subtree
+- Time observability per node and aggregated by subtree (billable seconds)
 - Generation traces with timing, GPU usage, and resource metrics
 - Serialization for post-run analysis and visualization
 
@@ -34,7 +35,8 @@ Usage:
     tree.end_timing(backbone_node, cost_usd=0.50)
     
     # Query state
-    tree.get_subtree_cost("target")
+    tree.get_subtree_cost("target")      # Total cost under target node
+    tree.get_subtree_timing("target")    # Total billable seconds under target
     tree.get_generation_trace("seq_abc123")
     
     # Export
@@ -619,6 +621,32 @@ class PipelineStateTree:
     def get_total_cost(self) -> float:
         """Get total estimated cost for the entire run."""
         return self.get_subtree_cost(self.root_id)
+    
+    def get_subtree_timing(self, node_id: str) -> float:
+        """
+        Calculate total billable seconds of a node and all its descendants.
+        
+        This returns the sum of individual node durations (billable compute seconds),
+        not wall-clock time. For parallel execution, this represents what Modal bills.
+        
+        Returns:
+            Total duration in seconds
+        """
+        if node_id not in self.graph:
+            return 0.0
+        
+        node_data: NodeData = self.graph.nodes[node_id]["data"]
+        total = node_data.timing.duration_sec or 0.0
+        
+        for descendant in nx.descendants(self.graph, node_id):
+            desc_data: NodeData = self.graph.nodes[descendant]["data"]
+            total += desc_data.timing.duration_sec or 0.0
+        
+        return total
+    
+    def get_total_timing(self) -> float:
+        """Get total billable seconds for the entire run."""
+        return self.get_subtree_timing(self.root_id)
     
     def get_cost_by_stage(self) -> dict[str, float]:
         """Get cost breakdown by pipeline stage."""

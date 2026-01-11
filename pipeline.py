@@ -109,7 +109,6 @@ DEFAULT_STEP_TIMEOUTS = {
 }
 
 # Default max_designs per step when no limits are specified
-# Conservative defaults tuned to keep typical runs within ~$5 USD budget
 DEFAULT_MAX_DESIGNS = {
     "rfdiffusion": 4,     # Max backbones to generate
     "proteinmpnn": 16,    # Max total sequences
@@ -402,9 +401,9 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     # Limit controls how many sequences proceed to cross-reactivity check
     max_chai1_sequences = limits.get_max_designs("chai1")
     
-    # Pre-flight cost check
+    # Pre-flight cost check (only if budget is set)
     cost_estimate = estimate_cost(config)
-    if cost_estimate["total"] > config.max_compute_usd:
+    if config.max_compute_usd is not None and cost_estimate["total"] > config.max_compute_usd:
         print(
             f"WARNING: Estimated cost ${cost_estimate['total']:.2f} exceeds budget "
             f"${config.max_compute_usd:.2f}. Reducing design count."
@@ -434,7 +433,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     print(f"│     └─ Validations: up to {max_boltz2_validations}")
     print(f"│        └─ Chai-1: up to {max_chai1_sequences} seqs × {config.foldseek.max_hits} decoys")
     print(f"└─ Decoys: {config.foldseek.max_hits} (max: {max_decoys_per_target})")
-    print(f"\nBudget: ${cost_estimate['total']:.2f} (cost ceiling)")
+    print(f"\nCost ceiling: ${cost_estimate['total']:.2f}")
     print(f"  ├─ RFDiffusion (A10G):  ${cost_estimate['rfdiffusion']:.3f}")
     print(f"  ├─ ProteinMPNN (L4):    ${cost_estimate['proteinmpnn']:.3f}")
     print(f"  ├─ Boltz-2 (A100):      ${cost_estimate['boltz2']:.3f}")
@@ -466,7 +465,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         },
         "effective_limits": cost_estimate["_effective"],
         "timeouts": cost_estimate["_timeouts"],
-        "max_compute_usd": config.max_compute_usd,
+        "max_compute_usd": config.max_compute_usd if config.max_compute_usd is not None else "unlimited",
     })
 
     validation_results: list[ValidationResult] = []
@@ -1754,12 +1753,15 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     print(f"{'CEILING TOTAL':<20} {'':<12} {'':<10} {int(est_runtime_sec):>6}s {'$' + f'{cost_total:.2f}':>12}")
     print()
     
-    budget_status = "✓ WITHIN BUDGET" if costs["total"] <= config.max_compute_usd else "✗ EXCEEDS BUDGET"
-    print(f"Budget: ${config.max_compute_usd:.2f}  [{budget_status}]")
+    if config.max_compute_usd is not None:
+        budget_status = "✓ WITHIN BUDGET" if costs["total"] <= config.max_compute_usd else "✗ EXCEEDS BUDGET"
+        print(f"Budget: ${config.max_compute_usd:.2f}  [{budget_status}]")
+    else:
+        print("Budget: unlimited")
     print(f"Max runtime: ~{est_runtime_min:.0f} minutes (sequential worst-case)")
     print()
 
-    if costs["total"] > config.max_compute_usd:
+    if config.max_compute_usd is not None and costs["total"] > config.max_compute_usd:
         scale_factor = config.max_compute_usd / costs["total"]
         suggested_designs = max(1, int(req_backbones * scale_factor))
         suggested_sequences = max(1, int(config.proteinmpnn.num_sequences * scale_factor))
@@ -1813,7 +1815,7 @@ def main(
     num_designs: int = 5,
     num_sequences: int = 4,
     use_mocks: bool = False,
-    max_budget: float = 5.0,
+    max_budget: float = None,
     dry_run: bool = False,
 ):
     """
@@ -1828,7 +1830,7 @@ def main(
         num_designs: Number of backbone designs (default: 5)
         num_sequences: Sequences per backbone (default: 4)
         use_mocks: Use mock implementations for testing (default: False)
-        max_budget: Maximum compute budget in USD (default: 5.0)
+        max_budget: Maximum compute budget in USD (default: None = no limit)
         dry_run: Preview deployment parameters and costs without running (default: False)
     
     Example with CLI args:
@@ -2047,7 +2049,7 @@ def design_binders(
     chain_id: str = "A",
     num_designs: int = 5,
     num_sequences: int = 4,
-    max_budget: float = 5.0,
+    max_budget: Optional[float] = None,
     use_mocks: bool = False,
 ) -> PipelineResult:
     """
@@ -2059,7 +2061,7 @@ def design_binders(
         chain_id: Target chain ID
         num_designs: Number of backbone designs
         num_sequences: Sequences per backbone
-        max_budget: Maximum compute budget in USD
+        max_budget: Maximum compute budget in USD (None = no limit)
         use_mocks: Use mock implementations for testing
 
     Returns:
@@ -2109,7 +2111,7 @@ Examples:
     parser.add_argument("--mode", default="bind", help="Generation mode (default: bind)")
     parser.add_argument("--num-designs", type=int, default=5, help="Number of backbones (default: 5)")
     parser.add_argument("--num-sequences", type=int, default=4, help="Sequences per backbone (default: 4)")
-    parser.add_argument("--max-budget", type=float, default=5.0, help="Max budget in USD (default: 5.0)")
+    parser.add_argument("--max-budget", type=float, default=None, help="Max budget in USD (default: no limit)")
     parser.add_argument("--dry-run", action="store_true", help="Preview costs without running")
     
     args = parser.parse_args()

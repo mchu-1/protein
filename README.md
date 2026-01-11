@@ -87,17 +87,12 @@ uv run modal token new
 uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 \
     --hotspot-residues "58,80,139" \
     --mode bind \
-    --num-designs 5 \
-    --num-sequences 4 \
     --dry-run
 
 # Run with Modal CLI
 uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 \
     --hotspot-residues "58,80,139" \
-    --mode bind \
-    --num-designs 5 \
-    --num-sequences 4 \
-    --max-budget 5.0
+    --mode bind
 
 # Test with mocks (no GPU required)
 uv run modal run pipeline.py --pdb-id 3DI3 --entity-id 2 \
@@ -173,9 +168,9 @@ data/
             └── 99_metrics/scores_combined.csv
 ```
 
-## Infrastructure & Cost Optimization
+## Infrastructure & Cost Observability
 
-The pipeline is designed to run within a **$5 USD** compute budget.
+The pipeline provides full cost observability through a state tree that tracks resource usage at every stage.
 
 ### Modal GPU Pricing (per second)
 
@@ -191,13 +186,15 @@ The pipeline is designed to run within a **$5 USD** compute budget.
 
 ### Step Resource Allocation
 
-| Step | Tool | GPU | Timeout | Cost Driver |
-|------|------|-----|---------|-------------|
-| Backbone Generation | RFDiffusion | A10G | 600s | `num_designs` |
-| Sequence Design | ProteinMPNN | L4 | 300s | `num_designs` |
-| Structure Validation | Boltz-2 | A100 | 900s | `num_designs × num_sequences` |
-| Decoy Search | FoldSeek | CPU | 120s | Fixed |
-| Cross-Reactivity | Chai-1 | A100 | 900s | `num_designs × num_sequences × max_decoys` |
+| Step | Tool | GPU | Timeout | Cost Driver | Default Runs |
+|------|------|-----|---------|-------------|--------------|
+| Backbone Generation | RFDiffusion | A10G | 600s | `num_designs` | 2 |
+| Sequence Design | ProteinMPNN | L4 | 300s | `num_designs` | 2 |
+| Structure Validation | Boltz-2 | A100 | 900s | `num_designs × num_sequences` | 4 |
+| Decoy Search | FoldSeek | CPU | 120s | Fixed | 1 |
+| Cross-Reactivity | Chai-1 | A100 | 900s | `num_designs × num_sequences × max_decoys` | 12* |
+
+\* Worst case assuming all sequences pass Boltz-2 validation. In practice, 60-80% are filtered.
 
 ### Cost Formula
 
@@ -207,30 +204,17 @@ The worst-case cost ceiling is computed as:
 Total Cost = Σ (GPU_cost/s × timeout × runs) + CPU/memory overhead
 ```
 
-**Critical insight:** Chai-1 cost scales cubically with configuration parameters. With defaults (5 backbones × 4 sequences × 5 decoys = 100 pairs), worst-case Chai-1 alone exceeds $50!
+**Critical insight:** Chai-1 cost scales cubically with configuration parameters. With aggressive settings (5 backbones × 4 sequences × 5 decoys = 100 pairs), worst-case Chai-1 alone exceeds $50! The defaults are tuned for cost efficiency.
 
-### Budget Run Example ($5 USD)
+### Default Configuration
 
-To generate a high-confidence binder within $5 USD, use a **Pareto-optimal configuration** that minimizes expensive Chai-1 calls while maintaining design diversity:
+The defaults use a **Pareto-optimal configuration** that minimizes expensive Chai-1 calls while maintaining design diversity:
 
-| Parameter | Default | Budget | Rationale |
-|-----------|---------|--------|-----------|
-| `--num-designs` | 5 | **2** | Fewer backbones, rely on quality |
-| `--num-sequences` | 4 | **2** | ProteinMPNN quality over quantity |
-| `--max-decoys` | 5 | **3** | Top decoys capture most off-target risk |
-
-#### Estimated Cost Breakdown (Budget Configuration)
-
-| Step | GPU | Runs | Worst-Case Time | Est. Cost |
-|------|-----|------|-----------------|-----------|
-| RFDiffusion | A10G | 2 | 1,200s | $0.37 |
-| ProteinMPNN | L4 | 2 | 600s | $0.13 |
-| Boltz-2 | A100 | 4 | 3,600s | $2.10 |
-| FoldSeek | CPU | 1 | 120s | $0.01 |
-| Chai-1 | A100 | 12* | 10,800s | $2.30 |
-| **Total** | | | | **~$4.91** |
-
-\* Assumes all 4 sequences pass Boltz-2 validation (worst case). In practice, 60-80% are filtered, reducing Chai-1 cost.
+| Parameter | Default | Rationale |
+|-----------|---------|-----------|
+| `--num-designs` | 2 | Fewer backbones, rely on quality |
+| `--num-sequences` | 2 | ProteinMPNN quality over quantity |
+| `--max-decoys` | 3 | Top decoys capture most off-target risk |
 
 #### CLI Command
 
@@ -241,66 +225,23 @@ uv run modal run pipeline.py \
   --entity-id 2 \
   --hotspot-residues "58,80,139" \
   --mode bind \
-  --num-designs 2 \
-  --num-sequences 2 \
-  --max-budget 5.0 \
   --dry-run
 
-# 2. Execute the budget run
+# 2. Execute the run
 uv run modal run pipeline.py \
   --pdb-id 3DI3 \
   --entity-id 2 \
   --hotspot-residues "58,80,139" \
-  --mode bind \
-  --num-designs 2 \
-  --num-sequences 2 \
-  --max-budget 5.0
+  --mode bind
 ```
 
-#### Dry-Run Output Example
-
-```
-============================================================
-DRY RUN — DEPLOYMENT PREVIEW
-============================================================
-
-CONFIGURATION
-------------------------------------------------------------
-Target: Interleukin-7 receptor subunit alpha
-PDB ID: 3DI3
-Entity ID: 2
-Hotspot residues: 58, 80, 139
-Configuration: 2 backbones × 2 sequences each
-Total sequences: 4
-Max decoys: 3
-
-COST BREAKDOWN (Modal pricing)
-------------------------------------------------------------
-Step                 GPU          Runs       Time           Cost
-------------------------------------------------------------
-RFDiffusion          A10G         2          1200s         $0.367
-ProteinMPNN          L4           2           600s         $0.133
-Boltz-2              A100-80GB    4          3600s         $2.099
-FoldSeek             CPU          1           120s         $0.003
-Chai-1               A100-80GB    12        10800s         $2.299
-------------------------------------------------------------
-TOTAL                                       16320s         $4.90
-
-Budget: $5.00  [✓ WITHIN BUDGET]
-Estimated runtime: ~272 minutes (sequential)
-
-To run: remove --dry-run flag
-```
-
-### Why This Configuration Works
+### Why the Defaults Work
 
 1. **Boltz-2 as gatekeeper**: AlphaProteo thresholds (`max_pae_interaction < 1.5 Å`, `min_ptm_binder > 0.80`, `max_rmsd < 2.5 Å`) filter 60-80% of candidates *before* Chai-1, so actual cost is typically 30-50% of ceiling.
 
 2. **Quality over quantity**: RFDiffusion and ProteinMPNN produce high-quality outputs. 2 well-designed backbones with proper hotspot contacts often outperform 10 random ones.
 
 3. **Top decoys matter most**: FoldSeek results are sorted by TM-score. The top 2-3 structural homologs capture the primary off-target risk.
-
-4. **Auto-scaling**: If estimated cost exceeds `--max-budget`, the pipeline automatically scales down `num_designs` and `num_sequences` to fit.
 
 ### Cost Optimization Strategies
 
@@ -358,7 +299,7 @@ uv run modal volume put binder-weights /path/to/chai1 /chai1
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `num_designs` | 10 | Number of backbones to generate |
+| `num_designs` | 2 | Number of backbones to generate |
 | `binder_length_min` | 50 | Minimum binder length |
 | `binder_length_max` | 100 | Maximum binder length |
 | `noise_scale` | 1.0 | Diffusion noise scale |
@@ -368,7 +309,7 @@ uv run modal volume put binder-weights /path/to/chai1 /chai1
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `num_sequences` | 8 | Sequences per backbone |
+| `num_sequences` | 2 | Sequences per backbone |
 | `temperature` | 0.2 | Sampling temperature (higher = more diverse) |
 | `backbone_noise` | 0.0 | Backbone coordinate noise |
 
@@ -386,7 +327,7 @@ uv run modal volume put binder-weights /path/to/chai1 /chai1
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `database` | pdb100 | Database to search |
-| `max_hits` | 5 | Maximum structural homologs (fewer = cheaper Chai-1) |
+| `max_hits` | 3 | Maximum structural homologs (fewer = cheaper Chai-1) |
 | `evalue_threshold` | 1e-3 | E-value cutoff |
 | `cache_results` | true | Cache decoy results for target reuse |
 

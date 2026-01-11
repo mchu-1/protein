@@ -432,7 +432,6 @@ class PipelineLimits(BaseModel):
     }
     
     # Default max_designs values - conservative limits for cost control
-    # Tuned to keep typical runs within ~$5 USD budget
     _default_max_designs: dict = {
         "rfdiffusion": 4,     # Max backbones to generate
         "proteinmpnn": 16,    # Max total sequences (backbones × seqs_per_backbone)
@@ -477,8 +476,8 @@ class PipelineConfig(BaseModel):
     # Stage limits (timeouts and max designs per stage)
     limits: PipelineLimits = Field(default_factory=PipelineLimits, description="Per-stage timeout and design limits")
 
-    # Budget control
-    max_compute_usd: float = Field(default=5.0, ge=0.1, le=100.0, description="Maximum compute budget in USD")
+    # Budget control (optional - set to None to disable budget enforcement)
+    max_compute_usd: Optional[float] = Field(default=None, ge=0.1, description="Maximum compute budget in USD (None = no limit)")
 
 
 # =============================================================================

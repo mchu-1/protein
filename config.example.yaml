@@ -139,9 +139,8 @@ limits:
     max_designs: 2             # Max sequences to check against decoys (2 seqs × 2 decoys = 4 pairs)
 
 # =============================================================================
-# Budget Control
+# Budget Control (Optional)
 # =============================================================================
 
-# Maximum compute budget in USD
-# With default limits, typical runs are ~$4.96 ceiling cost
-max_compute_usd: 5.0
+# Maximum compute budget in USD (optional - remove or set to null to disable)
+# max_compute_usd: 10.0
