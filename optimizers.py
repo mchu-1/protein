@@ -65,10 +65,10 @@ def check_solubility(
     Check sequence solubility using peptides.py.
     
     Computes:
-    - Net charge at pH 7.0 (should be moderate, not extreme)
-    - Isoelectric point (pI) - optimal range is ~5-10
-    
-    Sequences with extreme charges or pI values are likely to aggregate.
+    - Absolute net charge at pH 7.0: Must be within [min_abs, max_abs] to ensure
+      sufficient repulsion (prevents clumping) without being unfoldably super-charged.
+    - Isoelectric point (pI): Must be OUTSIDE the forbidden "dead zone" (6.0-8.0)
+      near physiological pH where proteins have minimal charge and aggregate.
     
     Args:
         sequence: Designed binder sequence
@@ -84,6 +84,7 @@ def check_solubility(
         
         # Net charge at physiological pH
         net_charge = peptide.charge(pH=7.0)
+        abs_charge = abs(net_charge)
         
         # Isoelectric point
         pI = peptide.isoelectric_point()
@@ -92,18 +93,17 @@ def check_solubility(
         passes = True
         rejection_reason = None
         
-        if net_charge < config.min_net_charge_ph7:
+        # Gate 1: Absolute charge must be in [min, max] range
+        if abs_charge < config.min_abs_charge_ph7:
             passes = False
-            rejection_reason = f"net_charge={net_charge:.1f} < {config.min_net_charge_ph7}"
-        elif net_charge > config.max_net_charge_ph7:
+            rejection_reason = f"|charge|={abs_charge:.1f} < {config.min_abs_charge_ph7} (insufficient repulsion)"
+        elif abs_charge > config.max_abs_charge_ph7:
             passes = False
-            rejection_reason = f"net_charge={net_charge:.1f} > {config.max_net_charge_ph7}"
-        elif pI < config.min_isoelectric_point:
+            rejection_reason = f"|charge|={abs_charge:.1f} > {config.max_abs_charge_ph7} (super-charged)"
+        # Gate 2: pI must be OUTSIDE the forbidden dead zone
+        elif config.forbidden_pi_min <= pI <= config.forbidden_pi_max:
             passes = False
-            rejection_reason = f"pI={pI:.1f} < {config.min_isoelectric_point}"
-        elif pI > config.max_isoelectric_point:
-            passes = False
-            rejection_reason = f"pI={pI:.1f} > {config.max_isoelectric_point}"
+            rejection_reason = f"pI={pI:.1f} in dead zone [{config.forbidden_pi_min}, {config.forbidden_pi_max}]"
         
         return SolubilityResult(
             sequence_id=sequence.sequence_id,

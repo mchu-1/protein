@@ -397,15 +397,21 @@ class SolubilityFilterConfig(BaseModel):
     Uses peptides.py to check net charge and isoelectric point (pI) to ensure
     good solubility of generated sequences before expensive structure prediction.
     
+    Charge gates: Uses absolute charge to ensure minimum repulsion (prevents clumping)
+    while rejecting super-charged sequences that won't fold properly.
+    
+    pI gate: Forbids the "dead zone" near physiological pH (6.0-8.0) where proteins
+    have minimal net charge and tend to aggregate.
+    
     Economics: Prunes ~20-40% of sequences that would likely aggregate in solution,
     saving Boltz-2 and Chai-1 compute costs.
     """
 
     enabled: bool = Field(default=True, description="Enable solubility pre-screening")
-    min_net_charge_ph7: float = Field(default=-5.0, description="Minimum net charge at pH 7 (too negative = aggregation)")
-    max_net_charge_ph7: float = Field(default=10.0, description="Maximum net charge at pH 7 (too positive = aggregation)")
-    min_isoelectric_point: float = Field(default=5.0, description="Minimum pI (avoid extremes)")
-    max_isoelectric_point: float = Field(default=10.0, description="Maximum pI (avoid extremes)")
+    min_abs_charge_ph7: float = Field(default=3.0, ge=0.0, description="Minimum |net charge| at pH 7 (repulsion to prevent clumping)")
+    max_abs_charge_ph7: float = Field(default=12.0, ge=0.0, description="Maximum |net charge| at pH 7 (reject unfoldable super-charged)")
+    forbidden_pi_min: float = Field(default=6.0, description="Lower bound of forbidden pI zone (dead zone near pH 7.4)")
+    forbidden_pi_max: float = Field(default=8.0, description="Upper bound of forbidden pI zone (dead zone near pH 7.4)")
 
 
 class StructuralMemoizationConfig(BaseModel):
@@ -453,7 +459,7 @@ class StickinessFilterConfig(BaseModel):
     """
 
     enabled: bool = Field(default=True, description="Enable SAP stickiness filtering")
-    max_sap_score: float = Field(default=0.15, ge=0.0, le=1.0, description="Maximum SAP score (lower = less sticky)")
+    max_sap_score: float = Field(default=0.50, ge=0.0, le=1.0, description="Maximum SAP score. Relaxed to 0.50 to allow CDR-like loops.")
     hydrophobic_residues: str = Field(default="AVILMFYW", description="Residues considered hydrophobic")
 
 

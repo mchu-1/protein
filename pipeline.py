@@ -751,6 +751,10 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             for bb_id in original_backbone_ids - kept_ids:
                 state_tree.set_status(bb_id, NodeStatus.FILTERED)
         
+        # Reload volume to see files committed by remote RFDiffusion container
+        if not use_mocks:
+            data_volume.reload()
+        
         # Step 1c: Structural Memoization - skip structural twins
         if config.structural_memoization.enabled and backbones:
             pre_memo_count = len(backbones)
@@ -1505,6 +1509,9 @@ def _run_adaptive_generation(
         if not batch_backbones:
             print(f"  No backbones generated in batch {batch_num}")
             continue
+        
+        # Reload volume to see files committed by remote RFDiffusion container
+        data_volume.reload()
         
         print(f"  Step 1: Generated {len(batch_backbones)} backbones")
         

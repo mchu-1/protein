@@ -110,6 +110,34 @@ adaptive:
   batch_size: 4                # Backbones per micro-batch
   max_batches: 3               # Maximum micro-batches
 
+# Solubility filter (1D chemistry gates)
+solubility_filter:
+  enabled: true
+  min_abs_charge_ph7: 3.0      # Min |net charge| - prevents clumping
+  max_abs_charge_ph7: 12.0     # Max |net charge| - rejects super-charged sludge
+  forbidden_pi_min: 6.0        # Forbidden pI zone lower bound (dead zone)
+  forbidden_pi_max: 8.0        # Forbidden pI zone upper bound (near pH 7.4)
+
+# Stickiness filter (3D structure gates)
+stickiness_filter:
+  enabled: true
+  max_sap_score: 0.50          # Relaxed to allow CDR-like loops
+  hydrophobic_residues: "AVILMFYW"
+
+# Structural memoization (3Di fingerprinting)
+structural_memoization:
+  enabled: true
+  similarity_threshold: 0.9    # Skip structural twins above this similarity
+  cache_ttl_hours: 168         # 7-day cache TTL
+
+# Beam pruning (tree width control)
+beam_pruning:
+  enabled: true
+  max_tree_nodes: 500          # Maximum total nodes in state tree
+  sequences_per_backbone: 5    # Max sequences per backbone
+  predictions_per_sequence: 1  # Max predictions per sequence
+  prune_by_score: true         # Prune lowest-scoring siblings
+
 # =============================================================================
 # Stage Limits
 # =============================================================================
