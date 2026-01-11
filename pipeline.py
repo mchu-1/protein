@@ -25,6 +25,7 @@ from common import (
     AdaptiveGenerationConfig,
     BackboneDesign,
     BackboneFilterConfig,
+    BeamPruningConfig,
     BinderCandidate,
     Boltz2Config,
     Chai1Config,
@@ -38,6 +39,9 @@ from common import (
     ProteinMPNNConfig,
     RFDiffusionConfig,
     SequenceDesign,
+    SolubilityFilterConfig,
+    StickinessFilterConfig,
+    StructuralMemoizationConfig,
     StructurePrediction,
     TargetProtein,
     ValidationResult,
@@ -52,6 +56,7 @@ from common import (
 from state_tree import (
     PipelineStateTree,
     NodeStatus,
+    StageType,
     create_state_tree,
 )
 from generators import (
@@ -73,6 +78,13 @@ from validators import (
     run_foldseek,
     save_decoys_to_cache,
     validate_sequences_parallel,
+)
+from optimizers import (
+    BeamPruner,
+    apply_sequence_filters,
+    filter_redundant_backbones,
+    filter_sequences_by_solubility,
+    filter_sequences_by_stickiness,
 )
 
 # Note: Local modules are added to all images in common.py via _add_local_modules()
@@ -476,6 +488,17 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     validation_results: list[ValidationResult] = []
     all_candidates: list[BinderCandidate] = []
     stage_metrics: list[dict] = []  # Track actual vs ceiling for each stage
+    
+    # Initialize beam pruner for tree width control
+    beam_pruner = BeamPruner(config.beam_pruning) if config.beam_pruning.enabled else None
+    
+    # Track optimization stats
+    optimization_stats = {
+        "structural_twins_skipped": 0,
+        "solubility_filtered": 0,
+        "stickiness_filtered": 0,
+        "beam_pruned": 0,
+    }
 
     # =========================================================================
     # Phase 1: Generation (Specificity)
@@ -495,13 +518,19 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             config.backbone_filter,
             dirs,
             max_boltz2_per_batch=max_boltz2_validations,
+            structural_memo_config=config.structural_memoization,
+            solubility_config=config.solubility_filter,
+            stickiness_config=config.stickiness_filter,
+            beam_pruner=beam_pruner,
+            state_tree=state_tree,
         )
         stage_duration = time.time() - stage_start
         print(f"Adaptive generation complete: {len(backbones)} backbones, {len(sequences)} sequences, {len(predictions)} validated")
         print(f"  └─ Total duration: {stage_duration:.1f}s")
         
-        # Add adaptive generation nodes to state tree
-        for backbone in backbones:
+        # Add adaptive generation nodes to state tree with batch tracking
+        backbone_batch_id = f"rfdiff_adaptive_{run_id}"
+        for i, backbone in enumerate(backbones):
             backbone_node_id = state_tree.add_backbone(
                 design_id=backbone.design_id,
                 parent_id=target_node_id,
@@ -510,8 +539,16 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 rfdiffusion_score=backbone.rfdiffusion_score,
             )
             state_tree.end_timing(backbone_node_id, NodeStatus.COMPLETED)
+            # Track batch consolidation for active observability
+            state_tree.set_batch_info(
+                node_id=backbone_node_id,
+                batch_id=backbone_batch_id,
+                batch_position=i,
+                batch_size=len(backbones),
+            )
         
-        for seq in sequences:
+        seq_batch_id = f"mpnn_adaptive_{run_id}"
+        for i, seq in enumerate(sequences):
             seq_node_id = state_tree.add_sequence(
                 sequence_id=seq.sequence_id,
                 backbone_id=seq.backbone_id,
@@ -525,8 +562,16 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 seq_node_id,
                 status=NodeStatus.COMPLETED if has_prediction else NodeStatus.FILTERED,
             )
+            # Track batch consolidation for active observability
+            state_tree.set_batch_info(
+                node_id=seq_node_id,
+                batch_id=seq_batch_id,
+                batch_position=i,
+                batch_size=len(sequences),
+            )
         
-        for pred in predictions:
+        val_batch_id = f"boltz2_adaptive_{run_id}"
+        for i, pred in enumerate(predictions):
             pred_node_id = state_tree.add_prediction(
                 prediction_id=pred.prediction_id,
                 sequence_id=pred.sequence_id,
@@ -541,6 +586,13 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 rmsd_to_design=pred.rmsd_to_design,
             )
             state_tree.end_timing(pred_node_id, NodeStatus.COMPLETED)
+            # Track batch consolidation for active observability
+            state_tree.set_batch_info(
+                node_id=pred_node_id,
+                batch_id=val_batch_id,
+                batch_position=i,
+                batch_size=len(predictions),
+            )
         
         # Set aggregate cost for adaptive stage
         state_tree.set_metrics(run_id, {
@@ -624,6 +676,41 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             kept_ids = {b.design_id for b in backbones}
             for bb_id in original_backbone_ids - kept_ids:
                 state_tree.set_status(bb_id, NodeStatus.FILTERED)
+        
+        # Step 1c: Structural Memoization - skip structural twins
+        if config.structural_memoization.enabled and backbones:
+            pre_memo_count = len(backbones)
+            pre_memo_ids = {b.design_id for b in backbones}
+            target_key = f"{config.target.pdb_id.upper()}_E{config.target.entity_id}"
+            backbones, fingerprints = filter_redundant_backbones(
+                backbones,
+                config.structural_memoization,
+                target_key,
+            )
+            post_memo_ids = {b.design_id for b in backbones}
+            twins_skipped = pre_memo_count - len(backbones)
+            optimization_stats["structural_twins_skipped"] = twins_skipped
+            
+            if twins_skipped > 0:
+                print(f"[OPT] Structural memoization: skipped {twins_skipped} structural twins")
+                
+                # Estimate cost savings per skipped backbone (ProteinMPNN + Boltz-2 + Chai-1 avoided)
+                mpnn_cost = 300 * MODAL_GPU_COST_PER_SEC.get("L4", 0.000222)
+                boltz2_cost = 900 * MODAL_GPU_COST_PER_SEC.get("A100", 0.000583) * config.proteinmpnn.num_sequences
+                chai1_cost = 900 * MODAL_GPU_COST_PER_SEC.get("A100", 0.000583) * config.proteinmpnn.num_sequences * config.foldseek.max_hits
+                saved_cost_per_bb = mpnn_cost + boltz2_cost + chai1_cost
+                saved_time_per_bb = 300 + (900 * config.proteinmpnn.num_sequences) * (1 + config.foldseek.max_hits)
+                
+                # Mark skipped twins in state tree
+                skipped_bb_ids = pre_memo_ids - post_memo_ids
+                for bb_id in skipped_bb_ids:
+                    state_tree.mark_skipped(
+                        node_id=bb_id,
+                        skipped_by="structural_memoization",
+                        skip_reason="Structural twin detected via 3Di fingerprint",
+                        saved_cost_usd=saved_cost_per_bb,
+                        saved_timing_sec=saved_time_per_bb,
+                    )
 
         validation_results.append(
             ValidationResult(
@@ -682,6 +769,75 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
 
         if not sequences:
             return _create_empty_result(run_id, config, validation_results, start_time, state_tree)
+        
+        # =========================================================================
+        # Sequence Filters (Lookahead + Stickiness + Beam Pruning)
+        # =========================================================================
+        # Apply all sequence-level filters before expensive structure prediction
+        pre_filter_count = len(sequences)
+        all_seq_ids_before = {s.sequence_id for s in sequences}
+        
+        sequences, filter_stats = apply_sequence_filters(
+            sequences,
+            config.solubility_filter,
+            config.stickiness_filter,
+            beam_pruner,
+        )
+        
+        # Update optimization stats
+        optimization_stats["solubility_filtered"] = filter_stats.get("solubility_filtered", 0)
+        optimization_stats["stickiness_filtered"] = filter_stats.get("stickiness_filtered", 0)
+        optimization_stats["beam_pruned"] = filter_stats.get("beam_pruned", 0)
+        
+        total_filtered = pre_filter_count - len(sequences)
+        if total_filtered > 0:
+            print(f"[OPT] Sequence filters: {pre_filter_count} → {len(sequences)} sequences")
+            print(f"  ├─ Solubility: {filter_stats.get('solubility_filtered', 0)} filtered ({filter_stats.get('solubility_timing_sec', 0):.2f}s)")
+            print(f"  ├─ Stickiness: {filter_stats.get('stickiness_filtered', 0)} filtered ({filter_stats.get('stickiness_timing_sec', 0):.2f}s)")
+            print(f"  └─ Beam pruning: {filter_stats.get('beam_pruned', 0)} pruned ({filter_stats.get('beam_pruning_timing_sec', 0):.2f}s)")
+            print(f"  Total filter time: {filter_stats.get('total_timing_sec', 0):.2f}s")
+            
+            # Estimate cost savings per filtered sequence (Boltz-2 + Chai-1 avoided)
+            # Boltz-2: ~$0.52/seq (900s * A100), Chai-1: ~$0.52/seq * num_decoys
+            boltz2_cost_per_seq = 900 * MODAL_GPU_COST_PER_SEC.get("A100", 0.000583)
+            chai1_cost_per_seq = 900 * MODAL_GPU_COST_PER_SEC.get("A100", 0.000583) * config.foldseek.max_hits
+            saved_cost_per_seq = boltz2_cost_per_seq + chai1_cost_per_seq
+            saved_time_per_seq = 900 + (900 * config.foldseek.max_hits)  # Boltz-2 + Chai-1
+            
+            # Update state tree for filtered sequences with precise filter tracking
+            filtered_ids_map = filter_stats.get("filtered_ids", {})
+            
+            # Track each filter's impact precisely
+            for filter_name, filtered_seq_ids in filtered_ids_map.items():
+                filter_reasons = {
+                    "solubility_filter": "Failed solubility check (net charge or pI out of range)",
+                    "stickiness_filter": "Failed SAP stickiness check (too hydrophobic)",
+                    "beam_pruning": "Pruned by beam search (not in top N by score)",
+                }
+                reason = filter_reasons.get(filter_name, "Failed lookahead filter")
+                
+                for seq_id in filtered_seq_ids:
+                    state_tree.mark_skipped(
+                        node_id=seq_id,
+                        skipped_by=filter_name,
+                        skip_reason=reason,
+                        saved_cost_usd=saved_cost_per_seq,
+                        saved_timing_sec=saved_time_per_seq,
+                    )
+            
+            # Record filter timing in state tree metrics
+            state_tree.set_metrics(run_id, {
+                "sequence_filter_timing": {
+                    "solubility_sec": filter_stats.get("solubility_timing_sec", 0),
+                    "stickiness_sec": filter_stats.get("stickiness_timing_sec", 0),
+                    "beam_pruning_sec": filter_stats.get("beam_pruning_timing_sec", 0),
+                    "total_sec": filter_stats.get("total_timing_sec", 0),
+                }
+            })
+        
+        if not sequences:
+            print("All sequences filtered by lookahead filters")
+            return _create_empty_result(run_id, config, validation_results, start_time, state_tree)
 
         # =========================================================================
         # Phase 2: Validation (Specificity) - Standard Mode
@@ -721,7 +877,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         ))
         
         # Add prediction nodes to state tree
-        for pred in predictions:
+        val_batch_id = f"boltz2_standard_{run_id}"
+        for i, pred in enumerate(predictions):
             pred_node_id = state_tree.add_prediction(
                 prediction_id=pred.prediction_id,
                 sequence_id=pred.sequence_id,
@@ -739,6 +896,13 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 pred_node_id,
                 status=NodeStatus.COMPLETED,
                 cost_usd=cost_estimate["boltz2"] / max(1, len(predictions)),
+            )
+            # Track batch consolidation for active observability
+            state_tree.set_batch_info(
+                node_id=pred_node_id,
+                batch_id=val_batch_id,
+                batch_position=i,
+                batch_size=len(predictions),
             )
         
         # Mark sequences that failed validation as filtered
@@ -817,6 +981,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         config.foldseek,
         f"{campaign_dir}/_decoys",
         use_mocks,
+        state_tree=state_tree,
     )
     stage_duration = time.time() - stage_start
     print(f"[DONE]  {time.strftime('%H:%M:%S')} | Output: {len(decoys)} decoys | Duration: {stage_duration:.1f}s")
@@ -1089,7 +1254,32 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     
     print(f"\nWall-clock runtime: {runtime_seconds:.1f}s")
     
-    # Add final run metrics to state tree
+    # Print optimization savings breakdown (active observability)
+    opt_savings = state_tree.get_optimization_savings()
+    total_opt_cost, total_opt_time = state_tree.get_total_optimization_savings()
+    batch_efficiency = state_tree.get_batch_efficiency()
+    
+    if opt_savings or batch_efficiency.get("total_batches", 0) > 0:
+        print("\n=== Optimization Impact (Active Observability) ===")
+        
+        if opt_savings:
+            print(f"{'Filter/Optimization':<25} {'Items':<10} {'Cost Saved':<15} {'Time Saved':<15}")
+            print("-" * 65)
+            for opt_type, metrics in opt_savings.items():
+                count = int(metrics["count"])
+                cost = metrics["cost_usd"]
+                timing = metrics["timing_sec"]
+                print(f"{opt_type:<25} {count:<10} ${cost:<14.3f} {timing:<14.1f}s")
+            print("-" * 65)
+            print(f"{'TOTAL':<25} {'':<10} ${total_opt_cost:<14.3f} {total_opt_time:<14.1f}s")
+        
+        if batch_efficiency.get("total_batches", 0) > 0:
+            print(f"\nBatch Consolidation:")
+            print(f"  Batches: {batch_efficiency['total_batches']} (avg size: {batch_efficiency['avg_batch_size']:.1f})")
+            print(f"  Cold starts avoided: {batch_efficiency['cold_starts_avoided']}")
+            print(f"  Amortization efficiency: {batch_efficiency['cold_start_amortization_pct']:.0f}%")
+    
+    # Add final run metrics to state tree (including optimization stats)
     state_tree.set_metrics(run_id, {
         "runtime_seconds": runtime_seconds,
         "total_candidates": len(all_candidates),
@@ -1099,6 +1289,14 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         "ceiling_cost_usd": ceiling_cost,
         "savings_usd": savings if savings > 0 else 0,
         "savings_pct": (savings / ceiling_cost * 100) if ceiling_cost > 0 and savings > 0 else 0,
+        # Optimization metrics
+        "optimizations": {
+            "structural_twins_skipped": optimization_stats.get("structural_twins_skipped", 0),
+            "solubility_filtered": optimization_stats.get("solubility_filtered", 0),
+            "stickiness_filtered": optimization_stats.get("stickiness_filtered", 0),
+            "beam_pruned": optimization_stats.get("beam_pruned", 0),
+            "beam_pruner_summary": beam_pruner.summary() if beam_pruner else None,
+        },
     })
 
     # Write inputs (info.json at PDB root, entity-specific config)
@@ -1168,6 +1366,11 @@ def _run_adaptive_generation(
     backbone_filter_config: BackboneFilterConfig,
     dirs: dict[str, str],
     max_boltz2_per_batch: Optional[int] = None,
+    structural_memo_config: Optional[StructuralMemoizationConfig] = None,
+    solubility_config: Optional[SolubilityFilterConfig] = None,
+    stickiness_config: Optional[StickinessFilterConfig] = None,
+    beam_pruner: Optional[BeamPruner] = None,
+    state_tree: Optional[PipelineStateTree] = None,
 ) -> tuple[list[BackboneDesign], list[SequenceDesign], list[StructurePrediction]]:
     """
     Adaptive generation with early termination using micro-batching (#3 optimization).
@@ -1241,6 +1444,18 @@ def _run_adaptive_generation(
             print(f"  All backbones filtered out in batch {batch_num}")
             continue
         
+        # Apply structural memoization to skip twins
+        if structural_memo_config and structural_memo_config.enabled:
+            target_key = f"{target.pdb_id.upper()}_E{target.entity_id}"
+            batch_backbones, _ = filter_redundant_backbones(
+                batch_backbones,
+                structural_memo_config,
+                target_key,
+            )
+            if not batch_backbones:
+                print(f"  All backbones were structural twins in batch {batch_num}")
+                continue
+        
         all_backbones.extend(batch_backbones)
         
         # =====================================================================
@@ -1261,6 +1476,23 @@ def _run_adaptive_generation(
             continue
         
         print(f"  Step 2: Designed {len(batch_sequences)} sequences ({len(batch_sequences)//len(batch_backbones)} per backbone)")
+        
+        # Apply sequence filters (solubility, stickiness, beam pruning)
+        pre_filter = len(batch_sequences)
+        if solubility_config or stickiness_config or beam_pruner:
+            batch_sequences, _ = apply_sequence_filters(
+                batch_sequences,
+                solubility_config or SolubilityFilterConfig(enabled=False),
+                stickiness_config or StickinessFilterConfig(enabled=False),
+                beam_pruner,
+            )
+            if pre_filter > len(batch_sequences):
+                print(f"  [OPT] Sequence filters: {pre_filter} → {len(batch_sequences)}")
+        
+        if not batch_sequences:
+            print(f"  All sequences filtered in batch {batch_num}")
+            continue
+        
         all_sequences.extend(batch_sequences)
         
         # =====================================================================
@@ -1300,6 +1532,10 @@ def _run_adaptive_generation(
         if len(validated_predictions) >= adaptive_config.min_validated_candidates:
             print(f"\n  ✓ Early termination: reached {len(validated_predictions)} validated candidates")
             break
+        
+        # Print live optimization stats every 2 batches for active observability
+        if state_tree and batch_num % 2 == 0:
+            state_tree.print_live_stats()
     
     # Summary
     total_backbones = len(all_backbones)
@@ -1379,6 +1615,7 @@ def _run_decoy_search(
     config: FoldSeekConfig,
     output_dir: str,
     use_mocks: bool,
+    state_tree: Optional[PipelineStateTree] = None,
 ) -> list[DecoyHit]:
     """Execute decoy search step with TTL caching via Modal Dict."""
     if use_mocks:
@@ -1392,7 +1629,26 @@ def _run_decoy_search(
                 # Verify PDB structures exist, re-download if missing
                 valid_decoys = [d for d in cached_decoys if os.path.exists(d.pdb_path)]
                 
+                # Estimate cost savings from cache hit (FoldSeek CPU time avoided)
+                foldseek_cost = 120 * MODAL_CPU_COST_PER_CORE_SEC * 2  # 120s, 2 cores
+                foldseek_time = 120  # seconds
+                
                 if len(valid_decoys) == len(cached_decoys):
+                    print(f"[OPT] FoldSeek cache HIT: saved {foldseek_time}s, ${foldseek_cost:.4f}")
+                    
+                    # Track cache hit in state tree
+                    if state_tree:
+                        cache_key = f"{target.pdb_id.upper()}_E{target.entity_id}"
+                        for decoy in cached_decoys:
+                            decoy_node_id = f"decoy_{decoy.decoy_id}"
+                            if decoy_node_id in state_tree.graph:
+                                state_tree.mark_cache_hit(
+                                    node_id=decoy_node_id,
+                                    cache_key=cache_key,
+                                    saved_cost_usd=foldseek_cost / len(cached_decoys),
+                                    saved_timing_sec=foldseek_time / len(cached_decoys),
+                                )
+                    
                     return cached_decoys
                 else:
                     # Re-download missing structures
@@ -1830,6 +2086,20 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
         print(f"  3. Increase budget: --max-budget {cost_total * 1.1:.2f}")
         print()
 
+    # Print optimization settings
+    print("OPTIMIZATIONS (State Tree Based)")
+    print("-" * 70)
+    opt_settings = [
+        ("Structural Memoization", config.structural_memoization.enabled, f"threshold={config.structural_memoization.similarity_threshold}"),
+        ("Solubility Filter", config.solubility_filter.enabled, f"pI={config.solubility_filter.min_isoelectric_point}-{config.solubility_filter.max_isoelectric_point}"),
+        ("Stickiness Filter (SAP)", config.stickiness_filter.enabled, f"max_sap={config.stickiness_filter.max_sap_score}"),
+        ("Beam Pruning", config.beam_pruning.enabled, f"max_nodes={config.beam_pruning.max_tree_nodes}, seqs/bb={config.beam_pruning.sequences_per_backbone}"),
+    ]
+    for name, enabled, params in opt_settings:
+        status = "✓" if enabled else "✗"
+        print(f"  {status} {name}: {params if enabled else 'disabled'}")
+    print()
+    
     print("To run: remove --dry-run flag")
     print()
 

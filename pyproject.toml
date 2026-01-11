@@ -20,6 +20,10 @@ dependencies = [
     "omegaconf>=2.3.0",
     "icecream>=2.1.0",
     "tqdm>=4.66.0",
+    "networkx>=3.0",
+    # Optimization dependencies
+    "peptides>=0.3.2",  # Solubility filtering (net charge, pI)
+    "biotite>=1.0.0",  # SAP stickiness calculation
 ]
 
 [project.urls]
@@ -37,7 +41,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-only-include = ["common.py", "generators.py", "validators.py", "pipeline.py"]
+only-include = ["common.py", "generators.py", "validators.py", "pipeline.py", "state_tree.py", "optimizers.py"]
 
 [tool.hatch.build.targets.sdist]
-include = ["*.py", "README.md", "LICENSE"]
+include = ["*.py", "README.md", "LICENSE", "SYSTEM.md"]

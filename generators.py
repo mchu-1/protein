@@ -438,20 +438,34 @@ def generate_sequences_parallel(
     backbones: list[BackboneDesign],
     config: ProteinMPNNConfig,
     base_output_dir: str,
+    batch_id: Optional[str] = None,
 ) -> list[SequenceDesign]:
     """
     Generate sequences for multiple backbones in parallel using starmap.
 
     This leverages Modal's starmap for efficient parallel execution.
+    Batch consolidation reduces cold-start costs by processing multiple
+    backbones in the same container pool.
 
     Args:
         backbones: List of backbone designs
         config: ProteinMPNN configuration
         base_output_dir: Base directory for outputs
+        batch_id: Optional batch ID for consolidation tracking
 
     Returns:
         Flattened list of all sequence designs
     """
+    import time
+    batch_start = time.time()
+    
+    # Generate batch ID if not provided
+    if batch_id is None:
+        batch_id = f"mpnn_batch_{int(batch_start * 1000)}"
+    
+    print(f"ProteinMPNN: generating sequences for {len(backbones)} backbones")
+    print(f"  Batch ID: {batch_id} | Batch size: {len(backbones)} (cold start amortized)")
+    
     # Prepare arguments for starmap
     args = [
         (backbone, config, f"{base_output_dir}/{backbone.design_id}")
@@ -465,6 +479,9 @@ def generate_sequences_parallel(
     all_sequences: list[SequenceDesign] = []
     for seq_list in all_results:
         all_sequences.extend(seq_list)
+    
+    batch_duration = time.time() - batch_start
+    print(f"  Batch complete: {len(all_sequences)} sequences in {batch_duration:.1f}s (avg {batch_duration/len(backbones):.1f}s/backbone)")
 
     return all_sequences
 

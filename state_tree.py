@@ -94,6 +94,12 @@ class StageType(str, Enum):
     FOLDSEEK = "foldseek"
     CHAI1 = "chai1"
     SCORING = "scoring"
+    
+    # Optimization stages (no GPU cost, but track impact)
+    STRUCTURAL_MEMOIZATION = "structural_memoization"
+    SOLUBILITY_FILTER = "solubility_filter"
+    STICKINESS_FILTER = "stickiness_filter"
+    BEAM_PRUNING = "beam_pruning"
 
 
 # =============================================================================
@@ -175,6 +181,33 @@ class CostTrace:
 
 
 @dataclass
+class OptimizationTrace:
+    """Tracks optimization decisions and their impact (active observability)."""
+    
+    # Filter decisions
+    skipped_by: Optional[str] = None  # Which filter skipped this node
+    skip_reason: Optional[str] = None  # Why it was skipped
+    
+    # Cost savings (downstream compute avoided)
+    saved_cost_usd: float = 0.0
+    saved_timing_sec: float = 0.0
+    
+    # Cache metrics (for memoization)
+    cache_hit: bool = False
+    cache_key: Optional[str] = None
+    
+    # Batch metrics (for consolidation)
+    batch_id: Optional[str] = None
+    batch_position: int = 0
+    batch_size: int = 1
+    
+    # Pruning metrics (for beam search)
+    pruned: bool = False
+    original_rank: Optional[int] = None
+    prune_score: Optional[float] = None
+
+
+@dataclass
 class NodeData:
     """Complete data for a node in the state tree."""
     
@@ -185,6 +218,9 @@ class NodeData:
     # Timing and cost
     timing: TimingTrace = field(default_factory=TimingTrace)
     cost: CostTrace = field(default_factory=CostTrace)
+    
+    # Optimization tracking (active observability)
+    optimization: OptimizationTrace = field(default_factory=OptimizationTrace)
     
     # Stage-specific data
     stage: Optional[StageType] = None
@@ -217,6 +253,7 @@ class NodeData:
                 "ceiling_cost_usd": self.cost.ceiling_cost_usd,
                 "ceiling_timing_sec": self.cost.ceiling_timing_sec,
             },
+            "optimization": asdict(self.optimization),
             "stage": self.stage.value if self.stage else None,
             "data": self.data,
             "parent_id": self.parent_id,
@@ -247,6 +284,11 @@ class PipelineStateTree:
         StageType.FOLDSEEK: {"gpu": None, "cpu_cores": 2, "memory_gib": 8},
         StageType.CHAI1: {"gpu": "A100-80GB", "cpu_cores": 4, "memory_gib": 32},
         StageType.SCORING: {"gpu": None, "cpu_cores": 1, "memory_gib": 4},
+        # Optimization stages (minimal CPU cost, but track for observability)
+        StageType.STRUCTURAL_MEMOIZATION: {"gpu": None, "cpu_cores": 1, "memory_gib": 2},
+        StageType.SOLUBILITY_FILTER: {"gpu": None, "cpu_cores": 1, "memory_gib": 1},
+        StageType.STICKINESS_FILTER: {"gpu": None, "cpu_cores": 1, "memory_gib": 1},
+        StageType.BEAM_PRUNING: {"gpu": None, "cpu_cores": 1, "memory_gib": 1},
     }
     
     def __init__(self, run_id: str, config: Optional[dict] = None):
@@ -569,6 +611,351 @@ class PipelineStateTree:
             node_data.cost.ceiling_timing_sec = ceiling_timing_sec
     
     # =========================================================================
+    # Optimization Tracking Methods (Active Observability)
+    # =========================================================================
+    
+    def mark_skipped(
+        self,
+        node_id: str,
+        skipped_by: str,
+        skip_reason: str,
+        saved_cost_usd: float = 0.0,
+        saved_timing_sec: float = 0.0,
+    ) -> None:
+        """
+        Mark a node as skipped by an optimization filter.
+        
+        Tracks the filter that skipped this node and estimates cost savings
+        from avoided downstream compute.
+        
+        Args:
+            node_id: ID of the skipped node
+            skipped_by: Name of the optimization (e.g., "solubility_filter")
+            skip_reason: Human-readable reason for skipping
+            saved_cost_usd: Estimated cost saved by skipping downstream
+            saved_timing_sec: Estimated time saved by skipping downstream
+        """
+        if node_id not in self.graph:
+            return
+        
+        node_data: NodeData = self.graph.nodes[node_id]["data"]
+        node_data.status = NodeStatus.FILTERED
+        node_data.optimization.skipped_by = skipped_by
+        node_data.optimization.skip_reason = skip_reason
+        node_data.optimization.saved_cost_usd = saved_cost_usd
+        node_data.optimization.saved_timing_sec = saved_timing_sec
+    
+    def mark_cache_hit(
+        self,
+        node_id: str,
+        cache_key: str,
+        saved_cost_usd: float = 0.0,
+        saved_timing_sec: float = 0.0,
+    ) -> None:
+        """
+        Mark a node as served from cache (structural memoization).
+        
+        Args:
+            node_id: ID of the cached node
+            cache_key: Cache key that was hit
+            saved_cost_usd: Cost saved by avoiding recomputation
+            saved_timing_sec: Time saved by avoiding recomputation
+        """
+        if node_id not in self.graph:
+            return
+        
+        node_data: NodeData = self.graph.nodes[node_id]["data"]
+        node_data.optimization.cache_hit = True
+        node_data.optimization.cache_key = cache_key
+        node_data.optimization.saved_cost_usd = saved_cost_usd
+        node_data.optimization.saved_timing_sec = saved_timing_sec
+    
+    def mark_pruned(
+        self,
+        node_id: str,
+        original_rank: int,
+        prune_score: float,
+        saved_cost_usd: float = 0.0,
+        saved_timing_sec: float = 0.0,
+    ) -> None:
+        """
+        Mark a node as pruned by beam search.
+        
+        Args:
+            node_id: ID of the pruned node
+            original_rank: Rank before pruning (1 = best)
+            prune_score: Score used for pruning decision
+            saved_cost_usd: Cost saved by pruning
+            saved_timing_sec: Time saved by pruning
+        """
+        if node_id not in self.graph:
+            return
+        
+        node_data: NodeData = self.graph.nodes[node_id]["data"]
+        node_data.status = NodeStatus.SKIPPED
+        node_data.optimization.pruned = True
+        node_data.optimization.original_rank = original_rank
+        node_data.optimization.prune_score = prune_score
+        node_data.optimization.saved_cost_usd = saved_cost_usd
+        node_data.optimization.saved_timing_sec = saved_timing_sec
+    
+    def set_batch_info(
+        self,
+        node_id: str,
+        batch_id: str,
+        batch_position: int,
+        batch_size: int,
+    ) -> None:
+        """
+        Set batch consolidation info for a node.
+        
+        Tracks which nodes were processed together in a batch for
+        cost amortization analysis.
+        
+        Args:
+            node_id: ID of the node
+            batch_id: Unique batch identifier
+            batch_position: Position within batch (0-indexed)
+            batch_size: Total items in batch
+        """
+        if node_id not in self.graph:
+            return
+        
+        node_data: NodeData = self.graph.nodes[node_id]["data"]
+        node_data.optimization.batch_id = batch_id
+        node_data.optimization.batch_position = batch_position
+        node_data.optimization.batch_size = batch_size
+    
+    def get_optimization_savings(self) -> dict[str, dict[str, float]]:
+        """
+        Get total savings from each optimization type.
+        
+        Returns:
+            Dict mapping optimization type to {cost_usd, timing_sec, count}
+        """
+        savings: dict[str, dict[str, float]] = {}
+        
+        for node_id in self.graph.nodes:
+            node_data: NodeData = self.graph.nodes[node_id]["data"]
+            opt = node_data.optimization
+            
+            # Track by filter type
+            if opt.skipped_by:
+                if opt.skipped_by not in savings:
+                    savings[opt.skipped_by] = {"cost_usd": 0.0, "timing_sec": 0.0, "count": 0}
+                savings[opt.skipped_by]["cost_usd"] += opt.saved_cost_usd
+                savings[opt.skipped_by]["timing_sec"] += opt.saved_timing_sec
+                savings[opt.skipped_by]["count"] += 1
+            
+            # Track cache hits
+            if opt.cache_hit:
+                if "cache_hit" not in savings:
+                    savings["cache_hit"] = {"cost_usd": 0.0, "timing_sec": 0.0, "count": 0}
+                savings["cache_hit"]["cost_usd"] += opt.saved_cost_usd
+                savings["cache_hit"]["timing_sec"] += opt.saved_timing_sec
+                savings["cache_hit"]["count"] += 1
+            
+            # Track pruning
+            if opt.pruned:
+                if "beam_pruning" not in savings:
+                    savings["beam_pruning"] = {"cost_usd": 0.0, "timing_sec": 0.0, "count": 0}
+                savings["beam_pruning"]["cost_usd"] += opt.saved_cost_usd
+                savings["beam_pruning"]["timing_sec"] += opt.saved_timing_sec
+                savings["beam_pruning"]["count"] += 1
+        
+        return savings
+    
+    def get_batch_efficiency(self) -> dict[str, Any]:
+        """
+        Calculate batch consolidation efficiency metrics.
+        
+        Returns:
+            Dict with batch stats including cold start amortization
+        """
+        batches: dict[str, list[str]] = {}
+        
+        for node_id in self.graph.nodes:
+            node_data: NodeData = self.graph.nodes[node_id]["data"]
+            opt = node_data.optimization
+            
+            if opt.batch_id:
+                if opt.batch_id not in batches:
+                    batches[opt.batch_id] = []
+                batches[opt.batch_id].append(node_id)
+        
+        if not batches:
+            return {"total_batches": 0, "avg_batch_size": 0, "cold_start_amortization": 0}
+        
+        batch_sizes = [len(nodes) for nodes in batches.values()]
+        avg_size = sum(batch_sizes) / len(batch_sizes) if batch_sizes else 0
+        
+        # Cold start amortization: how many cold starts were avoided
+        # (items_in_batches - num_batches) = items that shared a cold start
+        total_items = sum(batch_sizes)
+        cold_starts_avoided = total_items - len(batches)
+        
+        return {
+            "total_batches": len(batches),
+            "avg_batch_size": avg_size,
+            "max_batch_size": max(batch_sizes) if batch_sizes else 0,
+            "total_items_batched": total_items,
+            "cold_starts_avoided": cold_starts_avoided,
+            "cold_start_amortization_pct": (cold_starts_avoided / total_items * 100) if total_items > 0 else 0,
+        }
+    
+    def get_total_optimization_savings(self) -> tuple[float, float]:
+        """
+        Get total cost and time saved across all optimizations.
+        
+        Returns:
+            Tuple of (total_cost_saved_usd, total_time_saved_sec)
+        """
+        savings = self.get_optimization_savings()
+        total_cost = sum(s["cost_usd"] for s in savings.values())
+        total_time = sum(s["timing_sec"] for s in savings.values())
+        return total_cost, total_time
+    
+    def get_live_optimization_stats(self) -> dict[str, Any]:
+        """
+        Get live optimization statistics for dashboard display during run.
+        
+        This provides real-time visibility into how optimizations are
+        performing, enabling mid-run decision making.
+        
+        Returns:
+            Dict with live optimization metrics for active observability
+        """
+        now = time.time()
+        run_duration = self.get_run_duration()
+        
+        # Count nodes by status
+        pending_count = 0
+        running_count = 0
+        completed_count = 0
+        filtered_count = 0
+        skipped_count = 0
+        failed_count = 0
+        
+        # Optimization counters
+        solubility_filtered = 0
+        stickiness_filtered = 0
+        beam_pruned = 0
+        cache_hits = 0
+        structural_twins = 0
+        
+        # Cost tracking
+        actual_cost = 0.0
+        saved_cost = 0.0
+        ceiling_cost = 0.0
+        
+        for node_id in self.graph.nodes:
+            node_data: NodeData = self.graph.nodes[node_id]["data"]
+            
+            # Status counts
+            if node_data.status == NodeStatus.PENDING:
+                pending_count += 1
+            elif node_data.status == NodeStatus.RUNNING:
+                running_count += 1
+            elif node_data.status == NodeStatus.COMPLETED:
+                completed_count += 1
+            elif node_data.status == NodeStatus.FILTERED:
+                filtered_count += 1
+            elif node_data.status == NodeStatus.SKIPPED:
+                skipped_count += 1
+            elif node_data.status == NodeStatus.FAILED:
+                failed_count += 1
+            
+            # Optimization tracking
+            opt = node_data.optimization
+            if opt.skipped_by == "solubility_filter":
+                solubility_filtered += 1
+            elif opt.skipped_by == "stickiness_filter":
+                stickiness_filtered += 1
+            elif opt.skipped_by == "structural_memoization":
+                structural_twins += 1
+            
+            if opt.pruned:
+                beam_pruned += 1
+            if opt.cache_hit:
+                cache_hits += 1
+            
+            saved_cost += opt.saved_cost_usd
+            actual_cost += node_data.cost.estimated_cost_usd
+            ceiling_cost += node_data.cost.ceiling_cost_usd
+        
+        # Calculate efficiency metrics
+        total_nodes = len(self.graph.nodes)
+        efficiency_pct = (saved_cost / ceiling_cost * 100) if ceiling_cost > 0 else 0
+        
+        return {
+            "run_duration_sec": run_duration,
+            "timestamp": now,
+            # Node status (live)
+            "nodes": {
+                "total": total_nodes,
+                "pending": pending_count,
+                "running": running_count,
+                "completed": completed_count,
+                "filtered": filtered_count,
+                "skipped": skipped_count,
+                "failed": failed_count,
+            },
+            # Optimization effectiveness (live)
+            "optimizations": {
+                "solubility_filtered": solubility_filtered,
+                "stickiness_filtered": stickiness_filtered,
+                "beam_pruned": beam_pruned,
+                "cache_hits": cache_hits,
+                "structural_twins": structural_twins,
+                "total_optimized": solubility_filtered + stickiness_filtered + beam_pruned + cache_hits + structural_twins,
+            },
+            # Cost tracking (live)
+            "costs": {
+                "actual_usd": actual_cost,
+                "saved_usd": saved_cost,
+                "ceiling_usd": ceiling_cost,
+                "efficiency_pct": efficiency_pct,
+            },
+            # Batch consolidation (live)
+            "batching": self.get_batch_efficiency(),
+        }
+    
+    def print_live_stats(self) -> None:
+        """Print live optimization stats to console."""
+        stats = self.get_live_optimization_stats()
+        
+        print("\n" + "=" * 50)
+        print(f"LIVE OPTIMIZATION STATS ({stats['run_duration_sec']:.0f}s elapsed)")
+        print("=" * 50)
+        
+        nodes = stats["nodes"]
+        print(f"Nodes: {nodes['completed']}/{nodes['total']} complete, {nodes['running']} running, {nodes['pending']} pending")
+        print(f"  Filtered: {nodes['filtered']} | Skipped: {nodes['skipped']} | Failed: {nodes['failed']}")
+        
+        opt = stats["optimizations"]
+        print(f"\nOptimizations ({opt['total_optimized']} total):")
+        print(f"  Solubility filter: {opt['solubility_filtered']}")
+        print(f"  Stickiness filter: {opt['stickiness_filtered']}")
+        print(f"  Beam pruning: {opt['beam_pruned']}")
+        print(f"  Cache hits: {opt['cache_hits']}")
+        print(f"  Structural twins: {opt['structural_twins']}")
+        
+        costs = stats["costs"]
+        print(f"\nCosts:")
+        print(f"  Actual: ${costs['actual_usd']:.3f}")
+        print(f"  Saved: ${costs['saved_usd']:.3f}")
+        print(f"  Ceiling: ${costs['ceiling_usd']:.3f}")
+        print(f"  Efficiency: {costs['efficiency_pct']:.0f}%")
+        
+        batch = stats["batching"]
+        if batch.get("total_batches", 0) > 0:
+            print(f"\nBatching:")
+            print(f"  Batches: {batch['total_batches']} (avg size: {batch['avg_batch_size']:.1f})")
+            print(f"  Cold starts avoided: {batch['cold_starts_avoided']}")
+        
+        print("=" * 50 + "\n")
+    
+    # =========================================================================
     # Query Methods
     # =========================================================================
     
@@ -748,6 +1135,11 @@ class PipelineStateTree:
         root_data.timing.duration_sec = self.get_run_duration()
         root_data.status = NodeStatus.COMPLETED if success else NodeStatus.FAILED
         
+        # Get optimization savings
+        opt_savings = self.get_optimization_savings()
+        total_opt_cost, total_opt_time = self.get_total_optimization_savings()
+        batch_efficiency = self.get_batch_efficiency()
+        
         # Aggregate metrics - includes both passive (ceiling) and active (actual)
         root_data.metrics = {
             # Active observability (actual execution)
@@ -761,6 +1153,11 @@ class PipelineStateTree:
             # Savings (ceiling - actual)
             "cost_savings_usd": self.get_ceiling_cost() - self.get_total_cost(),
             "timing_savings_sec": self.get_ceiling_timing() - self.get_total_timing(),
+            # Optimization savings (active observability)
+            "optimization_savings": opt_savings,
+            "total_optimization_cost_saved_usd": total_opt_cost,
+            "total_optimization_time_saved_sec": total_opt_time,
+            "batch_efficiency": batch_efficiency,
             # Tree statistics
             "status_summary": self.get_status_summary(),
             "node_count": len(self.graph.nodes),
@@ -783,6 +1180,11 @@ class PipelineStateTree:
         for source, target in self.graph.edges:
             edges.append({"source": source, "target": target})
         
+        # Get optimization metrics
+        opt_savings = self.get_optimization_savings()
+        total_opt_cost, total_opt_time = self.get_total_optimization_savings()
+        batch_efficiency = self.get_batch_efficiency()
+        
         return {
             "run_id": self.run_id,
             "created_at": datetime.now().isoformat(),
@@ -793,6 +1195,11 @@ class PipelineStateTree:
             # Passive observability (pre-computed ceiling)
             "ceiling_timing_sec": self.get_ceiling_timing(),
             "ceiling_cost_usd": self.get_ceiling_cost(),
+            # Optimization observability
+            "optimization_savings": opt_savings,
+            "total_optimization_cost_saved_usd": total_opt_cost,
+            "total_optimization_time_saved_sec": total_opt_time,
+            "batch_efficiency": batch_efficiency,
             "nodes": nodes,
             "edges": edges,
             "summary": {
@@ -912,6 +1319,11 @@ class PipelineStateTree:
         actual_cost = self.get_total_cost()
         actual_timing = self.get_total_timing()
         
+        # Get optimization metrics
+        opt_savings = self.get_optimization_savings()
+        total_opt_cost, total_opt_time = self.get_total_optimization_savings()
+        batch_efficiency = self.get_batch_efficiency()
+        
         lines = [
             f"Pipeline State Tree: {self.run_id}",
             "=" * 60,
@@ -936,6 +1348,32 @@ class PipelineStateTree:
         else:
             lines.append(f"  Billable Time: {actual_timing:.1f}s")
             lines.append(f"  Total Cost: ${actual_cost:.3f}")
+        
+        # Optimization savings breakdown
+        if opt_savings:
+            lines.append("")
+            lines.append("Optimization Savings (Dynamic/Active):")
+            lines.append("-" * 50)
+            for opt_type, metrics in opt_savings.items():
+                count = int(metrics["count"])
+                cost = metrics["cost_usd"]
+                timing = metrics["timing_sec"]
+                lines.append(f"  {opt_type}:")
+                lines.append(f"    Items skipped: {count}")
+                lines.append(f"    Cost saved: ${cost:.3f}")
+                lines.append(f"    Time saved: {timing:.1f}s")
+            lines.append("-" * 50)
+            lines.append(f"  TOTAL: ${total_opt_cost:.3f} saved, {total_opt_time:.1f}s saved")
+        
+        # Batch efficiency
+        if batch_efficiency.get("total_batches", 0) > 0:
+            lines.append("")
+            lines.append("Batch Consolidation:")
+            lines.append(f"  Total batches: {batch_efficiency['total_batches']}")
+            lines.append(f"  Avg batch size: {batch_efficiency['avg_batch_size']:.1f}")
+            lines.append(f"  Items batched: {batch_efficiency['total_items_batched']}")
+            lines.append(f"  Cold starts avoided: {batch_efficiency['cold_starts_avoided']}")
+            lines.append(f"  Amortization: {batch_efficiency['cold_start_amortization_pct']:.0f}%")
         
         lines.append("")
         lines.append("Nodes by Type:")
@@ -1042,6 +1480,21 @@ def load_state_tree(json_path: str) -> PipelineStateTree:
         node_data.cost.estimated_cost_usd = cost.get("estimated_cost_usd", 0.0)
         node_data.cost.ceiling_cost_usd = cost.get("ceiling_cost_usd", 0.0)
         node_data.cost.ceiling_timing_sec = cost.get("ceiling_timing_sec", 0.0)
+        
+        # Restore optimization trace (active observability for optimizations)
+        opt = node_dict.get("optimization", {})
+        node_data.optimization.skipped_by = opt.get("skipped_by")
+        node_data.optimization.skip_reason = opt.get("skip_reason")
+        node_data.optimization.saved_cost_usd = opt.get("saved_cost_usd", 0.0)
+        node_data.optimization.saved_timing_sec = opt.get("saved_timing_sec", 0.0)
+        node_data.optimization.cache_hit = opt.get("cache_hit", False)
+        node_data.optimization.cache_key = opt.get("cache_key")
+        node_data.optimization.batch_id = opt.get("batch_id")
+        node_data.optimization.batch_position = opt.get("batch_position", 0)
+        node_data.optimization.batch_size = opt.get("batch_size", 1)
+        node_data.optimization.pruned = opt.get("pruned", False)
+        node_data.optimization.original_rank = opt.get("original_rank")
+        node_data.optimization.prune_score = opt.get("prune_score")
         
         tree.graph.add_node(node_id, data=node_data)
         tree._nodes_by_type[node_data.node_type].append(node_id)

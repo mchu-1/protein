@@ -1166,6 +1166,7 @@ def validate_sequences_parallel(
     target: TargetProtein,
     config: Boltz2Config,
     base_output_dir: str,
+    batch_id: Optional[str] = None,
 ) -> list[StructurePrediction]:
     """
     Validate multiple sequences in parallel using starmap.
@@ -1175,15 +1176,24 @@ def validate_sequences_parallel(
         target: Target protein
         config: Boltz-2 configuration
         base_output_dir: Base output directory
+        batch_id: Optional batch ID for consolidation tracking
 
     Returns:
         List of successful structure predictions
     """
+    import time
+    batch_start = time.time()
+    
+    # Generate batch ID if not provided
+    if batch_id is None:
+        batch_id = f"boltz2_batch_{int(batch_start * 1000)}"
+    
     # Print common parameters once
     if sequences:
         target_len = len(_extract_sequence_from_pdb(target.pdb_path, target.chain_id))
         binder_len = len(sequences[0].sequence)
         print(f"Boltz-2: validating {len(sequences)} sequences (target: {target_len} res, binder: {binder_len} res)")
+        print(f"  Batch ID: {batch_id} | Batch size: {len(sequences)} (cold start amortized)")
 
     # Prepare arguments for starmap
     args = [
@@ -1193,6 +1203,10 @@ def validate_sequences_parallel(
 
     # Use starmap for parallel execution
     all_results = list(run_boltz2.starmap(args))
+    
+    batch_duration = time.time() - batch_start
+    successful = sum(1 for r in all_results if r is not None)
+    print(f"  Batch complete: {successful}/{len(sequences)} in {batch_duration:.1f}s (avg {batch_duration/len(sequences):.1f}s/seq)")
 
     # Filter None results
     return [r for r in all_results if r is not None]

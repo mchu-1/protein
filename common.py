@@ -30,6 +30,10 @@ data_volume = modal.Volume.from_name("binder-data", create_if_missing=True)
 # Uses Modal Dict for cloud-native caching with automatic LRU-like expiry
 foldseek_cache = modal.Dict.from_name("foldseek-decoy-cache", create_if_missing=True)
 
+# Cache for 3Di structural fingerprints (structural memoization)
+# Key: PDB ID + entity ID, Value: {backbone_hash: 3di_fingerprint}
+structural_cache = modal.Dict.from_name("structural-3di-cache", create_if_missing=True)
+
 WEIGHTS_PATH = "/weights"
 DATA_PATH = "/data"
 
@@ -49,7 +53,9 @@ base_image = (
         "biopython>=1.81",
         "pydantic>=2.0.0",
         "scipy>=1.11.0",
-        "networkx>=3.0",  # State tree graph representation
+        "networkx>=3.0",  # State tree graph representation & beam pruning
+        "peptides>=0.3.2",  # Solubility filtering (net charge, pI)
+        "biotite>=1.0.0",  # SAP stickiness calculation
     )
 )
 
@@ -187,6 +193,7 @@ def _add_local_modules(image: modal.Image) -> modal.Image:
         .add_local_file("generators.py", remote_path="/root/generators.py")
         .add_local_file("validators.py", remote_path="/root/validators.py")
         .add_local_file("state_tree.py", remote_path="/root/state_tree.py")
+        .add_local_file("optimizers.py", remote_path="/root/optimizers.py")
     )
 
 
@@ -384,6 +391,72 @@ class AdaptiveGenerationConfig(BaseModel):
     max_batches: int = Field(default=3, ge=1, le=10, description="Maximum micro-batches before stopping")
 
 
+class SolubilityFilterConfig(BaseModel):
+    """Configuration for lookahead solubility filtering (Post-ProteinMPNN).
+    
+    Uses peptides.py to check net charge and isoelectric point (pI) to ensure
+    good solubility of generated sequences before expensive structure prediction.
+    
+    Economics: Prunes ~20-40% of sequences that would likely aggregate in solution,
+    saving Boltz-2 and Chai-1 compute costs.
+    """
+
+    enabled: bool = Field(default=True, description="Enable solubility pre-screening")
+    min_net_charge_ph7: float = Field(default=-5.0, description="Minimum net charge at pH 7 (too negative = aggregation)")
+    max_net_charge_ph7: float = Field(default=10.0, description="Maximum net charge at pH 7 (too positive = aggregation)")
+    min_isoelectric_point: float = Field(default=5.0, description="Minimum pI (avoid extremes)")
+    max_isoelectric_point: float = Field(default=10.0, description="Maximum pI (avoid extremes)")
+
+
+class StructuralMemoizationConfig(BaseModel):
+    """Configuration for structural memoization via 3Di hashing (Post-RFDiffusion).
+    
+    Uses mini3di (ported from Foldseek) to generate structural fingerprints.
+    Detects 'structural twins' from different random seeds and skips redundant
+    sequence/folding computations.
+    
+    Economics: Can skip 10-30% of redundant backbone processing when generating
+    many designs from the same target.
+    """
+
+    enabled: bool = Field(default=True, description="Enable structural memoization")
+    similarity_threshold: float = Field(default=0.9, ge=0.5, le=1.0, description="3Di similarity threshold to consider as 'twin'")
+    cache_ttl_hours: int = Field(default=168, ge=1, description="TTL for structural cache (default: 7 days)")
+
+
+class BeamPruningConfig(BaseModel):
+    """Configuration for greedy beam pruning (Throughout pipeline).
+    
+    Uses NetworkX-based dynamic tree pruning with beam search to limit fan-out.
+    Ensures 1 backbone only sprouts N sequences instead of unlimited, keeping
+    total tree nodes under control.
+    
+    Economics: Critical for cost control. Without pruning, costs scale O(n³).
+    """
+
+    enabled: bool = Field(default=True, description="Enable beam pruning")
+    max_tree_nodes: int = Field(default=500, ge=50, le=2000, description="Maximum total nodes in state tree")
+    sequences_per_backbone: int = Field(default=5, ge=1, le=20, description="Max sequences to spawn per backbone")
+    predictions_per_sequence: int = Field(default=1, ge=1, le=5, description="Max predictions per sequence (usually 1)")
+    prune_by_score: bool = Field(default=True, description="Prune lowest-scoring siblings when limit hit")
+
+
+class StickinessFilterConfig(BaseModel):
+    """Configuration for SAP (Spatial Aggregation Propensity) stickiness check.
+    
+    Uses biotite.structure.CellList for efficient spatial queries to compute
+    surface-exposed hydrophobic patches. Prunes binders that are generally
+    'sticky' and will aggregate in a test tube.
+    
+    Economics: Filters out ~10-20% of sequences that would fail wet-lab validation
+    before expensive affinity checks (Chai-1).
+    """
+
+    enabled: bool = Field(default=True, description="Enable SAP stickiness filtering")
+    max_sap_score: float = Field(default=0.15, ge=0.0, le=1.0, description="Maximum SAP score (lower = less sticky)")
+    hydrophobic_residues: str = Field(default="AVILMFYW", description="Residues considered hydrophobic")
+
+
 # =============================================================================
 # Stage Limits Configuration
 # =============================================================================
@@ -476,6 +549,12 @@ class PipelineConfig(BaseModel):
     # Cost optimization configs
     backbone_filter: BackboneFilterConfig = Field(default_factory=BackboneFilterConfig, description="Backbone quality pre-screening")
     adaptive: AdaptiveGenerationConfig = Field(default_factory=AdaptiveGenerationConfig, description="Adaptive generation with early termination")
+    
+    # New optimizations based on state tree
+    solubility_filter: SolubilityFilterConfig = Field(default_factory=SolubilityFilterConfig, description="Lookahead solubility filtering")
+    structural_memoization: StructuralMemoizationConfig = Field(default_factory=StructuralMemoizationConfig, description="3Di structural hashing for deduplication")
+    beam_pruning: BeamPruningConfig = Field(default_factory=BeamPruningConfig, description="Greedy beam pruning to limit tree size")
+    stickiness_filter: StickinessFilterConfig = Field(default_factory=StickinessFilterConfig, description="SAP stickiness check")
 
     # Stage limits (timeouts and max designs per stage)
     limits: PipelineLimits = Field(default_factory=PipelineLimits, description="Per-stage timeout and design limits")
