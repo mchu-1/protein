@@ -56,6 +56,7 @@ base_image = (
         "networkx>=3.0",  # State tree graph representation & beam pruning
         "peptides>=0.3.2",  # Solubility filtering (net charge, pI)
         "biotite>=1.0.0",  # SAP stickiness calculation
+        "pyhmmer>=0.10.0",  # Novelty check vs UniRef50 (phmmer mode)
     )
 )
 
@@ -350,11 +351,20 @@ class ClusterConfig(BaseModel):
 
 
 class NoveltyConfig(BaseModel):
-    """Configuration for novelty check via pyhmmer vs UniRef50."""
+    """Configuration for novelty check via pyhmmer vs UniRef50.
+    
+    Uses UniRef50 sequence database to filter sequences with high similarity to
+    existing proteins. Critical for:
+    - Patentability (IP): Avoid sequences too similar to known/patented proteins
+    - Safety (Immunogenicity): Flag sequences similar to human proteins
+    
+    UniRef50 is a ~12GB compressed / ~50GB uncompressed FASTA database.
+    It is persisted in a Modal Volume and downloaded only once.
+    """
 
-    database: str = Field(default="uniref50", description="HMM database for novelty check")
-    max_evalue: float = Field(default=1e-5, ge=0.0, description="Max E-value to consider a hit (lower = stricter)")
+    max_evalue: float = Field(default=1e-6, ge=0.0, description="Max E-value to consider a hit (lower = stricter)")
     enabled: bool = Field(default=True, description="Enable novelty filtering")
+    auto_download: bool = Field(default=True, description="Auto-download UniRef50 database if not present")
 
 
 class ScoringWeights(BaseModel):

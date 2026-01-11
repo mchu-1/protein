@@ -23,3 +23,6 @@ tqdm>=4.66.0
 
 # Pipeline state tracking and observability
 networkx>=3.0
+
+# Novelty check
+pyhmmer>=0.10.0

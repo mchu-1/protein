@@ -957,7 +957,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         novel_sequences = check_novelty(
             [s for s in sequences if s.sequence_id in pred_seq_ids],
             max_evalue=config.novelty.max_evalue,
-            database=config.novelty.database,
+            auto_download=config.novelty.auto_download,
         )
         # Filter predictions to only novel sequences
         novel_seq_ids = {s.sequence_id for s in novel_sequences}

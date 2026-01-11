@@ -79,11 +79,12 @@ cluster:
   tm_threshold: 0.7            # TM-score threshold for clustering
   select_best: true            # Select best representative per cluster
 
-# Novelty check vs UniRef50
+# Novelty check vs UniRef50 (phmmer sequence-vs-sequence search)
+# First run downloads ~12GB compressed → ~50GB uncompressed (persisted in Modal Volume)
 novelty:
-  database: "uniref50"         # HMM database for novelty check
-  max_evalue: 0.00001          # Max E-value to consider a hit
+  max_evalue: 0.000001         # Max E-value to consider a hit (1e-6, stricter for IP/safety)
   enabled: true                # Enable novelty filtering
+  auto_download: true          # Auto-download UniRef50 database if not present
 
 # =============================================================================
 # Scoring Weights

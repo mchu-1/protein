@@ -46,7 +46,7 @@ Based on **AlphaProteo SI 2.2** optimized metrics.
 | Step | Method | Purpose |
 |------|--------|---------|
 | **Cluster** | TM-score > 0.7 | **Diversify.** Select best representative per cluster. |
-| **Novelty** | pyhmmer vs UniRef50 | **Ensure novelty.** Filter sequences with existing homologs. |
+| **Novelty** | pyhmmer vs UniRef50 | **Ensure novelty.** Filter sequences with high similarity to existing proteins (IP/safety). |
 
 ### Off-Target Screening (Chai-1 Single-Sequence Mode)
 

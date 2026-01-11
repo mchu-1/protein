@@ -1688,22 +1688,84 @@ def _calculate_tm_score(pdb1: str, pdb2: str, chain_id: str = "B") -> float:
 # Novelty Check - pyhmmer vs UniRef50 (AlphaProteo Step 5)
 # =============================================================================
 
+# UniRef50 sequence database URL (UniProt FTP)
+# ~12GB compressed, ~50GB uncompressed - persisted in Modal Volume
+UNIREF50_URL = "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz"
+UNIREF50_DB_PATH = "/data/uniref50/uniref50.fasta"
+
+
+def _ensure_uniref50_database(auto_download: bool = True) -> str | None:
+    """
+    Ensure UniRef50 FASTA database is available, downloading if necessary.
+    
+    UniRef50 is persisted in the Modal data volume and only downloaded once.
+    This is a ~12GB download that expands to ~50GB.
+    
+    Args:
+        auto_download: If True, download database if not present
+        
+    Returns:
+        Path to the database, or None if unavailable
+    """
+    import gzip
+    import shutil
+    import urllib.request
+    
+    if os.path.exists(UNIREF50_DB_PATH):
+        return UNIREF50_DB_PATH
+    
+    if not auto_download:
+        print(f"Warning: UniRef50 database not found at {UNIREF50_DB_PATH}")
+        return None
+    
+    # Create directory if needed
+    os.makedirs(os.path.dirname(UNIREF50_DB_PATH), exist_ok=True)
+    
+    gz_path = UNIREF50_DB_PATH + ".gz"
+    
+    try:
+        print(f"Downloading UniRef50 database from {UNIREF50_URL}...")
+        print("  ⚠️  One-time download: ~12GB compressed → ~50GB uncompressed")
+        print("  ⚠️  This may take 10-30 minutes depending on network speed")
+        urllib.request.urlretrieve(UNIREF50_URL, gz_path)
+        
+        print("  Extracting database (streaming to minimize RAM usage)...")
+        with gzip.open(gz_path, 'rb') as f_in:
+            with open(UNIREF50_DB_PATH, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        
+        # Clean up compressed file to save ~12GB
+        os.remove(gz_path)
+        print(f"  UniRef50 database ready at {UNIREF50_DB_PATH}")
+        return UNIREF50_DB_PATH
+        
+    except Exception as e:
+        print(f"Warning: Failed to download UniRef50 database: {e}")
+        # Clean up partial downloads
+        if os.path.exists(gz_path):
+            os.remove(gz_path)
+        if os.path.exists(UNIREF50_DB_PATH):
+            os.remove(UNIREF50_DB_PATH)
+        return None
+
 
 def check_novelty(
     sequences: list[SequenceDesign],
-    max_evalue: float = 1e-5,
-    database: str = "uniref50",
+    max_evalue: float = 1e-6,
+    auto_download: bool = True,
 ) -> list[SequenceDesign]:
     """
-    Filter sequences for novelty using pyhmmer against UniRef50.
+    Filter sequences for novelty using pyhmmer phmmer against UniRef50.
     
-    Sequences with significant hits (E-value < threshold) are filtered out
-    as they likely resemble existing proteins.
+    Uses sequence-vs-sequence search (phmmer mode) to find sequences with
+    high similarity to known proteins in UniRef50. Critical for:
+    - Patentability (IP): Avoid sequences too similar to known/patented proteins
+    - Safety (Immunogenicity): Flag sequences similar to human proteins
     
     Args:
         sequences: List of designed sequences
-        max_evalue: Maximum E-value to consider a hit (lower = stricter)
-        database: HMM database to search (default: uniref50)
+        max_evalue: Maximum E-value to consider a hit (lower = stricter, default 1e-6)
+        auto_download: Auto-download UniRef50 database if not present
     
     Returns:
         List of novel sequences (no significant UniRef50 hits)
@@ -1713,48 +1775,56 @@ def check_novelty(
     
     try:
         import pyhmmer
-        from pyhmmer.easel import TextSequence, Alphabet
-        from pyhmmer.plan7 import HMMFile
+        from pyhmmer.easel import TextSequence, Alphabet, SequenceFile
+        from pyhmmer.plan7 import Pipeline
         
-        alphabet = Alphabet.amino()
-        novel_sequences = []
-        
-        # Path to UniRef50 HMM database (should be pre-downloaded)
-        hmm_db_path = f"/weights/hmm/{database}.hmm"
-        
-        if not os.path.exists(hmm_db_path):
-            print(f"Warning: HMM database not found at {hmm_db_path}, skipping novelty check")
+        # Ensure database is available (persisted in Modal Volume)
+        db_path = _ensure_uniref50_database(auto_download=auto_download)
+        if db_path is None:
+            print("Warning: UniRef50 database unavailable, skipping novelty check")
             return sequences
         
-        with HMMFile(hmm_db_path) as hmm_file:
-            hmms = list(hmm_file)
+        alphabet = Alphabet.amino()
         
+        print(f"  Scanning {len(sequences)} sequences against UniRef50 (phmmer mode)...")
+        print(f"  E-value threshold: {max_evalue:.0e}")
+        
+        # Track which sequences have hits
+        seq_hits: dict[str, tuple[str, float]] = {}  # seq_id -> (hit_name, evalue)
+        
+        # Process each query sequence
         for seq in sequences:
-            # Create query sequence
+            # Create digital query sequence
             query = TextSequence(
                 name=seq.sequence_id.encode(),
                 sequence=seq.sequence.encode(),
-            )
-            digital_seq = query.digitize(alphabet)
+            ).digitize(alphabet)
             
-            # Search against HMM database
-            hits_found = False
-            for hmm in hmms:
-                pipeline = pyhmmer.plan7.Pipeline(alphabet)
-                hits = pipeline.search_hmm(hmm, [digital_seq])
+            # Create pipeline for this search
+            pipeline = Pipeline(alphabet)
+            
+            # Stream through UniRef50 FASTA - avoids loading 50GB into RAM
+            # This is phmmer mode: sequence vs sequence database
+            with SequenceFile(db_path, digital=True, alphabet=alphabet) as seq_file:
+                hits = pipeline.search_seq(query, seq_file)
                 
+                # Check for significant hits
                 for hit in hits:
                     if hit.evalue < max_evalue:
-                        hits_found = True
-                        print(f"  {seq.sequence_id}: hit {hit.name.decode()} (E={hit.evalue:.2e}) - NOT NOVEL")
-                        break
-                
-                if hits_found:
-                    break
-            
-            if not hits_found:
+                        seq_hits[seq.sequence_id] = (hit.name.decode(), hit.evalue)
+                        break  # One significant hit is enough to flag as non-novel
+        
+        # Separate novel from non-novel sequences
+        novel_sequences = []
+        for seq in sequences:
+            if seq.sequence_id in seq_hits:
+                hit_name, evalue = seq_hits[seq.sequence_id]
+                # Truncate long UniRef IDs for display
+                display_name = hit_name[:40] + "..." if len(hit_name) > 40 else hit_name
+                print(f"  ✗ {seq.sequence_id}: hit {display_name} (E={evalue:.2e}) - NOT NOVEL")
+            else:
                 novel_sequences.append(seq)
-                print(f"  {seq.sequence_id}: no significant hits - NOVEL")
+                print(f"  ✓ {seq.sequence_id}: no significant hits - NOVEL")
         
         print(f"Novelty: {len(novel_sequences)}/{len(sequences)} sequences are novel (E > {max_evalue})")
         return novel_sequences

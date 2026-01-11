@@ -24,6 +24,8 @@ dependencies = [
     # Optimization dependencies
     "peptides>=0.3.2",  # Solubility filtering (net charge, pI)
     "biotite==1.2.0",  # SAP stickiness calculation (pinned for reliable download)
+    # Novelty check
+    "pyhmmer>=0.10.0",  # phmmer search vs UniRef50 for novelty filtering
 ]
 
 [project.urls]

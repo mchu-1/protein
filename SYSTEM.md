@@ -81,7 +81,7 @@ Based on **AlphaProteo SI 2.2** optimized metrics.
 | Step | Method | Purpose |
 |------|--------|---------|
 | Cluster | TM-score > 0.7 | Diversify binders. |
-| Novelty | pyhmmer vs UniRef50 | Filter existing homologs. |
+| Novelty | pyhmmer vs UniRef50 | Filter sequences similar to existing proteins (IP/safety). |
 
 ### PPI Quality Score
 
