@@ -1175,10 +1175,24 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         # Get cross-reactivity results for this sequence
         cr_results = cross_reactivity_results.get(sequence.sequence_id, [])
 
+        # Get Chai-1 positive control result if available
+        pc_result = positive_control_results.get(sequence.sequence_id)
+        chai1_specificity_score = None
+        if pc_result:
+            chai1_ppi = pc_result.ppi_score
+            chai1_specificity_score = chai1_ppi * 100 if chai1_ppi > 0 else pc_result.plddt_interface
+
         # Compute specificity using PPI score: 0.8 * ipTM + 0.2 * pTM
         # Scale to 0-100 for compatibility with existing scoring
         ppi_score = prediction.ppi_score  # Range [0, 1]
-        specificity_score = ppi_score * 100 if ppi_score > 0 else prediction.plddt_interface
+        boltz_specificity = ppi_score * 100 if ppi_score > 0 else prediction.plddt_interface
+        specificity_score = boltz_specificity
+
+        # Use consensus specificity (min of Boltz-2 and Chai-1) if available to avoid hallucinations
+        consensus_specificity = specificity_score
+        if chai1_specificity_score is not None and chai1_specificity_score > 0:
+            consensus_specificity = min(specificity_score, chai1_specificity_score)
+            print(f"  Consensus scoring for {sequence.sequence_id}: Boltz={specificity_score:.1f}, Chai={chai1_specificity_score:.1f} -> {consensus_specificity:.1f}")
 
         # Selectivity: penalize if binder binds any decoy (using decoy PPI scores)
         max_decoy_ppi = 0.0
@@ -1191,9 +1205,9 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 max_decoy_ppi = max(abs(r.predicted_affinity) / 10 for r in cr_results)
         selectivity_score = 100.0 - max_decoy_ppi * 100  # Penalize high decoy PPI
 
-        # Final score using S(x) = α * PPI_target - β * max(PPI_decoy)
+        # Final score using S(x) = α * MIN(PPI_target_Boltz, PPI_target_Chai) - β * max(PPI_decoy)
         final_score = (
-            config.scoring.alpha * specificity_score
+            config.scoring.alpha * consensus_specificity
             - config.scoring.beta * max_decoy_ppi * 100
         )
 
@@ -1210,6 +1224,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             structure_prediction=prediction,
             decoy_results=cr_results,
             specificity_score=specificity_score,
+            chai1_specificity_score=chai1_specificity_score,
             selectivity_score=selectivity_score,
             final_score=final_score,
         )
@@ -2014,7 +2029,7 @@ def _write_metrics_csv(metrics_dir: str, candidates: list[BinderCandidate]) -> N
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "candidate_id", "sequence", "ppi_score", "iptm", "ptm",
+            "candidate_id", "sequence", "ppi_score", "iptm", "ptm", "chai1_ppi",
             "pae_interaction", "ptm_binder", "rmsd", "specificity", "selectivity", "final_score"
         ])
         for c in candidates:
@@ -2025,6 +2040,7 @@ def _write_metrics_csv(metrics_dir: str, candidates: list[BinderCandidate]) -> N
                 f"{pred.ppi_score:.3f}" if pred.ppi_score else "",
                 f"{pred.iptm:.3f}" if pred.iptm else "",
                 f"{pred.ptm:.3f}" if pred.ptm else "",
+                f"{c.chai1_specificity_score/100:.3f}" if c.chai1_specificity_score else "",
                 f"{pred.pae_interaction:.2f}" if pred.pae_interaction else "",
                 f"{pred.ptm_binder:.3f}" if pred.ptm_binder else "",
                 f"{pred.rmsd_to_design:.2f}" if pred.rmsd_to_design else "",

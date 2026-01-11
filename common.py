@@ -711,7 +711,8 @@ class BinderCandidate(BaseModel):
     )
 
     # Computed scores
-    specificity_score: float = Field(..., description="Target binding score (higher = better)")
+    specificity_score: float = Field(..., description="Target binding score (higher = better, Boltz-2)")
+    chai1_specificity_score: Optional[float] = Field(None, description="Target binding score (higher = better, Chai-1)")
     selectivity_score: float = Field(..., description="Off-target avoidance (higher = better)")
     final_score: float = Field(..., description="Combined S(x) score")
 
@@ -719,13 +720,22 @@ class BinderCandidate(BaseModel):
         """
         Compute the selection function S(x).
         
-        S(x) = α * pLDDT_interface(x) - β * max_{d ∈ D}(Affinity(x, d))
+        S(x) = α * MIN(pLDDT_interface_Boltz, pLDDT_interface_Chai) - β * max_{d ∈ D}(Affinity(x, d))
+        
+        Uses the minimum specificity score between Boltz-2 and Chai-1 (if available)
+        to be conservative and avoid hallucinations from a single model.
         """
+        # Specificity: Use min of Boltz-2 and Chai-1 (if available)
+        # This provides a "consensus" confidence check
+        spec = self.specificity_score
+        if self.chai1_specificity_score is not None and self.chai1_specificity_score > 0:
+            spec = min(self.specificity_score, self.chai1_specificity_score)
+
         max_decoy_affinity = 0.0
         if self.decoy_results:
             max_decoy_affinity = max(r.predicted_affinity for r in self.decoy_results)
 
-        return alpha * self.specificity_score - beta * max_decoy_affinity
+        return alpha * spec - beta * max_decoy_affinity
 
 
 class ValidationResult(BaseModel):

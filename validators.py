@@ -1277,7 +1277,12 @@ def check_cross_reactivity_parallel(
             if result is not None:
                 positive_control_results[result.binder_id] = result
                 status = "✓ BINDS" if result.plddt_interface > 50 else "✗ NO BINDING"
-                print(f"  {result.binder_id}: pLDDT={result.plddt_interface:.1f} {status}")
+                metrics_str = f"pLDDT={result.plddt_interface:.1f}"
+                if result.iptm is not None:
+                    metrics_str += f", ipTM={result.iptm:.3f}"
+                if result.ptm is not None:
+                    metrics_str += f", pTM={result.ptm:.3f}"
+                print(f"  {result.binder_id}: {metrics_str} {status}")
         
         print(f"  Positive control: {len(positive_control_results)}/{len(sequences)} sequences bind target")
     
