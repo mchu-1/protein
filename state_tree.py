@@ -610,6 +610,64 @@ class PipelineStateTree:
             node_data.cost.ceiling_cost_usd = ceiling_cost_usd
             node_data.cost.ceiling_timing_sec = ceiling_timing_sec
     
+    def set_ceiling_from_stage(
+        self,
+        node_id: str,
+        timeout_sec: float,
+        gpu_cost_per_sec: Optional[dict[str, float]] = None,
+        cpu_cost_per_core_sec: float = 0.0000131,
+        memory_cost_per_gib_sec: float = 0.00000222,
+    ) -> None:
+        """
+        Set ceiling cost for a node based on its stage and configured timeout.
+        
+        Uses the node's assigned stage to look up resource configuration,
+        then calculates the ceiling cost using timeout * resource_rates.
+        
+        Args:
+            node_id: ID of the node
+            timeout_sec: Configured timeout in seconds (from config.limits)
+            gpu_cost_per_sec: Optional GPU pricing dict (defaults to Modal rates)
+            cpu_cost_per_core_sec: CPU cost per core-second
+            memory_cost_per_gib_sec: Memory cost per GiB-second
+        """
+        if node_id not in self.graph:
+            return
+        
+        node_data: NodeData = self.graph.nodes[node_id]["data"]
+        if not node_data.stage or node_data.stage not in self.STAGE_RESOURCES:
+            return
+        
+        # Use default GPU pricing if not provided
+        if gpu_cost_per_sec is None:
+            gpu_cost_per_sec = {
+                "H100": 0.001097,
+                "A100-80GB": 0.000694,
+                "A100": 0.000583,
+                "L40S": 0.000542,
+                "A10G": 0.000306,
+                "L4": 0.000222,
+                "T4": 0.000164,
+            }
+        
+        resources = self.STAGE_RESOURCES[node_data.stage]
+        
+        # GPU cost
+        gpu_cost = 0.0
+        if resources["gpu"] and resources["gpu"] in gpu_cost_per_sec:
+            gpu_cost = gpu_cost_per_sec[resources["gpu"]] * timeout_sec
+        
+        # CPU cost
+        cpu_cost = cpu_cost_per_core_sec * resources["cpu_cores"] * timeout_sec
+        
+        # Memory cost
+        mem_cost = memory_cost_per_gib_sec * resources["memory_gib"] * timeout_sec
+        
+        ceiling_cost = gpu_cost + cpu_cost + mem_cost
+        
+        node_data.cost.ceiling_cost_usd = ceiling_cost
+        node_data.cost.ceiling_timing_sec = timeout_sec
+    
     # =========================================================================
     # Optimization Tracking Methods (Active Observability)
     # =========================================================================
@@ -884,8 +942,16 @@ class PipelineStateTree:
             ceiling_cost += node_data.cost.ceiling_cost_usd
         
         # Calculate efficiency metrics
+        # Efficiency = percentage of ceiling cost that was NOT spent (savings / ceiling)
+        # This aligns with "under-ceiling" tracking in observability
         total_nodes = len(self.graph.nodes)
-        efficiency_pct = (saved_cost / ceiling_cost * 100) if ceiling_cost > 0 else 0
+        
+        # Savings from optimization (tracked per-node via mark_skipped, mark_pruned, etc.)
+        optimization_savings_pct = (saved_cost / (actual_cost + saved_cost) * 100) if (actual_cost + saved_cost) > 0 else 0
+        
+        # Under-ceiling percentage (ceiling - actual) / ceiling
+        # This shows how much less we spent vs worst-case estimate
+        under_ceiling_pct = ((ceiling_cost - actual_cost) / ceiling_cost * 100) if ceiling_cost > 0 else 0
         
         return {
             "run_duration_sec": run_duration,
@@ -914,7 +980,8 @@ class PipelineStateTree:
                 "actual_usd": actual_cost,
                 "saved_usd": saved_cost,
                 "ceiling_usd": ceiling_cost,
-                "efficiency_pct": efficiency_pct,
+                "optimization_savings_pct": optimization_savings_pct,  # % saved by optimizations
+                "under_ceiling_pct": under_ceiling_pct,  # % under ceiling estimate
             },
             # Batch consolidation (live)
             "batching": self.get_batch_efficiency(),
@@ -943,9 +1010,9 @@ class PipelineStateTree:
         costs = stats["costs"]
         print(f"\nCosts:")
         print(f"  Actual: ${costs['actual_usd']:.3f}")
-        print(f"  Saved: ${costs['saved_usd']:.3f}")
+        print(f"  Saved by optimizations: ${costs['saved_usd']:.3f} ({costs['optimization_savings_pct']:.0f}%)")
         print(f"  Ceiling: ${costs['ceiling_usd']:.3f}")
-        print(f"  Efficiency: {costs['efficiency_pct']:.0f}%")
+        print(f"  Under ceiling: {costs['under_ceiling_pct']:.0f}%")
         
         batch = stats["batching"]
         if batch.get("total_batches", 0) > 0:

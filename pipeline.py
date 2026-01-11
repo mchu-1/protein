@@ -157,6 +157,72 @@ def _calculate_step_cost(step: str, duration_sec: float) -> float:
     return gpu_cost + cpu_cost + mem_cost
 
 
+def _calculate_downstream_savings(
+    config: PipelineConfig,
+    skipped_at_stage: str,
+) -> tuple[float, float]:
+    """
+    Calculate estimated cost and time saved by skipping downstream compute.
+    
+    Uses configured timeouts from config.limits for consistent ceiling-based
+    savings calculations. This ensures savings align with the cost estimate.
+    
+    Args:
+        config: Pipeline configuration with limits
+        skipped_at_stage: Stage where item was skipped ("backbone", "sequence", "prediction")
+    
+    Returns:
+        Tuple of (saved_cost_usd, saved_timing_sec)
+    """
+    limits = config.limits
+    saved_cost = 0.0
+    saved_time = 0.0
+    
+    if skipped_at_stage == "backbone":
+        # Skipping a backbone avoids: ProteinMPNN + (Boltz-2 + Chai-1) * num_sequences
+        proteinmpnn_timeout = limits.get_timeout("proteinmpnn")
+        boltz2_timeout = limits.get_timeout("boltz2")
+        chai1_timeout = limits.get_timeout("chai1")
+        num_seqs = config.proteinmpnn.num_sequences
+        num_decoys = config.foldseek.max_hits
+        
+        # ProteinMPNN cost for this backbone
+        proteinmpnn_cost = _calculate_step_cost("proteinmpnn", proteinmpnn_timeout)
+        
+        # Boltz-2 cost for all sequences from this backbone
+        boltz2_cost = _calculate_step_cost("boltz2", boltz2_timeout) * num_seqs
+        
+        # Chai-1 cost for all sequence × decoy pairs
+        chai1_cost = _calculate_step_cost("chai1", chai1_timeout) * num_seqs * num_decoys
+        
+        saved_cost = proteinmpnn_cost + boltz2_cost + chai1_cost
+        saved_time = proteinmpnn_timeout + (boltz2_timeout * num_seqs) + (chai1_timeout * num_seqs * num_decoys)
+        
+    elif skipped_at_stage == "sequence":
+        # Skipping a sequence avoids: Boltz-2 + Chai-1 * num_decoys
+        boltz2_timeout = limits.get_timeout("boltz2")
+        chai1_timeout = limits.get_timeout("chai1")
+        num_decoys = config.foldseek.max_hits
+        
+        boltz2_cost = _calculate_step_cost("boltz2", boltz2_timeout)
+        chai1_cost = _calculate_step_cost("chai1", chai1_timeout) * num_decoys
+        
+        saved_cost = boltz2_cost + chai1_cost
+        saved_time = boltz2_timeout + (chai1_timeout * num_decoys)
+        
+    elif skipped_at_stage == "prediction":
+        # Skipping a prediction avoids: Chai-1 * num_decoys
+        chai1_timeout = limits.get_timeout("chai1")
+        num_decoys = config.foldseek.max_hits
+        
+        chai1_cost = _calculate_step_cost("chai1", chai1_timeout) * num_decoys
+        
+        saved_cost = chai1_cost
+        saved_time = chai1_timeout * num_decoys
+    
+    return saved_cost, saved_time
+
+
 def estimate_cost(config: PipelineConfig) -> dict:
     """
     Estimate the worst-case compute cost ceiling for a pipeline run.
@@ -538,6 +604,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 binder_length=backbone.binder_length,
                 rfdiffusion_score=backbone.rfdiffusion_score,
             )
+            # Set ceiling cost based on stage timeout (passive observability)
+            state_tree.set_ceiling_from_stage(backbone_node_id, cost_estimate["_timeouts"]["rfdiffusion"])
             state_tree.end_timing(backbone_node_id, NodeStatus.COMPLETED)
             # Track batch consolidation for active observability
             state_tree.set_batch_info(
@@ -556,6 +624,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 score=seq.score,
                 fasta_path=seq.fasta_path,
             )
+            # Set ceiling cost based on stage timeout (passive observability)
+            state_tree.set_ceiling_from_stage(seq_node_id, cost_estimate["_timeouts"]["proteinmpnn"])
             # Mark as completed or filtered based on whether it has a prediction
             has_prediction = any(p.sequence_id == seq.sequence_id for p in predictions)
             state_tree.end_timing(
@@ -585,6 +655,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 ptm_binder=pred.ptm_binder,
                 rmsd_to_design=pred.rmsd_to_design,
             )
+            # Set ceiling cost based on stage timeout (passive observability)
+            state_tree.set_ceiling_from_stage(pred_node_id, cost_estimate["_timeouts"]["boltz2"])
             state_tree.end_timing(pred_node_id, NodeStatus.COMPLETED)
             # Track batch consolidation for active observability
             state_tree.set_batch_info(
@@ -658,6 +730,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 binder_length=backbone.binder_length,
                 rfdiffusion_score=backbone.rfdiffusion_score,
             )
+            # Set ceiling cost based on stage timeout (passive observability)
+            state_tree.set_ceiling_from_stage(backbone_node_id, cost_estimate["_timeouts"]["rfdiffusion"])
             state_tree.end_timing(
                 backbone_node_id,
                 status=NodeStatus.COMPLETED,
@@ -694,12 +768,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             if twins_skipped > 0:
                 print(f"[OPT] Structural memoization: skipped {twins_skipped} structural twins")
                 
-                # Estimate cost savings per skipped backbone (ProteinMPNN + Boltz-2 + Chai-1 avoided)
-                mpnn_cost = 300 * MODAL_GPU_COST_PER_SEC.get("L4", 0.000222)
-                boltz2_cost = 900 * MODAL_GPU_COST_PER_SEC.get("A100", 0.000583) * config.proteinmpnn.num_sequences
-                chai1_cost = 900 * MODAL_GPU_COST_PER_SEC.get("A100", 0.000583) * config.proteinmpnn.num_sequences * config.foldseek.max_hits
-                saved_cost_per_bb = mpnn_cost + boltz2_cost + chai1_cost
-                saved_time_per_bb = 300 + (900 * config.proteinmpnn.num_sequences) * (1 + config.foldseek.max_hits)
+                # Calculate downstream savings using configured timeouts (consistent with ceiling)
+                saved_cost_per_bb, saved_time_per_bb = _calculate_downstream_savings(config, "backbone")
                 
                 # Mark skipped twins in state tree
                 skipped_bb_ids = pre_memo_ids - post_memo_ids
@@ -750,6 +820,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 score=seq.score,
                 fasta_path=seq.fasta_path,
             )
+            # Set ceiling cost based on stage timeout (passive observability)
+            state_tree.set_ceiling_from_stage(seq_node_id, cost_estimate["_timeouts"]["proteinmpnn"])
             state_tree.end_timing(
                 seq_node_id,
                 status=NodeStatus.COMPLETED,
@@ -797,12 +869,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             print(f"  └─ Beam pruning: {filter_stats.get('beam_pruned', 0)} pruned ({filter_stats.get('beam_pruning_timing_sec', 0):.2f}s)")
             print(f"  Total filter time: {filter_stats.get('total_timing_sec', 0):.2f}s")
             
-            # Estimate cost savings per filtered sequence (Boltz-2 + Chai-1 avoided)
-            # Boltz-2: ~$0.52/seq (900s * A100), Chai-1: ~$0.52/seq * num_decoys
-            boltz2_cost_per_seq = 900 * MODAL_GPU_COST_PER_SEC.get("A100", 0.000583)
-            chai1_cost_per_seq = 900 * MODAL_GPU_COST_PER_SEC.get("A100", 0.000583) * config.foldseek.max_hits
-            saved_cost_per_seq = boltz2_cost_per_seq + chai1_cost_per_seq
-            saved_time_per_seq = 900 + (900 * config.foldseek.max_hits)  # Boltz-2 + Chai-1
+            # Calculate downstream savings using configured timeouts (consistent with ceiling)
+            saved_cost_per_seq, saved_time_per_seq = _calculate_downstream_savings(config, "sequence")
             
             # Update state tree for filtered sequences with precise filter tracking
             filtered_ids_map = filter_stats.get("filtered_ids", {})
@@ -892,6 +960,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 ptm_binder=pred.ptm_binder,
                 rmsd_to_design=pred.rmsd_to_design,
             )
+            # Set ceiling cost based on stage timeout (passive observability)
+            state_tree.set_ceiling_from_stage(pred_node_id, cost_estimate["_timeouts"]["boltz2"])
             state_tree.end_timing(
                 pred_node_id,
                 status=NodeStatus.COMPLETED,
@@ -1001,6 +1071,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             aligned_length=decoy.aligned_length,
             sequence_identity=decoy.sequence_identity,
         )
+        # Set ceiling cost based on stage timeout (passive observability)
+        state_tree.set_ceiling_from_stage(decoy_node_id, cost_estimate["_timeouts"]["foldseek"])
         state_tree.end_timing(
             decoy_node_id,
             status=NodeStatus.COMPLETED,
@@ -1095,6 +1167,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 chain_pair_iptm=pc_result.chain_pair_iptm,
             )
             state_tree.set_metrics(pc_node_id, {"is_positive_control": True})
+            # Set ceiling cost based on stage timeout (passive observability)
+            state_tree.set_ceiling_from_stage(pc_node_id, cost_estimate["_timeouts"]["chai1"])
             state_tree.end_timing(pc_node_id, status=NodeStatus.COMPLETED)
         
         # Add cross-reactivity nodes to state tree (decoy checks)
@@ -1110,6 +1184,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                     iptm=cr.iptm,
                     chain_pair_iptm=cr.chain_pair_iptm,
                 )
+                # Set ceiling cost based on stage timeout (passive observability)
+                state_tree.set_ceiling_from_stage(cr_node_id, cost_estimate["_timeouts"]["chai1"])
                 state_tree.end_timing(
                     cr_node_id,
                     status=NodeStatus.COMPLETED,
