@@ -282,7 +282,7 @@ class TargetProtein(BaseModel):
     """
 
     pdb_id: str = Field(..., description="4-letter PDB code (e.g., '3DI3')")
-    entity_id: int = Field(..., ge=1, description="Polymer entity ID (e.g., 1, 2)")
+    entity_id: int = Field(..., description="Polymer entity ID (e.g., 1, 2)")
     hotspot_residues: list[int] = Field(
         default_factory=list,
         description="Residue indices defining the binding interface",
@@ -314,11 +314,11 @@ class TargetProtein(BaseModel):
 class RFDiffusionConfig(BaseModel):
     """Configuration for RFDiffusion backbone generation."""
 
-    num_designs: int = Field(default=10, ge=1, description="Number of backbones to generate")
-    binder_length_min: int = Field(default=50, ge=30, description="Minimum binder length")
-    binder_length_max: int = Field(default=100, le=200, description="Maximum binder length")
-    noise_scale: float = Field(default=1.0, ge=0.1, le=2.0, description="Diffusion noise scale")
-    num_diffusion_steps: int = Field(default=50, ge=10, le=200, description="Number of diffusion steps")
+    num_designs: int = Field(default=10, description="Number of backbones to generate")
+    binder_length_min: int = Field(default=50, description="Minimum binder length")
+    binder_length_max: int = Field(default=100, description="Maximum binder length")
+    noise_scale: float = Field(default=1.0, description="Diffusion noise scale")
+    num_diffusion_steps: int = Field(default=50, description="Number of diffusion steps")
 
     @property
     def contigmap(self) -> str:
@@ -329,9 +329,9 @@ class RFDiffusionConfig(BaseModel):
 class ProteinMPNNConfig(BaseModel):
     """Configuration for ProteinMPNN sequence design."""
 
-    num_sequences: int = Field(default=8, ge=1, le=64, description="Sequences per backbone")
-    temperature: float = Field(default=0.2, ge=0.01, le=1.0, description="Sampling temperature")
-    backbone_noise: float = Field(default=0.0, ge=0.0, le=0.5, description="Backbone coordinate noise")
+    num_sequences: int = Field(default=8, description="Sequences per backbone")
+    temperature: float = Field(default=0.2, description="Sampling temperature")
+    backbone_noise: float = Field(default=0.0, description="Backbone coordinate noise")
 
 
 class ESMFoldConfig(BaseModel):
@@ -346,8 +346,8 @@ class ESMFoldConfig(BaseModel):
     """
     
     enabled: bool = Field(default=True, description="Enable ESMFold gatekeeper")
-    min_plddt: float = Field(default=70.0, ge=0.0, le=100.0, description="Min mean pLDDT (confidence)")
-    max_rmsd: float = Field(default=2.5, ge=0.0, le=10.0, description="Max RMSD to RFDiffusion backbone (consistency)")
+    min_plddt: float = Field(default=70.0, description="Min mean pLDDT (confidence)")
+    max_rmsd: float = Field(default=2.5, description="Max RMSD to RFDiffusion backbone (consistency)")
     save_predictions: bool = Field(default=False, description="Save ESMFold PDB predictions")
 
 
@@ -360,12 +360,12 @@ class Boltz2Config(BaseModel):
     3. rmsd < 2.5 Å: Self-consistency vs RFDiffusion
     """
 
-    num_recycles: int = Field(default=3, ge=1, le=10, description="Number of recycling iterations")
+    num_recycles: int = Field(default=3, description="Number of recycling iterations")
     
     # AlphaProteo thresholds (SI 2.2)
-    max_pae_interaction: float = Field(default=1.5, ge=0.0, le=31.0, description="Max PAE at hotspots (Anchor Lock)")
-    min_ptm_binder: float = Field(default=0.80, ge=0.0, le=1.0, description="Min pTM for binder-only (Fold Quality)")
-    max_rmsd: float = Field(default=2.5, ge=0.0, le=10.0, description="Max RMSD vs RFDiffusion backbone (Self-Consistency)")
+    max_pae_interaction: float = Field(default=1.5, description="Max PAE at hotspots (Anchor Lock)")
+    min_ptm_binder: float = Field(default=0.80, description="Min pTM for binder-only (Fold Quality)")
+    max_rmsd: float = Field(default=2.5, description="Max RMSD vs RFDiffusion backbone (Self-Consistency)")
 
 
 class FoldSeekConfig(BaseModel):
@@ -375,27 +375,27 @@ class FoldSeekConfig(BaseModel):
     """
 
     database: str = Field(default="pdb100", description="Database to search (pdb100, afdb50, etc.)")
-    max_hits: int = Field(default=5, ge=1, le=100, description="Maximum decoys (fewer = cheaper)")
-    evalue_threshold: float = Field(default=1e-3, ge=0.0, description="E-value cutoff")
+    max_hits: int = Field(default=5, description="Maximum decoys (fewer = cheaper)")
+    evalue_threshold: float = Field(default=1e-3, description="E-value cutoff")
     cache_results: bool = Field(default=True, description="Cache decoy results by target (saves repeated FoldSeek calls)")
 
 
 class Chai1Config(BaseModel):
     """Configuration for Chai-1 cross-reactivity check (single-sequence mode)."""
 
-    num_samples: int = Field(default=1, ge=1, le=5, description="Samples per binder-decoy pair")
-    min_chain_pair_iptm: float = Field(default=0.5, ge=0.0, le=1.0, description="chain_pair_iptm threshold for cross-reactivity")
-    num_recycles: int = Field(default=3, ge=1, le=10, description="Number of recycling iterations")
+    num_samples: int = Field(default=1, description="Samples per binder-decoy pair")
+    min_chain_pair_iptm: float = Field(default=0.5, description="chain_pair_iptm threshold for cross-reactivity")
+    num_recycles: int = Field(default=3, description="Number of recycling iterations")
     tiered_checking: bool = Field(default=True, description="Use tiered decoy checking (Tier 1/2/3) for cost savings")
-    tier1_min_tm: float = Field(default=0.7, ge=0.0, le=1.0, description="Min TM-score for Tier 1 (highest risk)")
-    tier2_min_tm: float = Field(default=0.5, ge=0.0, le=1.0, description="Min TM-score for Tier 2")
-    tier2_max_decoys: int = Field(default=2, ge=1, le=10, description="Max decoys in Tier 2")
+    tier1_min_tm: float = Field(default=0.7, description="Min TM-score for Tier 1 (highest risk)")
+    tier2_min_tm: float = Field(default=0.5, description="Min TM-score for Tier 2")
+    tier2_max_decoys: int = Field(default=2, description="Max decoys in Tier 2")
 
 
 class ClusterConfig(BaseModel):
     """Configuration for TM-score based clustering (diversity)."""
 
-    tm_threshold: float = Field(default=0.7, ge=0.0, le=1.0, description="TM-score threshold for clustering")
+    tm_threshold: float = Field(default=0.7, description="TM-score threshold for clustering")
     select_best: bool = Field(default=True, description="Select best representative per cluster")
 
 
@@ -411,7 +411,7 @@ class NoveltyConfig(BaseModel):
     It is persisted in a Modal Volume and downloaded only once.
     """
 
-    max_evalue: float = Field(default=1e-6, ge=0.0, description="Max E-value to consider a hit (lower = stricter)")
+    max_evalue: float = Field(default=1e-6, description="Max E-value to consider a hit (lower = stricter)")
     enabled: bool = Field(default=True, description="Enable novelty filtering")
     auto_download: bool = Field(default=True, description="Auto-download UniRef50 database if not present")
 
@@ -419,8 +419,8 @@ class NoveltyConfig(BaseModel):
 class ScoringWeights(BaseModel):
     """Weights for the scoring function S(x)."""
 
-    alpha: float = Field(default=1.0, ge=0.0, description="Weight for interface pLDDT (specificity)")
-    beta: float = Field(default=0.5, ge=0.0, description="Weight for max decoy affinity (selectivity penalty)")
+    alpha: float = Field(default=1.0, description="Weight for interface pLDDT (specificity)")
+    beta: float = Field(default=0.5, description="Weight for max decoy affinity (selectivity penalty)")
 
 
 class BackboneFilterConfig(BaseModel):
@@ -430,8 +430,8 @@ class BackboneFilterConfig(BaseModel):
     """
 
     enabled: bool = Field(default=True, description="Enable backbone quality filtering")
-    min_score: float = Field(default=0.4, ge=0.0, le=1.0, description="Min RFDiffusion confidence score")
-    max_keep: Optional[int] = Field(default=None, ge=1, description="Max backbones to keep (None = no limit)")
+    min_score: float = Field(default=0.4, description="Min RFDiffusion confidence score")
+    max_keep: Optional[int] = Field(default=None, description="Max backbones to keep (None = no limit)")
 
 
 class AdaptiveGenerationConfig(BaseModel):
@@ -445,9 +445,9 @@ class AdaptiveGenerationConfig(BaseModel):
     """
 
     enabled: bool = Field(default=True, description="Enable adaptive generation")
-    min_validated_candidates: int = Field(default=3, ge=1, description="Stop when this many pass Boltz-2")
-    batch_size: int = Field(default=4, ge=1, le=16, description="Backbones to generate per micro-batch (GPU-efficient)")
-    max_batches: int = Field(default=3, ge=1, le=10, description="Maximum micro-batches before stopping")
+    min_validated_candidates: int = Field(default=3, description="Stop when this many pass Boltz-2")
+    batch_size: int = Field(default=4, description="Backbones to generate per micro-batch (GPU-efficient)")
+    max_batches: int = Field(default=3, description="Maximum micro-batches before stopping")
 
 
 class SolubilityFilterConfig(BaseModel):
@@ -467,8 +467,8 @@ class SolubilityFilterConfig(BaseModel):
     """
 
     enabled: bool = Field(default=True, description="Enable solubility pre-screening")
-    min_abs_charge_ph7: float = Field(default=3.0, ge=0.0, description="Minimum |net charge| at pH 7 (repulsion to prevent clumping)")
-    max_abs_charge_ph7: float = Field(default=12.0, ge=0.0, description="Maximum |net charge| at pH 7 (reject unfoldable super-charged)")
+    min_abs_charge_ph7: float = Field(default=3.0, description="Minimum |net charge| at pH 7 (repulsion to prevent clumping)")
+    max_abs_charge_ph7: float = Field(default=12.0, description="Maximum |net charge| at pH 7 (reject unfoldable super-charged)")
     forbidden_pi_min: float = Field(default=6.0, description="Lower bound of forbidden pI zone (dead zone near pH 7.4)")
     forbidden_pi_max: float = Field(default=8.0, description="Upper bound of forbidden pI zone (dead zone near pH 7.4)")
 
@@ -485,8 +485,8 @@ class StructuralMemoizationConfig(BaseModel):
     """
 
     enabled: bool = Field(default=True, description="Enable structural memoization")
-    similarity_threshold: float = Field(default=0.9, ge=0.5, le=1.0, description="3Di similarity threshold to consider as 'twin'")
-    cache_ttl_hours: int = Field(default=168, ge=1, description="TTL for structural cache (default: 7 days)")
+    similarity_threshold: float = Field(default=0.9, description="3Di similarity threshold to consider as 'twin'")
+    cache_ttl_hours: int = Field(default=168, description="TTL for structural cache (default: 7 days)")
 
 
 class BeamPruningConfig(BaseModel):
@@ -500,9 +500,9 @@ class BeamPruningConfig(BaseModel):
     """
 
     enabled: bool = Field(default=True, description="Enable beam pruning")
-    max_tree_nodes: int = Field(default=500, ge=50, le=2000, description="Maximum total nodes in state tree")
-    sequences_per_backbone: int = Field(default=5, ge=1, le=20, description="Max sequences to spawn per backbone")
-    predictions_per_sequence: int = Field(default=1, ge=1, le=5, description="Max predictions per sequence (usually 1)")
+    max_tree_nodes: int = Field(default=500, description="Maximum total nodes in state tree")
+    sequences_per_backbone: int = Field(default=5, description="Max sequences to spawn per backbone")
+    predictions_per_sequence: int = Field(default=1, description="Max predictions per sequence (usually 1)")
     prune_by_score: bool = Field(default=True, description="Prune lowest-scoring siblings when limit hit")
 
 
@@ -518,7 +518,7 @@ class StickinessFilterConfig(BaseModel):
     """
 
     enabled: bool = Field(default=True, description="Enable SAP stickiness filtering")
-    max_sap_score: float = Field(default=0.50, ge=0.0, le=1.0, description="Maximum SAP score. Relaxed to 0.50 to allow CDR-like loops.")
+    max_sap_score: float = Field(default=0.50, description="Maximum SAP score. Relaxed to 0.50 to allow CDR-like loops.")
     hydrophobic_residues: str = Field(default="AVILMFYW", description="Residues considered hydrophobic")
 
 
@@ -536,7 +536,6 @@ class StageLimits(BaseModel):
     
     timeout_seconds: Optional[int] = Field(
         default=None, 
-        ge=1, 
         description="Max seconds for this stage (None = use default)"
     )
 
@@ -606,7 +605,7 @@ class PipelineConfig(BaseModel):
     limits: PipelineLimits = Field(default_factory=PipelineLimits, description="Per-stage timeout limits")
 
     # Budget control (optional - set to None to disable budget enforcement)
-    max_compute_usd: Optional[float] = Field(default=None, ge=0.1, description="Maximum compute budget in USD (None = no limit)")
+    max_compute_usd: Optional[float] = Field(default=None, description="Maximum compute budget in USD (None = no limit)")
 
 
 # =============================================================================
@@ -656,16 +655,16 @@ class StructurePrediction(BaseModel):
     pdb_path: str = Field(..., description="Path to predicted complex PDB")
     
     # Standard metrics
-    plddt_overall: float = Field(..., ge=0.0, le=100.0, description="Overall pLDDT score")
-    plddt_interface: float = Field(..., ge=0.0, le=100.0, description="Interface pLDDT (i-pLDDT)")
-    pae_interface: float = Field(..., ge=0.0, description="Interface PAE score")
-    ptm: Optional[float] = Field(None, ge=0.0, le=1.0, description="pTM score (complex)")
-    iptm: Optional[float] = Field(None, ge=0.0, le=1.0, description="ipTM score")
+    plddt_overall: float = Field(..., description="Overall pLDDT score")
+    plddt_interface: float = Field(..., description="Interface pLDDT (i-pLDDT)")
+    pae_interface: float = Field(..., description="Interface PAE score")
+    ptm: Optional[float] = Field(None, description="pTM score (complex)")
+    iptm: Optional[float] = Field(None, description="ipTM score")
     
     # AlphaProteo SI 2.2 metrics
-    pae_interaction: Optional[float] = Field(None, ge=0.0, description="Min PAE at hotspot residues (Anchor Lock)")
-    ptm_binder: Optional[float] = Field(None, ge=0.0, le=1.0, description="pTM for binder-only (Fold Quality)")
-    rmsd_to_design: Optional[float] = Field(None, ge=0.0, description="RMSD vs RFDiffusion backbone (Self-Consistency)")
+    pae_interaction: Optional[float] = Field(None, description="Min PAE at hotspot residues (Anchor Lock)")
+    ptm_binder: Optional[float] = Field(None, description="pTM for binder-only (Fold Quality)")
+    rmsd_to_design: Optional[float] = Field(None, description="RMSD vs RFDiffusion backbone (Self-Consistency)")
 
     @property
     def ppi_score(self) -> float:
@@ -692,9 +691,9 @@ class DecoyHit(BaseModel):
     decoy_id: str = Field(..., description="Identifier (PDB ID or UniProt)")
     pdb_path: str = Field(..., description="Path to decoy structure")
     evalue: float = Field(..., description="E-value from FoldSeek")
-    tm_score: float = Field(..., ge=0.0, le=1.0, description="TM-score alignment")
+    tm_score: float = Field(..., description="TM-score alignment")
     aligned_length: int = Field(..., description="Number of aligned residues")
-    sequence_identity: float = Field(..., ge=0.0, le=1.0, description="Sequence identity in alignment")
+    sequence_identity: float = Field(..., description="Sequence identity in alignment")
 
 
 class CrossReactivityResult(BaseModel):
@@ -703,11 +702,11 @@ class CrossReactivityResult(BaseModel):
     binder_id: str = Field(..., description="Binder sequence ID")
     decoy_id: str = Field(..., description="Decoy protein ID")
     predicted_affinity: float = Field(..., description="Predicted binding affinity (lower = tighter)")
-    plddt_interface: float = Field(..., ge=0.0, le=100.0, description="Interface pLDDT with decoy")
+    plddt_interface: float = Field(..., description="Interface pLDDT with decoy")
     binds_decoy: bool = Field(..., description="Whether binder likely binds decoy")
-    ptm: Optional[float] = Field(None, ge=0.0, le=1.0, description="pTM score")
-    iptm: Optional[float] = Field(None, ge=0.0, le=1.0, description="ipTM score")
-    chain_pair_iptm: Optional[float] = Field(None, ge=0.0, le=1.0, description="Chain-pair ipTM (off-target threshold: >0.5)")
+    ptm: Optional[float] = Field(None, description="pTM score")
+    iptm: Optional[float] = Field(None, description="ipTM score")
+    chain_pair_iptm: Optional[float] = Field(None, description="Chain-pair ipTM (off-target threshold: >0.5)")
 
     @property
     def ppi_score(self) -> float:

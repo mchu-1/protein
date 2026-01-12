@@ -34,7 +34,7 @@ mode: bind
 
 # RFDiffusion - Backbone Generation
 rfdiffusion:
-  num_designs: 10              # Number of backbones to generate
+  num_designs: 1200             # Number of backbones to generate
   binder_length_min: 50        # Minimum binder length (residues)
   binder_length_max: 100       # Maximum binder length (residues)
   noise_scale: 1.0             # Diffusion noise scale
@@ -42,7 +42,7 @@ rfdiffusion:
 
 # ProteinMPNN - Sequence Design
 proteinmpnn:
-  num_sequences: 8             # Sequences per backbone
+  num_sequences: 50            # Sequences per backbone
   temperature: 0.2             # Sampling temperature (lower = more conservative)
   backbone_noise: 0.0          # Backbone coordinate noise
 
@@ -113,8 +113,8 @@ backbone_filter:
 
 # Adaptive generation with early termination
 adaptive:
-  enabled: true                # Enable adaptive generation
-  min_validated_candidates: 3  # Stop when this many pass Boltz-2
+  enabled: true               # Enable adaptive generation
+  min_validated_candidates: 10  # Stop when this many pass Boltz-2
   batch_size: 4                # Backbones per micro-batch
   max_batches: 3               # Maximum micro-batches
 
@@ -141,8 +141,8 @@ structural_memoization:
 # Beam pruning (tree width control)
 beam_pruning:
   enabled: true
-  max_tree_nodes: 500          # Maximum total nodes in state tree
-  sequences_per_backbone: 5    # Max sequences per backbone
+  max_tree_nodes: 75000          # Maximum total nodes in state tree
+  sequences_per_backbone: 150   # Max sequences per backbone
   predictions_per_sequence: 1  # Max predictions per sequence
   prune_by_score: true         # Prune lowest-scoring siblings
 
