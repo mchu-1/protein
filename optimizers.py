@@ -65,8 +65,8 @@ def check_solubility(
     Check sequence solubility using peptides.py.
     
     Computes:
-    - Absolute net charge at pH 7.0: Must be within [min_abs, max_abs] to ensure
-      sufficient repulsion (prevents clumping) without being unfoldably super-charged.
+    - Absolute net charge at pH 7.0: Must be >= min_abs to ensure
+      sufficient repulsion (prevents clumping).
     - Isoelectric point (pI): Must be OUTSIDE the forbidden "dead zone" (6.0-8.0)
       near physiological pH where proteins have minimal charge and aggregate.
     
@@ -97,9 +97,6 @@ def check_solubility(
         if abs_charge < config.min_abs_charge_ph7:
             passes = False
             rejection_reason = f"|charge|={abs_charge:.1f} < {config.min_abs_charge_ph7} (insufficient repulsion)"
-        elif abs_charge > config.max_abs_charge_ph7:
-            passes = False
-            rejection_reason = f"|charge|={abs_charge:.1f} > {config.max_abs_charge_ph7} (super-charged)"
         # Gate 2: pI must be OUTSIDE the forbidden dead zone
         elif config.forbidden_pi_min <= pI <= config.forbidden_pi_max:
             passes = False

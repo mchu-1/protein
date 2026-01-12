@@ -220,7 +220,6 @@ esmfold_image = (
         "print(\"ESMFold weights cached successfully\")'",
     )
     .env({
-        "TRANSFORMERS_CACHE": "/root/.cache/huggingface",
         "HF_HOME": "/root/.cache/huggingface",
     })
 )
@@ -477,7 +476,6 @@ class SolubilityFilterConfig(BaseModel):
 
     enabled: bool = Field(default=True, description="Enable solubility pre-screening")
     min_abs_charge_ph7: float = Field(default=3.0, description="Minimum |net charge| at pH 7 (repulsion to prevent clumping)")
-    max_abs_charge_ph7: float = Field(default=12.0, description="Maximum |net charge| at pH 7 (reject unfoldable super-charged)")
     forbidden_pi_min: float = Field(default=6.0, description="Lower bound of forbidden pI zone (dead zone near pH 7.4)")
     forbidden_pi_max: float = Field(default=8.0, description="Upper bound of forbidden pI zone (dead zone near pH 7.4)")
 

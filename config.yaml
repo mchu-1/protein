@@ -168,7 +168,6 @@ adaptive:
 solubility_filter:
   enabled: true
   min_abs_charge_ph7: 3.0 # Strict: Min |net charge| to prevent aggregation
-  max_abs_charge_ph7: 12.0 # Strict: Max |net charge| to avoid non-specific binding
   forbidden_pi_min: 6.0 # Forbidden pI zone lower bound (dead zone)
   forbidden_pi_max: 8.0 # Forbidden pI zone upper bound (near pH 7.4)
 
