@@ -135,6 +135,8 @@ boltz2_image = (
         "boltz==0.4.0",  # Use stable version compatible with Modal
         "biopython>=1.81",
         "pydantic>=2.0.0",
+        "biotite>=1.0.0",  # For robust RMSD calculation
+        "scipy>=1.11.0",   # Required by biotite
     )
 )
 
