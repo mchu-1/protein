@@ -513,9 +513,27 @@ def run_esmfold_validation(
         pdb_file = pdb.PDBFile.read(StringIO(esmfold_pdb_str))
         esmfold_structure = pdb.get_structure(pdb_file, model=1)
         
-        # Get pLDDT values (stored in b_factor field)
+        # Get pLDDT values (stored in b_factor annotation in Biotite)
         ca_mask = esmfold_structure.atom_name == "CA"
-        plddt_values = esmfold_structure.b_factor[ca_mask]
+        ca_atoms = esmfold_structure[ca_mask]
+        
+        # Access b_factor from the annotation dict (Biotite stores it here)
+        if hasattr(ca_atoms, 'b_factor'):
+            plddt_values = ca_atoms.b_factor
+        elif 'b_factor' in ca_atoms.get_annotation_categories():
+            plddt_values = ca_atoms.get_annotation('b_factor')
+        else:
+            # Fallback: extract from PDB file directly
+            plddt_values = []
+            for line in esmfold_pdb_str.split('\n'):
+                if line.startswith('ATOM') and ' CA ' in line:
+                    try:
+                        b_factor = float(line[60:66].strip())
+                        plddt_values.append(b_factor)
+                    except (ValueError, IndexError):
+                        continue
+            plddt_values = np.array(plddt_values)
+        
         mean_plddt = float(np.mean(plddt_values))
         
         print(f"  ESMFold: Mean pLDDT = {mean_plddt:.1f}")
