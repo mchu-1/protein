@@ -1395,8 +1395,9 @@ def run_chai1(
             f.write(f">protein|name=decoy\n{decoy_sequence}\n")
             f.write(f">protein|name=binder\n{sequence.sequence}\n")
 
-        # Use output_dir directly - caller already includes seq_id/decoy_id in path
-        output_subdir = Path(output_dir)
+        # Use a subdirectory for Chai-1 output to avoid "directory not empty" errors
+        # (Chai-1 expects to be able to write into a clean directory or manages it internally)
+        output_subdir = Path(output_dir) / "predictions"
 
         # Use chai_lab Python API
         try:
@@ -1638,6 +1639,7 @@ def validate_sequences_parallel(
 @app.function(
     image=chai1_image,
     timeout=3600,  # 1 hour for processing multiple sequences against multiple decoys
+    volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def check_cross_reactivity_parallel(
     sequences: list[SequenceDesign],
@@ -2232,7 +2234,7 @@ def check_novelty(
             # Create digital query sequence
             query = TextSequence(
                 name=seq.sequence_id.encode(),
-                sequence=seq.sequence.encode(),
+                sequence=seq.sequence,
             ).digitize(alphabet)
             
             # Create pipeline for this search
