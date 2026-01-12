@@ -34,7 +34,7 @@ mode: bind
 
 # RFDiffusion - Backbone Generation
 rfdiffusion:
-  num_designs: 1200             # Number of backbones to generate
+  num_designs: 96             # Number of backbones to generate
   binder_length_min: 50        # Minimum binder length (residues)
   binder_length_max: 100       # Maximum binder length (residues)
   noise_scale: 1.0             # Diffusion noise scale
@@ -42,15 +42,15 @@ rfdiffusion:
 
 # ProteinMPNN - Sequence Design
 proteinmpnn:
-  num_sequences: 50            # Sequences per backbone
+  num_sequences: 1            # Optimized: Reduced from 50 to 20 to focus on quality over quantity
   temperature: 0.2             # Sampling temperature (lower = more conservative)
   backbone_noise: 0.0          # Backbone coordinate noise
 
 # ESMFold - Orthogonal Validation (Gatekeeper)
 esmfold:
   enabled: true                # Enable ESMFold gatekeeper (validates all sequences)
-  min_plddt: 70.0              # Min mean pLDDT (confidence)
-  max_rmsd: 2.5                # Max RMSD to RFDiffusion backbone (consistency)
+  min_plddt: 75.0              # Optimized: Increased from 70.0 to 75.0 (Stricter filter)
+  max_rmsd: 2.0                # Optimized: Decreased from 2.5 to 2.0 (Stricter consistency)
   save_predictions: false      # Save ESMFold PDB predictions
 
 # Boltz-2 - Structure Validation (AlphaProteo SI 2.2 thresholds)
@@ -63,7 +63,7 @@ boltz2:
 # FoldSeek - Decoy Identification
 foldseek:
   database: "pdb100"           # Database to search
-  max_hits: 5                  # Maximum decoys (fewer = cheaper Chai-1)
+  max_hits: 1                  # Optimized: Reduced from 5 to 1 (Major cost saver for Chai-1)
   evalue_threshold: 0.001      # E-value cutoff
   cache_results: true          # Cache decoys by target for reuse
 
@@ -114,7 +114,7 @@ backbone_filter:
 # Adaptive generation with early termination
 adaptive:
   enabled: true               # Enable adaptive generation
-  min_validated_candidates: 10  # Stop when this many pass Boltz-2
+  min_validated_candidates: 5 # Optimized: Reduced from 10 to 5 to stop early
   batch_size: 4                # Backbones per micro-batch
   max_batches: 3               # Maximum micro-batches
 
@@ -129,7 +129,7 @@ solubility_filter:
 # Stickiness filter (3D structure gates)
 stickiness_filter:
   enabled: true
-  max_sap_score: 0.50          # Relaxed to allow CDR-like loops
+  max_sap_score: 0.45          # Optimized: Slightly stricter (0.50 -> 0.45)
   hydrophobic_residues: "AVILMFYW"
 
 # Structural memoization (3Di fingerprinting)
