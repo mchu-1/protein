@@ -161,7 +161,7 @@ backbone_filter:
 # Adaptive generation with early termination
 adaptive:
   enabled: true # Enabled for batching
-  min_validated_candidates: 10 # Stop after 10 validated candidates
+  min_validated_candidates: 100 # Stop after 10 validated candidates
   batch_size: 10 # Increased for throughput (was 5)
 
 # Solubility filter (1D chemistry gates)
