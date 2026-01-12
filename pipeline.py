@@ -1871,16 +1871,16 @@ def _run_adaptive_generation(
     
     # Summary
     total_backbones = len(all_backbones)
-    max_possible_backbones = adaptive_config.max_batches * adaptive_config.batch_size
+    max_possible_backbones = max_batches * adaptive_config.batch_size
     max_possible_sequences = max_possible_backbones * proteinmpnn_config.num_sequences
     
     print("\nAdaptive generation summary:")
-    print(f"  Micro-batches used: {batch_num}/{adaptive_config.max_batches}")
+    print(f"  Micro-batches used: {batch_num}/{max_batches}")
     print(f"  Backbones generated: {total_backbones}")
     print(f"  Sequences designed: {len(all_sequences)}")
     print(f"  Validated candidates: {len(validated_predictions)}")
     
-    if batch_num < adaptive_config.max_batches:
+    if batch_num < max_batches:
         saved_backbones = max_possible_backbones - total_backbones
         saved_sequences = max_possible_sequences - len(all_sequences)
         if saved_backbones > 0 or saved_sequences > 0:

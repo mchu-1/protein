@@ -38,7 +38,7 @@ from common import (
 @app.function(
     image=rfdiffusion_image,
     gpu="A10G",  # Cost-effective GPU sufficient for RFDiffusion
-    timeout=600,
+    timeout=1200, # Increased to 20 mins to support batch generation
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def run_rfdiffusion(

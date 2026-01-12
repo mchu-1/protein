@@ -146,7 +146,7 @@ backbone_filter:
 adaptive:
   enabled: true               # Enabled for batching
   min_validated_candidates: 10 # Stop after 10 validated candidates (matches num_designs)
-  batch_size: 16              # Small batches to prevent RFDiffusion timeouts (600s)
+  batch_size: 5               # Reduced to prevent RFDiffusion timeouts (from 16)
 
 # Solubility filter (1D chemistry gates)
 solubility_filter:
@@ -178,7 +178,7 @@ structural_memoization:
 
 limits:
   rfdiffusion:
-    timeout_seconds: 600      # 10 minutes for batch generation
+    timeout_seconds: 1200     # Increased to 20 minutes (from 600s) for batch generation
   
   proteinmpnn:
     timeout_seconds: 300      # 5 minutes per backbone
