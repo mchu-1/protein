@@ -1152,27 +1152,36 @@ class PipelineStateTree:
     
     def get_ceiling_cost(self) -> float:
         """
-        Get the pre-computed ceiling cost for the run (passive observability).
+        Get the aggregate ceiling cost for all nodes in the run (passive observability).
         
-        This is the worst-case cost based on timeouts × max_designs, set at run start.
-        Compare with get_total_cost() (active) to see actual savings.
+        Summing all node ceilings provides an accurate total of all worst-case 
+        allocations, including branching factors and positive controls that might 
+        be missed in a static top-down estimate.
         """
-        if self.root_id in self.graph:
-            root_data: NodeData = self.graph.nodes[self.root_id]["data"]
-            return root_data.cost.ceiling_cost_usd
-        return 0.0
+        total = 0.0
+        for node_id in self.graph.nodes:
+            # Skip the root node if it contains the static forecast to avoid double-counting
+            if node_id == self.root_id:
+                continue
+            node_data: NodeData = self.graph.nodes[node_id]["data"]
+            total += node_data.cost.ceiling_cost_usd
+        return total
     
     def get_ceiling_timing(self) -> float:
         """
-        Get the pre-computed ceiling timing for the run (passive observability).
+        Get the aggregate ceiling timing for all nodes in the run (passive observability).
         
-        This is the worst-case billable seconds based on timeouts × max_designs.
-        Compare with get_total_timing() (active) to see actual time savings.
+        Summing all node ceilings provides an accurate total of all worst-case 
+        billable seconds across all parallel and sequential stages.
         """
-        if self.root_id in self.graph:
-            root_data: NodeData = self.graph.nodes[self.root_id]["data"]
-            return root_data.cost.ceiling_timing_sec
-        return 0.0
+        total = 0.0
+        for node_id in self.graph.nodes:
+            # Skip the root node if it contains the static forecast
+            if node_id == self.root_id:
+                continue
+            node_data: NodeData = self.graph.nodes[node_id]["data"]
+            total += node_data.cost.ceiling_timing_sec
+        return total
     
     def get_status_summary(self) -> dict[str, dict[str, int]]:
         """Get count of nodes by type and status."""

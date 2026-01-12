@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import time
+import math
 from datetime import datetime
 from typing import Optional
 
@@ -289,9 +290,11 @@ def estimate_cost(config: PipelineConfig) -> dict:
     requested_decoys = config.foldseek.max_hits
     effective_decoys = requested_decoys
     
-    # Level 4: Chai-1 - sequences to check (each checked against ALL decoys)
+    # Level 4: Chai-1 - sequences to check (each checked against ALL decoys + positive control)
     effective_chai1_sequences = effective_boltz2
-    effective_chai1_pairs = effective_chai1_sequences * effective_decoys
+    # Include positive control (binder vs target) for each sequence
+    # This ensures the estimate accounts for the mandatory target binding check
+    effective_chai1_pairs = effective_chai1_sequences * (effective_decoys + 1)
     
     # Get effective timeouts from limits
     rfdiffusion_timeout = limits.get_timeout("rfdiffusion")
@@ -304,8 +307,15 @@ def estimate_cost(config: PipelineConfig) -> dict:
     # Calculate per-step costs using timeout ceilings (worst-case billing)
     costs = {}
     
-    # RFDiffusion (A10G) - timeout for batch generation (all backbones in one call)
-    rfdiffusion_sec = rfdiffusion_timeout
+    # RFDiffusion (A10G) - depends on mode
+    if config.adaptive.enabled:
+        # Adaptive mode generates in micro-batches
+        num_batches = math.ceil(config.rfdiffusion.num_designs / config.adaptive.batch_size)
+        rfdiffusion_sec = rfdiffusion_timeout * num_batches
+    else:
+        # Standard mode: all backbones in one batch call
+        rfdiffusion_sec = rfdiffusion_timeout
+        
     costs["rfdiffusion"] = _calculate_step_cost("rfdiffusion", rfdiffusion_sec, config.hardware.rfdiffusion_gpu)
     
     # ProteinMPNN (L4) - timeout per backbone
@@ -513,6 +523,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     print(f"\nCost ceiling: ${cost_estimate['total']:.2f}")
     print(f"  ├─ RFDiffusion ({config.hardware.rfdiffusion_gpu}):  ${cost_estimate['rfdiffusion']:.3f}")
     print(f"  ├─ ProteinMPNN ({config.hardware.proteinmpnn_gpu}):    ${cost_estimate['proteinmpnn']:.3f}")
+    if config.esmfold.enabled:
+        print(f"  ├─ ESMFold ({config.hardware.esmfold_gpu}):       ${cost_estimate['esmfold']:.3f}")
     print(f"  ├─ Boltz-2 ({config.hardware.boltz2_gpu}):      ${cost_estimate['boltz2']:.3f}")
     print(f"  ├─ FoldSeek (CPU):      ${cost_estimate['foldseek']:.3f}")
     print(f"  └─ Chai-1 ({config.hardware.chai1_gpu}):       ${cost_estimate['chai1']:.3f}")
@@ -541,6 +553,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             "total": cost_estimate["total"],
             "rfdiffusion": cost_estimate["rfdiffusion"],
             "proteinmpnn": cost_estimate["proteinmpnn"],
+            "esmfold": cost_estimate.get("esmfold", 0.0),
             "boltz2": cost_estimate["boltz2"],
             "foldseek": cost_estimate["foldseek"],
             "chai1": cost_estimate["chai1"],
@@ -1148,7 +1161,9 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             print(f"        Decoy check: {len(cross_reactivity_results)} sequences checked against {num_decoys} decoys")
         
         # Log Chai-1 metrics
-        num_pairs = len(validated_sequences) * num_decoys if decoys else len(validated_sequences)
+        # Total Chai-1 calls = sequences * (decoys + 1)
+        # One positive control per sequence, plus decoy checks if any decoys found
+        num_pairs = len(validated_sequences) * (num_decoys + 1)
         stage_metrics.append(_log_stage_metrics(
             "chai1", stage_duration, num_pairs,
             cost_estimate["_timeouts"]["chai1"] * cost_estimate["_effective"]["chai1_pairs"], 
@@ -1342,11 +1357,27 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     for stage in ["rfdiffusion", "proteinmpnn", "boltz2", "foldseek", "chai1"]:
         stage_time = timing_by_stage.get(stage, 0.0)
         stage_cost = cost_by_stage.get(stage, 0.0)
-        ceiling_time = cost_estimate["_timeouts"].get(stage, 0)
-        # Calculate ceiling cost for this stage
+        
+        # Calculate aggregate ceiling time for this stage (sum of all possible billable seconds)
+        # This is more accurate for comparison than a single-item timeout
+        if stage == "rfdiffusion" and config.adaptive.enabled:
+            # multiple batches
+            import math
+            num_batches = math.ceil(config.rfdiffusion.num_designs / config.adaptive.batch_size)
+            ceiling_time = cost_estimate["_timeouts"].get(stage, 0) * num_batches
+        elif stage == "proteinmpnn":
+            ceiling_time = cost_estimate["_timeouts"].get(stage, 0) * cost_estimate["_effective"]["backbones"]
+        elif stage == "boltz2":
+            ceiling_time = cost_estimate["_timeouts"].get(stage, 0) * cost_estimate["_effective"]["sequences"]
+        elif stage == "chai1":
+            ceiling_time = cost_estimate["_timeouts"].get(stage, 0) * cost_estimate["_effective"]["chai1_pairs"]
+        else:
+            ceiling_time = cost_estimate["_timeouts"].get(stage, 0)
+            
+        # Get pre-computed ceiling cost for this stage
         stage_ceiling = cost_estimate.get(stage, 0.0)
         
-        time_str = f"{stage_time:.1f}s / {ceiling_time}s"
+        time_str = f"{stage_time:.1f}s / {ceiling_time:.0f}s"
         cost_str = f"${stage_cost:.3f} / ${stage_ceiling:.3f}"
         print(f"{stage:<15} {time_str:<20} {cost_str:<25}")
     
@@ -2154,6 +2185,7 @@ def _write_run_manifest(
             "total": cost_estimate["total"],
             "rfdiffusion": cost_estimate["rfdiffusion"],
             "proteinmpnn": cost_estimate["proteinmpnn"],
+            "esmfold": cost_estimate.get("esmfold", 0.0),
             "boltz2": cost_estimate["boltz2"],
             "foldseek": cost_estimate["foldseek"],
             "chai1": cost_estimate["chai1"],
