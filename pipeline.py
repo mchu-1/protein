@@ -787,22 +787,34 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             cost_estimate["_timeouts"]["proteinmpnn"] * len(backbones), cost_estimate["proteinmpnn"]
         ))
         
-        # Add sequence nodes to state tree
-        for seq in sequences:
-            seq_node_id = state_tree.add_sequence(
-                sequence_id=seq.sequence_id,
-                backbone_id=seq.backbone_id,
-                sequence=seq.sequence,
-                score=seq.score,
-                fasta_path=seq.fasta_path,
-            )
-            # Set ceiling cost based on stage timeout (passive observability)
-            state_tree.set_ceiling_from_stage(seq_node_id, cost_estimate["_timeouts"]["proteinmpnn"])
-            state_tree.end_timing(
-                seq_node_id,
-                status=NodeStatus.COMPLETED,
-                cost_usd=cost_estimate["proteinmpnn"] / max(1, len(sequences)),
-            )
+        if state_tree and sequences:
+            # Parallel execution: all sequences took [duration] to generate
+            # We don't amortize time because they ran in parallel batches
+            # Cost is derived from container count, but billable time is wall-clock
+            for seq in sequences:
+                seq_node_id = state_tree.add_sequence(
+                    sequence_id=seq.sequence_id,
+                    parent_id=seq.backbone_id, # Changed from backbone_id to parent_id
+                    sequence=seq.sequence,
+                    score=seq.score, # Retained from original
+                    fasta_path=seq.fasta_path, # Retained from original
+                )
+                state_tree.set_ceiling_from_stage(seq_node_id, cost_estimate["_timeouts"]["proteinmpnn"])
+                # FIX: Use full stage duration for parallel timing (active observability)
+                # This correctly reflects that N resources were occupied for T seconds
+                state_tree.end_timing(
+                    seq_node_id,
+                    status=NodeStatus.COMPLETED,
+                    # Cost is still amortized purely for per-unit dollar accounting
+                    cost_usd=cost_estimate["proteinmpnn"] / max(1, len(sequences)),
+                )
+                # Manually override duration to reflect parallel execution
+                # (end_timing sets duration using wall-clock, which is correct here since we just finished the stage)
+                # But we want to ensure start/end times align with the batch
+                node_data = state_tree.graph.nodes[seq_node_id]["data"]
+                node_data.timing.start_time = stage_start
+                node_data.timing.end_time = stage_start + stage_duration
+                node_data.timing.duration_sec = stage_duration
         
         predictions = None  # Will be computed in Phase 2
         
@@ -1237,6 +1249,11 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             state_tree.end_timing(pc_node_id, status=NodeStatus.COMPLETED)
         
         # Add cross-reactivity nodes to state tree (decoy checks)
+        # Add cross-reactivity nodes to state tree (decoy checks)
+        # Since we use .local() execution for optimization, we model this as sequential
+        current_time = stage_start # Start tracking from beginning of stage
+        avg_duration = stage_duration / max(1, num_pairs) if num_pairs > 0 else 0.0
+
         for seq_id, cr_results in cross_reactivity_results.items():
             for cr in cr_results:
                 cr_node_id = state_tree.add_cross_reactivity(
@@ -1251,6 +1268,14 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
                 )
                 # Set ceiling cost based on stage timeout (passive observability)
                 state_tree.set_ceiling_from_stage(cr_node_id, cost_estimate["_timeouts"]["chai1"])
+                
+                # Manually set sequential timing
+                node_data = state_tree.graph.nodes[cr_node_id]["data"]
+                node_data.timing.start_time = current_time
+                node_data.timing.end_time = current_time + avg_duration
+                node_data.timing.duration_sec = avg_duration
+                current_time += avg_duration # Advance time for next node
+                
                 state_tree.end_timing(
                     cr_node_id,
                     status=NodeStatus.COMPLETED,
@@ -1839,8 +1864,8 @@ def _run_adaptive_generation(
             if state_tree:
                 val_batch_id = f"boltz2_batch{batch_num}"
                 # Calculate amortized duration per prediction input (including failures)
-                # This ensures cost is distributed among COMPLETED and FAILED/FILTERED nodes
-                avg_duration = batch_duration / len(batch_results) if batch_results else 0.0
+                # FIX: Use FULL batch duration for all nodes to reflect parallel execution
+                # This ensures timeline visualizer shows them stacked
                 
                 for i, (seq, pred, error) in enumerate(batch_results):
                     # Generate ID for failed predictions or use real one
@@ -1865,16 +1890,18 @@ def _run_adaptive_generation(
                     if error and ("failed" in error.lower() or "timeout" in error.lower()):
                          status = NodeStatus.FAILED
                     
-                    # Manually set timing based on batch execution
+                    # Manually set timing based on batch execution (Parallel)
                     if pred_node_id in state_tree.graph:
                         node_data = state_tree.graph.nodes[pred_node_id]["data"]
-                        node_data.timing.start_time = batch_start_time + (i * avg_duration)
-                        node_data.timing.end_time = node_data.timing.start_time + avg_duration
-                        node_data.timing.duration_sec = avg_duration
+                        node_data.timing.start_time = batch_start_time
+                        node_data.timing.end_time = batch_end_time
+                        node_data.timing.duration_sec = batch_duration
                         if error:
                             node_data.error_message = error
                     
-                    state_tree.end_timing(pred_node_id, status)
+                    # Do not call end_timing as it resets using time.time()
+                    # Just finalize status and cost
+                    state_tree.set_status(pred_node_id, status)
                     state_tree.set_batch_info(pred_node_id, val_batch_id, i, len(batch_results))
                 
                 # Mark sequences that failed validation as filtered

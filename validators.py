@@ -1558,7 +1558,9 @@ def check_cross_reactivity_parallel(
                 
                 # Tier 1: Must pass all high-risk decoys
                 for decoy in tier1_decoys:
-                    result = run_chai1.remote(
+                    # Use .local() to run synchronously in this container
+                    # This avoids the runtime crash of accessing Future result immediately
+                    result = run_chai1.local(
                         seq, decoy, config, 
                         f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}"
                     )
@@ -1577,7 +1579,7 @@ def check_cross_reactivity_parallel(
                 
                 # Tier 2: Check medium-risk decoys (early termination within tier)
                 for decoy in tier2_decoys:
-                    result = run_chai1.remote(
+                    result = run_chai1.local(
                         seq, decoy, config, 
                         f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}"
                     )
@@ -1612,8 +1614,8 @@ def check_cross_reactivity_parallel(
                 decoy_results[seq.sequence_id] = []
                 
                 for decoy in sorted_decoys:
-                    # Run single prediction
-                    result = run_chai1.remote(
+                    # Run single prediction synchronously
+                    result = run_chai1.local(
                         seq, decoy, config, 
                         f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}"
                     )
