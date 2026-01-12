@@ -158,10 +158,10 @@ backbone_filter:
   min_score: 0.6 # Strict: Discard bottom 60% of backbones immediately
   max_keep: null # Max backbones to keep (null = no limit)
 
-# Adaptive generation with early termination
+# Adaptive generation with early termination (>Boltz-2)
 adaptive:
   enabled: true # Enabled for batching
-  min_validated_candidates: 100 # Stop after 10 validated candidates
+  min_validated_candidates: 10 # Take top 10 candidates
   batch_size: 10 # Increased for throughput (was 5)
 
 # Solubility filter (1D chemistry gates)
