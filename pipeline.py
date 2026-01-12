@@ -749,10 +749,10 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             for seq in sequences:
                 seq_node_id = state_tree.add_sequence(
                     sequence_id=seq.sequence_id,
-                    parent_id=seq.backbone_id, # Changed from backbone_id to parent_id
+                    backbone_id=seq.backbone_id,
                     sequence=seq.sequence,
-                    score=seq.score, # Retained from original
-                    fasta_path=seq.fasta_path, # Retained from original
+                    score=seq.score,
+                    fasta_path=seq.fasta_path,
                 )
                 state_tree.set_ceiling_from_stage(seq_node_id, cost_estimate["_timeouts"]["proteinmpnn"])
                 # FIX: Use full stage duration for parallel timing (active observability)

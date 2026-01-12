@@ -371,20 +371,10 @@ def _parse_boltz2_metrics(
     return None
 
 
-def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -> Optional[float]:
+def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -> float | None:
     """
     Calculate backbone RMSD between RFDiffusion design and Boltz-2 prediction.
-    
-    Uses robust sequence alignment (Biotite) to handle gaps, insertions, and 
-    residue mismatches correctly.
-    
-    Args:
-        ref_pdb: Path to RFDiffusion backbone PDB
-        pred_pdb: Path to Boltz-2 predicted structure (PDB or CIF)
-        chain_id: Chain ID of binder (default: B)
-    
-    Returns:
-        RMSD in Angstroms, or None if calculation fails
+    Correctly parses Biotite Alignment.trace (N x 2 array of indices).
     """
     try:
         import biotite.structure as struc
@@ -393,107 +383,97 @@ def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -
         import biotite.sequence.align as align
         import numpy as np
         
-        # 1. Load structures (Robust to PDB/CIF/MMTF)
-        # Handle CIF files explicitly as struc_io.load_structure might need help detecting format
-        if ref_pdb.endswith(".cif"):
-            ref_file = struc_io.load_structure(ref_pdb, format="cif")
-        else:
-            ref_file = struc_io.load_structure(ref_pdb)
-            
-        if pred_pdb.endswith(".cif"):
-            pred_file = struc_io.load_structure(pred_pdb, format="cif")
-        else:
-            pred_file = struc_io.load_structure(pred_pdb)
-        
-        # 2. Extract CA atoms
-        # For reference: Use the specified chain_id (usually B from RFDiffusion)
-        # If chain doesn't exist, fallback to first chain
-        ref_ca = ref_file[(ref_file.atom_name == "CA") & (ref_file.chain_id == chain_id)]
-        if len(ref_ca) == 0:
-            # Fallback: use first chain if specified chain empty
-            chains = np.unique(ref_file.chain_id)
-            if len(chains) > 0:
-                ref_ca = ref_file[(ref_file.atom_name == "CA") & (ref_file.chain_id == chains[0])]
-        
-        if len(ref_ca) == 0:
+        # [Helper function to load PDB/CIF safely]
+        def load_safe(path):
+            try:
+                return struc_io.load_structure(path)
+            except Exception:
+                # Fallback for specific formats
+                if path.endswith(".cif") or path.endswith(".mmcif"):
+                    import biotite.structure.io.mmcif as mmcif
+                    f = mmcif.MMCIFFile.read(path)
+                    return mmcif.get_structure(f, model=1)
+                elif path.endswith(".pdb"):
+                    import biotite.structure.io.pdb as pdb
+                    f = pdb.PDBFile.read(path)
+                    return pdb.get_structure(f, model=1)
+                raise
+
+        # 1. Load Files
+        try:
+            ref_file = load_safe(ref_pdb)
+            pred_file = load_safe(pred_pdb)
+        except Exception:
             return None
-            
-        # For prediction: Find chain matching the specified chain_id
-        pred_ca_all = pred_file[pred_file.atom_name == "CA"]
+
+        # 2. Extract CA Atoms (With Robust Chain Filtering)
+        ref_ca = ref_file[(ref_file.atom_name == "CA") & (ref_file.element == "C")]
+        
+        # Filter Ref Chain
+        ref_chain_atoms = ref_ca[ref_ca.chain_id == chain_id]
+        if len(ref_chain_atoms) > 0:
+            ref_ca = ref_chain_atoms
+        elif len(ref_ca) > 0:
+            # Fallback to first chain if specified chain missing
+            ref_ca = ref_ca[ref_ca.chain_id == ref_ca.chain_id[0]]
+        else:
+            return None
+
+        # Filter Pred Chain (Heuristic: Best Length Match)
+        pred_ca_all = pred_file[(pred_file.atom_name == "CA") & (pred_file.element == "C")]
         pred_ca = pred_ca_all[pred_ca_all.chain_id == chain_id]
         
-        # If specified chain not found or empty, use heuristic (length matching)
         if len(pred_ca) == 0:
-            min_len_diff = 9999
-            best_chain_atoms = None
-            
-            for chain in np.unique(pred_ca_all.chain_id):
-                chain_atoms = pred_ca_all[pred_ca_all.chain_id == chain]
-                diff = abs(len(chain_atoms) - len(ref_ca))
-                if diff < min_len_diff:
-                    min_len_diff = diff
-                    best_chain_atoms = chain_atoms
-            
-            if best_chain_atoms is None:
-                return None
-            pred_ca = best_chain_atoms
+            best_chain = None
+            min_diff = float('inf')
+            for cid in np.unique(pred_ca_all.chain_id):
+                candidate = pred_ca_all[pred_ca_all.chain_id == cid]
+                diff = abs(len(candidate) - len(ref_ca))
+                if diff < min_diff:
+                    min_diff = diff
+                    best_chain = candidate
+            pred_ca = best_chain
 
-        if len(pred_ca) == 0:
+        if pred_ca is None or len(ref_ca) < 3 or len(pred_ca) < 3:
             return None
 
-        # 3. Sequence Alignment (Robust to index shifts/gaps)
-        # Convert 3D atoms to 1D sequence
+        # 3. Sequence Alignment (Strictly following Biotite Docs)
         try:
             ref_seq = seq.ProteinSequence(ref_ca.res_name)
             pred_seq = seq.ProteinSequence(pred_ca.res_name)
-        except Exception:
-            # Fallback for non-standard residues
+        except ValueError:
             return None
-        
-        # Perform global alignment
+
         matrix = align.SubstitutionMatrix.std_protein_matrix()
-        # Use semi-global alignment (penalize gaps)
-        alignment = align.global_align(ref_seq, pred_seq, matrix)[0]
+        alignments = align.align_optimal(ref_seq, pred_seq, matrix, terminal_penalty=False)
         
-        # Get indices of matches (ignoring gaps)
-        codes = alignment.trace
-        ref_indices = []
-        pred_indices = []
-        
-        ref_curr = 0
-        pred_curr = 0
-        
-        for code in codes:
-            if code == 0:   # Match (residues aligned)
-                ref_indices.append(ref_curr)
-                pred_indices.append(pred_curr)
-                ref_curr += 1
-                pred_curr += 1
-            elif code == 1: # Gap in pred (insertion in ref)
-                ref_curr += 1
-            elif code == 2: # Gap in ref (insertion in pred)
-                pred_curr += 1
-        
-        if len(ref_indices) < 3: # Need at least 3 points for superposition
+        if not alignments:
             return None
             
-        # 4. Superimpose & Calculate RMSD
-        # Filter atoms to the matched subset
+        # DOCS CONFIRMATION: trace is (N, 2) array. -1 is a gap.
+        trace = alignments[0].trace 
+        
+        # We want rows where neither column is -1
+        # Column 0 = Ref Index, Column 1 = Pred Index
+        match_mask = (trace[:, 0] != -1) & (trace[:, 1] != -1)
+        
+        ref_indices = trace[match_mask, 0]
+        pred_indices = trace[match_mask, 1]
+        
+        if len(ref_indices) < 3:
+            return None
+            
+        # 4. RMSD Calculation
         ref_ca_aligned = ref_ca[ref_indices]
         pred_ca_aligned = pred_ca[pred_indices]
         
-        # Superimpose (Kabsch algorithm)
-        pred_ca_superimposed, transformation = struc.superimpose(
-            ref_ca_aligned, pred_ca_aligned
-        )
-        
-        # Calculate RMSD
+        pred_ca_superimposed, _ = struc.superimpose(ref_ca_aligned, pred_ca_aligned)
         rmsd = struc.rmsd(ref_ca_aligned, pred_ca_superimposed)
         
         return float(rmsd)
-        
+
     except Exception as e:
-        print(f"  Warning: Robust RMSD calculation failed: {e}")
+        print(f"RMSD Error: {e}")
         return None
 
 
