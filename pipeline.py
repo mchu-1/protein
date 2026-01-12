@@ -2058,10 +2058,13 @@ def _create_best_symlinks(
 
     for candidate in top_candidates:
         # Find the predicted structure file
-        pattern = f"{validation_dir}/{candidate.structure_prediction.sequence_id}/**/*.pdb"
+        # Note: Boltz-2 outputs are nested under batch_N/ subdirectories, so we need
+        # to search recursively from the validation root for the sequence_id folder
+        seq_id = candidate.structure_prediction.sequence_id
+        pattern = f"{validation_dir}/**/{seq_id}/**/*.pdb"
         pdb_files = glob.glob(pattern, recursive=True)
         if not pdb_files:
-            pattern = f"{validation_dir}/{candidate.structure_prediction.sequence_id}/**/*.cif"
+            pattern = f"{validation_dir}/**/{seq_id}/**/*.cif"
             pdb_files = glob.glob(pattern, recursive=True)
 
         if pdb_files:
