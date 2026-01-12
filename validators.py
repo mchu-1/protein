@@ -52,7 +52,7 @@ def run_boltz2(
     target: TargetProtein,
     config: Boltz2Config,
     output_dir: str,
-) -> Optional[StructurePrediction]:
+) -> tuple[Optional[StructurePrediction], Optional[str]]:
     """
     Predict the complex structure of binder + target using Boltz-2.
 
@@ -63,7 +63,7 @@ def run_boltz2(
         output_dir: Directory to store output PDB files
 
     Returns:
-        StructurePrediction if successful, None otherwise
+        Tuple of (StructurePrediction if successful, error message if failed)
     """
 
     os.makedirs(output_dir, exist_ok=True)
@@ -103,9 +103,10 @@ def run_boltz2(
         )
 
         if result.returncode != 0:
+            error_msg = f"Process failed: {result.stderr[-200:] if result.stderr else 'unknown error'}"
             # Only print errors in quiet mode
-            print(f"  ✗ {sequence.sequence_id} failed: {result.stderr[-200:] if result.stderr else 'unknown error'}")
-            return None
+            print(f"  ✗ {sequence.sequence_id} {error_msg}")
+            return None, error_msg
 
         # Find output structure file
         import glob
@@ -119,8 +120,9 @@ def run_boltz2(
         elif cif_files:
             output_pdb = cif_files[0]
         else:
-            print(f"  ✗ {sequence.sequence_id}: no output structure")
-            return None
+            msg = "No output structure found"
+            print(f"  ✗ {sequence.sequence_id}: {msg}")
+            return None, msg
 
         # Parse Boltz-2 output metrics with AlphaProteo metrics
         # Pass hotspots for pae_interaction, backbone for RMSD
@@ -162,20 +164,23 @@ def run_boltz2(
         # 1. Anchor Lock: min PAE at hotspots < 1.5 Å
         if prediction.pae_interaction is not None:
             if prediction.pae_interaction > config.max_pae_interaction:
-                print(f"  ✗ {sequence.sequence_id}: PAE@hotspots {prediction.pae_interaction:.2f} Å > {config.max_pae_interaction} Å")
-                return None
+                msg = f"PAE@hotspots {prediction.pae_interaction:.2f} Å > {config.max_pae_interaction} Å"
+                print(f"  ✗ {sequence.sequence_id}: {msg}")
+                return None, msg
         
         # 2. Fold Quality: binder-only pTM > 0.80
         if prediction.ptm_binder is not None:
             if prediction.ptm_binder < config.min_ptm_binder:
-                print(f"  ✗ {sequence.sequence_id}: pTM(binder) {prediction.ptm_binder:.3f} < {config.min_ptm_binder}")
-                return None
+                msg = f"pTM(binder) {prediction.ptm_binder:.3f} < {config.min_ptm_binder}"
+                print(f"  ✗ {sequence.sequence_id}: {msg}")
+                return None, msg
         
         # 3. Self-Consistency: RMSD vs RFDiffusion < 2.5 Å
         if prediction.rmsd_to_design is not None:
             if prediction.rmsd_to_design > config.max_rmsd:
-                print(f"  ✗ {sequence.sequence_id}: RMSD {prediction.rmsd_to_design:.2f} Å > {config.max_rmsd} Å")
-                return None
+                msg = f"RMSD {prediction.rmsd_to_design:.2f} Å > {config.max_rmsd} Å"
+                print(f"  ✗ {sequence.sequence_id}: {msg}")
+                return None, msg
 
         # Build status string (AlphaProteo metrics only)
         status_parts = []
@@ -186,14 +191,16 @@ def run_boltz2(
         if prediction.rmsd_to_design is not None:
             status_parts.append(f"RMSD={prediction.rmsd_to_design:.2f}Å")
         print(f"  ✓ {sequence.sequence_id}: {', '.join(status_parts)}")
-        return prediction
+        return prediction, None
 
     except subprocess.TimeoutExpired:
-        print(f"  ✗ {sequence.sequence_id}: timeout")
-        return None
+        msg = "Validation timeout"
+        print(f"  ✗ {sequence.sequence_id}: {msg}")
+        return None, msg
     except Exception as e:
-        print(f"  ✗ {sequence.sequence_id}: {e}")
-        return None
+        msg = str(e)
+        print(f"  ✗ {sequence.sequence_id}: {msg}")
+        return None, msg
     finally:
         data_volume.commit()
 
@@ -209,7 +216,7 @@ def run_boltz2_batch(
     target: TargetProtein,
     config: Boltz2Config,
     output_dir: str,
-) -> list[StructurePrediction]:
+) -> list[tuple[SequenceDesign, Optional[StructurePrediction], Optional[str]]]:
     """
     Run Boltz-2 on multiple sequences.
 
@@ -220,17 +227,17 @@ def run_boltz2_batch(
         output_dir: Output directory
 
     Returns:
-        List of successful structure predictions
+        List of tuples (sequence, prediction, error_message).
+        Prediction is None if failed/filtered.
     """
-    predictions: list[StructurePrediction] = []
+    results: list[tuple[SequenceDesign, Optional[StructurePrediction], Optional[str]]] = []
 
     for sequence in sequences:
         seq_output_dir = f"{output_dir}/{sequence.sequence_id}"
-        pred = run_boltz2.local(sequence, target, config, seq_output_dir)
-        if pred is not None:
-            predictions.append(pred)
+        pred, error = run_boltz2.local(sequence, target, config, seq_output_dir)
+        results.append((sequence, pred, error))
 
-    return predictions
+    return results
 
 
 def _extract_sequence_from_pdb(pdb_path: str, chain_id: str) -> str:

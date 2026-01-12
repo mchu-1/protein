@@ -1821,7 +1821,7 @@ def _run_adaptive_generation(
         batch_start_time = time.time()
         
         try:
-            batch_predictions = validate_sequences_parallel.remote(
+            batch_results = validate_sequences_parallel.remote(
                 sequences_for_validation,
                 target,
                 boltz2_config,
@@ -1834,30 +1834,36 @@ def _run_adaptive_generation(
         batch_end_time = time.time()
         batch_duration = batch_end_time - batch_start_time
         
-        if batch_predictions:
+        if batch_results:
             # Add prediction nodes to state tree DURING adaptive generation (for live stats)
             if state_tree:
                 val_batch_id = f"boltz2_batch{batch_num}"
-                # Calculate amortized duration per prediction
-                # Note: We divide total time by number of *inputs* attempted, not just successes,
-                # but map cost only to successful predictions here (simplification)
-                # Better: attribute cost to failed nodes too if we tracked them
-                avg_duration = batch_duration / len(batch_predictions) if batch_predictions else 0.0
+                # Calculate amortized duration per prediction input (including failures)
+                # This ensures cost is distributed among COMPLETED and FAILED/FILTERED nodes
+                avg_duration = batch_duration / len(batch_results) if batch_results else 0.0
                 
-                for i, pred in enumerate(batch_predictions):
+                for i, (seq, pred, error) in enumerate(batch_results):
+                    # Generate ID for failed predictions or use real one
+                    pred_id = pred.prediction_id if pred else generate_design_id("pred")
+                    
                     pred_node_id = state_tree.add_prediction(
-                        prediction_id=pred.prediction_id,
-                        sequence_id=pred.sequence_id,
-                        pdb_path=pred.pdb_path,
-                        plddt_overall=pred.plddt_overall,
-                        plddt_interface=pred.plddt_interface,
-                        pae_interface=pred.pae_interface,
-                        ptm=pred.ptm,
-                        iptm=pred.iptm,
-                        pae_interaction=pred.pae_interaction,
-                        ptm_binder=pred.ptm_binder,
-                        rmsd_to_design=pred.rmsd_to_design,
+                        prediction_id=pred_id,
+                        sequence_id=seq.sequence_id,
+                        pdb_path=pred.pdb_path if pred else None,
+                        plddt_overall=pred.plddt_overall if pred else None,
+                        plddt_interface=pred.plddt_interface if pred else None,
+                        pae_interface=pred.pae_interface if pred else None,
+                        ptm=pred.ptm if pred else None,
+                        iptm=pred.iptm if pred else None,
+                        pae_interaction=pred.pae_interaction if pred else None,
+                        ptm_binder=pred.ptm_binder if pred else None,
+                        rmsd_to_design=pred.rmsd_to_design if pred else None,
                     )
+                    
+                    # Determine status and message
+                    status = NodeStatus.COMPLETED if pred else NodeStatus.FILTERED
+                    if error and ("failed" in error.lower() or "timeout" in error.lower()):
+                         status = NodeStatus.FAILED
                     
                     # Manually set timing based on batch execution
                     if pred_node_id in state_tree.graph:
@@ -1865,21 +1871,37 @@ def _run_adaptive_generation(
                         node_data.timing.start_time = batch_start_time + (i * avg_duration)
                         node_data.timing.end_time = node_data.timing.start_time + avg_duration
                         node_data.timing.duration_sec = avg_duration
+                        if error:
+                            node_data.error_message = error
                     
-                    state_tree.end_timing(pred_node_id, NodeStatus.COMPLETED)
-                    state_tree.set_batch_info(pred_node_id, val_batch_id, i, len(batch_predictions))
+                    state_tree.end_timing(pred_node_id, status)
+                    state_tree.set_batch_info(pred_node_id, val_batch_id, i, len(batch_results))
                 
                 # Mark sequences that failed validation as filtered
-                validated_seq_ids = {p.sequence_id for p in batch_predictions}
-                for seq in sequences_for_validation:
-                    if seq.sequence_id not in validated_seq_ids:
+                # We do this logic by checking if pred is None
+                # (Logic was: check if seq_id in valid_ids)
+                # But state_tree already has these nodes as FILTERED/FAILED above if we added them.
+                # However, sequences_for_validation might contain sequences that were NOT valid?
+                # No, sequences_for_validation passed to batch function matched 1:1 with output.
+                # But wait, original code skipped adding validation nodes if failed?
+                # Original code:
+                # 1. Add valid PREDICTIONS (COMPLETED)
+                # 2. Mark SEQUENCES as FILTERED if not in valid predictions
+                
+                # Now we have prediction nodes for failures too.
+                # So we should mark the SEQUENCE as FILTERED if the prediction failed/filtered.
+                for seq, pred, _ in batch_results:
+                    if pred is None:
                         state_tree.set_status(seq.sequence_id, NodeStatus.FILTERED)
             
+            # Extract successful predictions for downstream
+            batch_predictions = [p for _, p, _ in batch_results if p is not None]
             validated_predictions.extend(batch_predictions)
+            
             print(f"  Step 3: Validated {len(batch_predictions)}/{len(sequences_for_validation)} sequences")
             print(f"  Running total: {len(validated_predictions)}/{adaptive_config.min_validated_candidates} validated candidates")
         else:
-            print("  Step 3: No sequences passed validation in this batch")
+            print("  Step 3: No results returned in this batch")
         
         # =====================================================================
         # Check if we have enough validated candidates to stop
@@ -1959,7 +1981,9 @@ def _run_structure_validation(
         return predictions
 
     try:
-        return validate_sequences_parallel.remote(sequences, target, config, output_dir)
+        results = validate_sequences_parallel.remote(sequences, target, config, output_dir)
+        # Filter successes from tuples
+        return [p for _, p, _ in results if p is not None]
     except Exception as e:
         print(f"Boltz-2 validation failed: {e}")
         return []
