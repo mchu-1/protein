@@ -1008,7 +1008,7 @@ class PipelineStateTree:
         print(f"  Structural twins: {opt['structural_twins']}")
         
         costs = stats["costs"]
-        print(f"\nCosts:")
+        print("\nCosts:")
         print(f"  Actual: ${costs['actual_usd']:.3f}")
         print(f"  Saved by optimizations: ${costs['saved_usd']:.3f} ({costs['optimization_savings_pct']:.0f}%)")
         print(f"  Ceiling: ${costs['ceiling_usd']:.3f}")
@@ -1016,7 +1016,7 @@ class PipelineStateTree:
         
         batch = stats["batching"]
         if batch.get("total_batches", 0) > 0:
-            print(f"\nBatching:")
+            print("\nBatching:")
             print(f"  Batches: {batch['total_batches']} (avg size: {batch['avg_batch_size']:.1f})")
             print(f"  Cold starts avoided: {batch['cold_starts_avoided']}")
         

@@ -9,6 +9,7 @@ This module implements:
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -116,7 +117,6 @@ def run_rfdiffusion(
         # Since we put the binder first ([binder/0 target]), binder is ALWAYS A.
         # The target (regardless of its original ID) becomes Chain B.
         binder_chain = "A"
-        target_chain_id = "B"
         
         for i in range(config.num_designs):
             pdb_path = f"{output_dir}/design_{i}.pdb"
@@ -277,9 +277,6 @@ def run_proteinmpnn(
     sequences: list[SequenceDesign] = []
 
     try:
-        # Use the binder chain ID from the backbone design
-        chains_to_design = backbone.binder_chain_id
-
         # ProteinMPNN path from environment (set in image) or fallback
         proteinmpnn_path = os.environ.get("PROTEINMPNN_PATH", "/app/ProteinMPNN")
         

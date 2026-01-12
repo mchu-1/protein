@@ -2218,7 +2218,6 @@ def check_novelty(
         return sequences
     
     try:
-        import pyhmmer
         from pyhmmer.easel import TextSequence, Alphabet, SequenceFile
         from pyhmmer.plan7 import Pipeline
         

@@ -26,7 +26,6 @@ from common import (
     AdaptiveGenerationConfig,
     BackboneDesign,
     BackboneFilterConfig,
-    BeamPruningConfig,
     BinderCandidate,
     Boltz2Config,
     Chai1Config,
@@ -58,7 +57,6 @@ from common import (
 from state_tree import (
     PipelineStateTree,
     NodeStatus,
-    StageType,
     create_state_tree,
 )
 from generators import (
@@ -86,8 +84,6 @@ from optimizers import (
     BeamPruner,
     apply_sequence_filters,
     filter_redundant_backbones,
-    filter_sequences_by_solubility,
-    filter_sequences_by_stickiness,
 )
 
 # Note: Local modules are added to all images in common.py via _add_local_modules()
@@ -483,7 +479,6 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     #   └── [FoldSeek]
     #
     # ==========================================================================
-    limits = config.limits
     
     # Level 1: RFDiffusion
     # No limit enforcement on backbones per target
@@ -517,7 +512,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     print("\nConfiguration:")
     print(f"├─ Backbones: {config.rfdiffusion.num_designs}")
     print(f"│  └─ Sequences: {config.proteinmpnn.num_sequences}/backbone → {total_sequences} total")
-    print(f"│     └─ Validations: all generated sequences")
+    print("│     └─ Validations: all generated sequences")
     print(f"│        └─ Chai-1: all validated seqs × {config.foldseek.max_hits} decoys")
     print(f"└─ Decoys: {config.foldseek.max_hits}")
     print(f"\nCost ceiling: ${cost_estimate['total']:.2f}")
@@ -805,7 +800,6 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         # =========================================================================
         # Apply all sequence-level filters before expensive structure prediction
         pre_filter_count = len(sequences)
-        all_seq_ids_before = {s.sequence_id for s in sequences}
         
         sequences, filter_stats = apply_sequence_filters(
             sequences,
@@ -909,7 +903,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             if pruned_count > 0:
                 saved_cost_per_seq, saved_time_per_seq = _calculate_downstream_savings(config, "esmfold")
                 
-                print(f"💰 ESMFold Savings:")
+                print("💰 ESMFold Savings:")
                 print(f"  Sequences pruned: {pruned_count}")
                 print(f"  Boltz-2 + Chai-1 avoided: ${saved_cost_per_seq * pruned_count:.2f}")
                 
@@ -1410,7 +1404,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             print(f"{'TOTAL':<25} {'':<10} ${total_opt_cost:<14.3f} {total_opt_time:<14.1f}s")
         
         if batch_efficiency.get("total_batches", 0) > 0:
-            print(f"\nBatch Consolidation:")
+            print("\nBatch Consolidation:")
             print(f"  Batches: {batch_efficiency['total_batches']} (avg size: {batch_efficiency['avg_batch_size']:.1f})")
             print(f"  Cold starts avoided: {batch_efficiency['cold_starts_avoided']}")
             print(f"  Amortization efficiency: {batch_efficiency['cold_start_amortization_pct']:.0f}%")
@@ -1677,7 +1671,6 @@ def _run_adaptive_generation(
         
         # Apply sequence filters (solubility, stickiness, beam pruning)
         pre_filter = len(batch_sequences)
-        pre_filter_seq_ids = {s.sequence_id for s in batch_sequences}
         filter_stats = {}
         if solubility_config or stickiness_config or beam_pruner:
             batch_sequences, filter_stats = apply_sequence_filters(
@@ -1699,7 +1692,6 @@ def _run_adaptive_generation(
             # Calculate amortized duration per sequence
             avg_duration = batch_duration / len(batch_sequences) if batch_sequences else 0.0
             
-            kept_seq_ids = {s.sequence_id for s in batch_sequences}
             for i, seq in enumerate(batch_sequences):
                 seq_node_id = state_tree.add_sequence(
                     sequence_id=seq.sequence_id,
@@ -1746,7 +1738,6 @@ def _run_adaptive_generation(
             backbone_pdbs = {bb.design_id: bb.pdb_path for bb in batch_backbones}
             
             # Start timing ESMFold batch
-            esmfold_start_time = time.time()
             
             try:
                 batch_sequences = run_esmfold_validation_batch.remote(
@@ -1758,10 +1749,6 @@ def _run_adaptive_generation(
                 )
             except Exception as e:
                 print(f"  ESMFold batch failed: {e}")
-                # Continue with original sequences if ESMFold fails
-            
-            esmfold_end_time = time.time()
-            esmfold_duration = esmfold_end_time - esmfold_start_time
             
             post_esmfold_count = len(batch_sequences)
             pruned_count = pre_esmfold_count - post_esmfold_count
@@ -2344,9 +2331,7 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     eff = costs["_effective"]
     timeouts = costs["_timeouts"]
     
-    # Requested values
-    req_backbones = config.rfdiffusion.num_designs
-    req_decoys = config.foldseek.max_hits
+    # requested values
     
     eff_backbones = eff["backbones"]
     eff_seqs_per_backbone = eff["seqs_per_backbone"]
@@ -2366,7 +2351,6 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     chai1_sec = timeouts["chai1"] * eff_chai1
     
     est_runtime_sec = costs["_runtime_sec"]
-    est_runtime_min = est_runtime_sec / 60
 
     # Create human-readable timestamp
     def format_runtime(seconds: float) -> str:
