@@ -16,8 +16,8 @@ The pipeline operates as a Directed Acyclic Graph (DAG) with three main phases:
 ┌─────────────────────────────────────────────────────────────────────┐
 │                   Phase 2: Validation (Specificity)                  │
 ├─────────────────────────────────────────────────────────────────────┤
-│      Sequences + Target → [Boltz-2] → Validated Candidates          │
-│                     (Filter by i-pLDDT and PAE)                     │
+│  Sequences → [ESMFold Gatekeeper] → Filtered → [Boltz-2] → Validated│
+│         (Orthogonal pLM filters hallucinations, 30-50% cost cut)    │
 └─────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────┐
