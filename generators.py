@@ -112,9 +112,11 @@ def run_rfdiffusion(
             # Try to continue with any designs that were generated
 
         # Collect generated designs
-        # RFDiffusion usually assigns the first contig (the binder) to chain A
-        # but it might vary. We'll use a chain that isn't the target chain.
-        binder_chain = "A" if target.chain_id != "A" else "B"
+        # RFDiffusion assigns chains sequentially based on contigmap order.
+        # Since we put the binder first ([binder/0 target]), binder is ALWAYS A.
+        # The target (regardless of its original ID) becomes Chain B.
+        binder_chain = "A"
+        target_chain_id = "B"
         
         for i in range(config.num_designs):
             pdb_path = f"{output_dir}/design_{i}.pdb"
@@ -281,16 +283,27 @@ def run_proteinmpnn(
         # ProteinMPNN path from environment (set in image) or fallback
         proteinmpnn_path = os.environ.get("PROTEINMPNN_PATH", "/app/ProteinMPNN")
         
+        # ProteinMPNN CLI expects a JSONL file to handle multiple chains correctly
+        # (specifying which ones to design vs fix).
+        # Format: {pdb_name: [designed_chain_list, fixed_chain_list]}
+        pdb_stem = Path(backbone.pdb_path).stem
+        chain_id_jsonl = f"{output_dir}/chain_id_dict.jsonl"
+        with open(chain_id_jsonl, "w") as f:
+            # Binder is A (designed), Target is B (fixed)
+            f.write(json.dumps({pdb_stem: [["A"], ["B"]]}) + "\n")
+
         # ProteinMPNN command
-        # Note: ProteinMPNN designs all chains by default; use --pdb_path_chains to specify
-        # which chains to include. For binder design, we include both target (A) and binder (B)
+        # Load BOTH chains (A B) but only design A, as specified in the JSONL.
+        # Missing context (only loading one chain) is a common cause of Poly-G failure.
         cmd = [
             "python",
             f"{proteinmpnn_path}/protein_mpnn_run.py",
             "--pdb_path",
             backbone.pdb_path,
             "--pdb_path_chains",
-            chains_to_design,  # Only design chain B (binder), chain A (target) is fixed
+            "A B",  # Load BOTH chains to provide structural context
+            "--chain_id_jsonl",
+            chain_id_jsonl,
             "--out_folder",
             output_dir,
             "--num_seq_per_target",
@@ -300,7 +313,7 @@ def run_proteinmpnn(
             "--backbone_noise",
             str(config.backbone_noise),
             "--model_name",
-            "v_48_020",  # Standard ProteinMPNN model
+            "v_48_020",
             "--path_to_model_weights",
             f"{proteinmpnn_path}/vanilla_model_weights",
         ]
