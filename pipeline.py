@@ -75,6 +75,7 @@ from validators import (
     mock_boltz2,
     mock_chai1,
     mock_foldseek,
+    run_esmfold_validation_batch,
     run_foldseek,
     save_decoys_to_cache,
     validate_sequences_parallel,
@@ -883,6 +884,86 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             return _create_empty_result(run_id, config, validation_results, start_time, state_tree)
 
         # =========================================================================
+        # Phase 1.5: ESMFold Gatekeeper (Orthogonal Validation)
+        # =========================================================================
+        
+        if config.esmfold.enabled and not use_mocks:
+            print("\n=== Phase 1.5: ESMFold Gatekeeper (Orthogonal Validation) ===")
+            print(f"[START] {time.strftime('%H:%M:%S')} | Input: {len(sequences)} sequences")
+            print(f"  Thresholds: pLDDT ≥ {config.esmfold.min_plddt}, RMSD ≤ {config.esmfold.max_rmsd} Å")
+            stage_start = time.time()
+            
+            # Build backbone PDB mapping for RMSD calculation
+            backbone_pdbs = {bb.design_id: bb.pdb_path for bb in backbones}
+            
+            # Track pre-gatekeeper count
+            pre_esmfold_count = len(sequences)
+            pre_esmfold_ids = {s.sequence_id for s in sequences}
+            
+            # Run ESMFold validation
+            sequences = run_esmfold_validation_batch.remote(
+                sequences=sequences,
+                backbone_pdbs=backbone_pdbs,
+                min_plddt=config.esmfold.min_plddt,
+                max_rmsd=config.esmfold.max_rmsd,
+                output_dir=f"{dirs['sequences']}/esmfold" if config.esmfold.save_predictions else None,
+            )
+            
+            stage_duration = time.time() - stage_start
+            post_esmfold_count = len(sequences)
+            pruned_count = pre_esmfold_count - post_esmfold_count
+            prune_rate = 100 * pruned_count / pre_esmfold_count if pre_esmfold_count > 0 else 0
+            
+            print(f"[DONE]  {time.strftime('%H:%M:%S')} | Output: {post_esmfold_count}/{pre_esmfold_count} passed ({pruned_count} pruned, {prune_rate:.1f}%)")
+            print(f"  Duration: {stage_duration:.1f}s")
+            
+            stage_metrics.append(_log_stage_metrics(
+                "esmfold", stage_duration, post_esmfold_count,
+                cost_estimate["_timeouts"]["esmfold"] * pre_esmfold_count, 
+                cost_estimate.get("esmfold", 0.0)
+            ))
+            
+            # Calculate downstream savings for pruned sequences
+            if pruned_count > 0:
+                saved_cost_per_seq, saved_time_per_seq = _calculate_downstream_savings(config, "esmfold")
+                
+                print(f"💰 ESMFold Savings:")
+                print(f"  Sequences pruned: {pruned_count}")
+                print(f"  Boltz-2 + Chai-1 avoided: ${saved_cost_per_seq * pruned_count:.2f}")
+                
+                # Mark pruned sequences in state tree
+                post_esmfold_ids = {s.sequence_id for s in sequences}
+                pruned_ids = pre_esmfold_ids - post_esmfold_ids
+                
+                for seq_id in pruned_ids:
+                    state_tree.mark_skipped(
+                        node_id=seq_id,
+                        skipped_by="esmfold_gatekeeper",
+                        skip_reason="Failed ESMFold validation (low pLDDT or high RMSD)",
+                        saved_cost_usd=saved_cost_per_seq,
+                        saved_timing_sec=saved_time_per_seq,
+                    )
+                
+                # Track optimization impact
+                optimization_stats["esmfold_pruned"] = pruned_count
+            
+            # Record ESMFold timing in state tree metrics
+            state_tree.set_metrics(run_id, {
+                "esmfold_gatekeeper": {
+                    "enabled": True,
+                    "input_sequences": pre_esmfold_count,
+                    "output_sequences": post_esmfold_count,
+                    "pruned": pruned_count,
+                    "prune_rate": prune_rate / 100,
+                    "duration_sec": stage_duration,
+                }
+            })
+            
+            if not sequences:
+                print("All sequences pruned by ESMFold gatekeeper")
+                return _create_empty_result(run_id, config, validation_results, start_time, state_tree)
+
+        # =========================================================================
         # Phase 2: Validation (Specificity) - Standard Mode
         # =========================================================================
 
@@ -1667,6 +1748,61 @@ def _run_adaptive_generation(
                         )
         
         all_sequences.extend(batch_sequences)
+        
+        # =====================================================================
+        # Step 2.5: ESMFold Gatekeeper (Orthogonal Validation)
+        # =====================================================================
+        if config and config.esmfold.enabled:
+            pre_esmfold_count = len(batch_sequences)
+            pre_esmfold_ids = {s.sequence_id for s in batch_sequences}
+            
+            # Build backbone PDB mapping for RMSD calculation
+            backbone_pdbs = {bb.design_id: bb.pdb_path for bb in batch_backbones}
+            
+            # Start timing ESMFold batch
+            esmfold_start_time = time.time()
+            
+            try:
+                batch_sequences = run_esmfold_validation_batch.remote(
+                    sequences=batch_sequences,
+                    backbone_pdbs=backbone_pdbs,
+                    min_plddt=config.esmfold.min_plddt,
+                    max_rmsd=config.esmfold.max_rmsd,
+                    output_dir=f"{dirs['sequences']}/esmfold/batch_{batch_num}" if config.esmfold.save_predictions else None,
+                )
+            except Exception as e:
+                print(f"  ESMFold batch failed: {e}")
+                # Continue with original sequences if ESMFold fails
+            
+            esmfold_end_time = time.time()
+            esmfold_duration = esmfold_end_time - esmfold_start_time
+            
+            post_esmfold_count = len(batch_sequences)
+            pruned_count = pre_esmfold_count - post_esmfold_count
+            
+            if pruned_count > 0:
+                print(f"  [ESMFold] Gatekeeper: {pre_esmfold_count} → {post_esmfold_count} sequences ({pruned_count} pruned)")
+                
+                # Calculate downstream savings
+                if config:
+                    saved_cost, saved_time = _calculate_downstream_savings(config, "esmfold")
+                    
+                    # Mark pruned sequences in state tree
+                    post_esmfold_ids = {s.sequence_id for s in batch_sequences}
+                    pruned_ids = pre_esmfold_ids - post_esmfold_ids
+                    
+                    for seq_id in pruned_ids:
+                        state_tree.mark_skipped(
+                            node_id=seq_id,
+                            skipped_by="esmfold_gatekeeper",
+                            skip_reason="Failed ESMFold validation (low pLDDT or high RMSD)",
+                            saved_cost_usd=saved_cost,
+                            saved_timing_sec=saved_time,
+                        )
+        
+        if not batch_sequences:
+            print(f"  All sequences pruned by ESMFold in batch {batch_num}")
+            continue
         
         # =====================================================================
         # Step 3: Validate sequences (GPU-efficient, score-ranked selection)
