@@ -191,18 +191,21 @@ foldseek_image = (
 esmfold_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "wget", "build-essential")
+    # Install PyTorch FIRST (transformers requires >= 2.1)
     .pip_install(
-        "torch==2.0.1",  # Pin for stability
+        "torch>=2.1.0",
         "numpy>=1.24.0,<2.0.0",
+    )
+    # Then install other dependencies
+    .pip_install(
         "scipy>=1.11.0",
         "biotite>=1.0.0",  # For fast RMSD calculations
         "pydantic>=2.0.0",
-        "fair-esm",  # Facebook ESM library (includes ESMFold)
         "transformers>=4.30.0",  # For ESMFold via HuggingFace
-        index_url="https://pypi.org/simple",
+        "fair-esm",  # Facebook ESM library (includes ESMFold)
     )
+    # Pre-download ESMFold model weights to bake into image (avoids 15GB download on every run)
     .run_commands(
-        # Pre-download ESMFold model weights to bake into image (avoids 15GB download on every run)
         "python -c 'from transformers import EsmForProteinFolding; "
         "model = EsmForProteinFolding.from_pretrained(\"facebook/esmfold_v1\"); "
         "print(\"ESMFold weights cached successfully\")'",
