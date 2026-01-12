@@ -377,6 +377,7 @@ def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -
     Correctly parses Biotite Alignment.trace (N x 2 array of indices).
     """
     try:
+        import warnings
         import biotite.structure as struc
         import biotite.structure.io as struc_io
         import biotite.sequence as seq
@@ -385,19 +386,21 @@ def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -
         
         # [Helper function to load PDB/CIF safely]
         def load_safe(path):
-            try:
-                return struc_io.load_structure(path)
-            except Exception:
-                # Fallback for specific formats
-                if path.endswith(".cif") or path.endswith(".mmcif"):
-                    import biotite.structure.io.mmcif as mmcif
-                    f = mmcif.MMCIFFile.read(path)
-                    return mmcif.get_structure(f, model=1)
-                elif path.endswith(".pdb"):
-                    import biotite.structure.io.pdb as pdb
-                    f = pdb.PDBFile.read(path)
-                    return pdb.get_structure(f, model=1)
-                raise
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                try:
+                    return struc_io.load_structure(path)
+                except Exception:
+                    # Fallback for specific formats
+                    if path.endswith(".cif") or path.endswith(".mmcif"):
+                        import biotite.structure.io.mmcif as mmcif
+                        f = mmcif.MMCIFFile.read(path)
+                        return mmcif.get_structure(f, model=1)
+                    elif path.endswith(".pdb"):
+                        import biotite.structure.io.pdb as pdb
+                        f = pdb.PDBFile.read(path)
+                        return pdb.get_structure(f, model=1)
+                    raise
 
         # 1. Load Files
         try:
