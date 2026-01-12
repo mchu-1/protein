@@ -92,6 +92,7 @@ rfdiffusion_image = (
         "opt_einsum",
         "icecream",
         "pyrsistent",  # Required by RFDiffusion symmetry module
+        "pyyaml>=6.0",  # Required for common.py config loading
     )
     # Install DGL with CUDA 12.1 support (must match torch CUDA version)
     .run_commands(
@@ -116,6 +117,7 @@ proteinmpnn_image = (
         "scipy>=1.11.0",
         "biopython>=1.81",
         "pydantic>=2.0.0",
+        "pyyaml>=6.0",  # Required for common.py config loading
     )
     # Clone ProteinMPNN repository (includes model weights)
     .run_commands(
@@ -138,6 +140,7 @@ boltz2_image = (
         "pydantic>=2.0.0",
         "biotite>=1.0.0",  # For robust RMSD calculation
         "scipy>=1.11.0",   # Required by biotite
+        "pyyaml>=6.0",      # Required for common.py config loading
     )
 )
 
@@ -154,6 +157,7 @@ chai1_image = (
         "einops>=0.7.0",
         "modelcif",  # For CIF file handling
         "gemmi",  # Molecular structure library
+        "pyyaml>=6.0",  # Required for common.py config loading
         index_url="https://pypi.org/simple",
     )
     .run_commands(
@@ -185,6 +189,7 @@ foldseek_image = (
         "pandas>=2.0.0",
         "biopython>=1.81",
         "pydantic>=2.0.0",
+        "pyyaml>=6.0",  # Required for common.py config loading
     )
 )
 
@@ -206,6 +211,7 @@ esmfold_image = (
         "pydantic>=2.0.0",
         "transformers>=4.30.0",  # For ESMFold via HuggingFace
         "fair-esm",  # Facebook ESM library (includes ESMFold)
+        "pyyaml>=6.0",  # Required for common.py config loading
     )
     # Pre-download ESMFold model weights to bake into image (avoids 15GB download on every run)
     .run_commands(
