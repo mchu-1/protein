@@ -559,6 +559,7 @@ class PipelineLimits(BaseModel):
     # Stage-specific limits
     rfdiffusion: StageLimits = Field(default_factory=StageLimits)
     proteinmpnn: StageLimits = Field(default_factory=StageLimits)
+    esmfold: StageLimits = Field(default_factory=StageLimits)
     boltz2: StageLimits = Field(default_factory=StageLimits)
     foldseek: StageLimits = Field(default_factory=StageLimits)
     chai1: StageLimits = Field(default_factory=StageLimits)
@@ -568,6 +569,7 @@ class PipelineLimits(BaseModel):
     _default_timeouts: dict = {
         "rfdiffusion": 600,   # 10 min for batch generation
         "proteinmpnn": 300,   # 5 min per backbone
+        "esmfold": 300,       # 5 min per sequence (gatekeeper)
         "boltz2": 900,        # 15 min per sequence
         "foldseek": 120,      # 2 min for proteome search
         "chai1": 900,         # 15 min per binder-decoy pair
@@ -577,6 +579,7 @@ class PipelineLimits(BaseModel):
     _default_max_designs: dict = {
         "rfdiffusion": 4,     # Max backbones to generate
         "proteinmpnn": 16,    # Max total sequences (backbones × seqs_per_backbone)
+        "esmfold": 16,        # Max sequences to validate (gatekeeper)
         "boltz2": 3,          # Max sequences to validate (Boltz-2 @ $0.74/seq)
         "foldseek": 2,        # Max decoys to find
         "chai1": 3,           # Max binder-decoy pairs (Chai-1 @ $0.74/pair)

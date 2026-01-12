@@ -115,6 +115,7 @@ MODAL_MEMORY_COST_PER_GIB_SEC = 0.00000222
 DEFAULT_STEP_TIMEOUTS = {
     "rfdiffusion": 600,   # generators.py: run_rfdiffusion timeout=600
     "proteinmpnn": 300,   # generators.py: run_proteinmpnn timeout=300
+    "esmfold": 300,       # validators.py: run_esmfold_validation timeout=300
     "boltz2": 900,        # validators.py: run_boltz2 timeout=900
     "foldseek": 120,      # validators.py: download_decoy_structures timeout=120
     "chai1": 900,         # validators.py: run_chai1 timeout=900
@@ -124,6 +125,7 @@ DEFAULT_STEP_TIMEOUTS = {
 DEFAULT_MAX_DESIGNS = {
     "rfdiffusion": 4,     # Max backbones to generate
     "proteinmpnn": 16,    # Max total sequences
+    "esmfold": 16,        # Max sequences to validate (gatekeeper)
     "boltz2": 3,          # Max sequences to validate (Boltz-2 @ $0.74/seq)
     "foldseek": 2,        # Max decoys
     "chai1": 3,           # Max binder-decoy pairs (Chai-1 @ $0.74/pair)
@@ -133,6 +135,7 @@ DEFAULT_MAX_DESIGNS = {
 STEP_RESOURCES = {
     "rfdiffusion": {"gpu": "A10G", "cpu_cores": 2, "memory_gib": 16},
     "proteinmpnn": {"gpu": "L4", "cpu_cores": 2, "memory_gib": 8},
+    "esmfold": {"gpu": "T4", "cpu_cores": 2, "memory_gib": 16},
     "boltz2": {"gpu": "A100-80GB", "cpu_cores": 4, "memory_gib": 32},
     "foldseek": {"gpu": None, "cpu_cores": 2, "memory_gib": 8},
     "chai1": {"gpu": "A100-80GB", "cpu_cores": 4, "memory_gib": 32},
@@ -169,7 +172,8 @@ def _calculate_downstream_savings(
     
     Args:
         config: Pipeline configuration with limits
-        skipped_at_stage: Stage where item was skipped ("backbone", "sequence", "prediction")
+        skipped_at_stage: Stage where item was skipped 
+                         ("backbone", "sequence", "esmfold", "prediction")
     
     Returns:
         Tuple of (saved_cost_usd, saved_timing_sec)
@@ -179,8 +183,9 @@ def _calculate_downstream_savings(
     saved_time = 0.0
     
     if skipped_at_stage == "backbone":
-        # Skipping a backbone avoids: ProteinMPNN + (Boltz-2 + Chai-1) * num_sequences
+        # Skipping a backbone avoids: ProteinMPNN + (ESMFold + Boltz-2 + Chai-1) * num_sequences
         proteinmpnn_timeout = limits.get_timeout("proteinmpnn")
+        esmfold_timeout = limits.get_timeout("esmfold")
         boltz2_timeout = limits.get_timeout("boltz2")
         chai1_timeout = limits.get_timeout("chai1")
         num_seqs = config.proteinmpnn.num_sequences
@@ -189,17 +194,40 @@ def _calculate_downstream_savings(
         # ProteinMPNN cost for this backbone
         proteinmpnn_cost = _calculate_step_cost("proteinmpnn", proteinmpnn_timeout)
         
+        # ESMFold cost for all sequences from this backbone (if enabled)
+        esmfold_cost = 0.0
+        if config.esmfold.enabled:
+            esmfold_cost = _calculate_step_cost("esmfold", esmfold_timeout) * num_seqs
+        
         # Boltz-2 cost for all sequences from this backbone
         boltz2_cost = _calculate_step_cost("boltz2", boltz2_timeout) * num_seqs
         
         # Chai-1 cost for all sequence × decoy pairs
         chai1_cost = _calculate_step_cost("chai1", chai1_timeout) * num_seqs * num_decoys
         
-        saved_cost = proteinmpnn_cost + boltz2_cost + chai1_cost
-        saved_time = proteinmpnn_timeout + (boltz2_timeout * num_seqs) + (chai1_timeout * num_seqs * num_decoys)
+        saved_cost = proteinmpnn_cost + esmfold_cost + boltz2_cost + chai1_cost
+        saved_time = proteinmpnn_timeout + (esmfold_timeout * num_seqs) + (boltz2_timeout * num_seqs) + (chai1_timeout * num_seqs * num_decoys)
         
     elif skipped_at_stage == "sequence":
-        # Skipping a sequence avoids: Boltz-2 + Chai-1 * num_decoys
+        # Skipping a sequence avoids: ESMFold + Boltz-2 + Chai-1 * num_decoys
+        esmfold_timeout = limits.get_timeout("esmfold")
+        boltz2_timeout = limits.get_timeout("boltz2")
+        chai1_timeout = limits.get_timeout("chai1")
+        num_decoys = config.foldseek.max_hits
+        
+        # ESMFold cost (if enabled)
+        esmfold_cost = 0.0
+        if config.esmfold.enabled:
+            esmfold_cost = _calculate_step_cost("esmfold", esmfold_timeout)
+        
+        boltz2_cost = _calculate_step_cost("boltz2", boltz2_timeout)
+        chai1_cost = _calculate_step_cost("chai1", chai1_timeout) * num_decoys
+        
+        saved_cost = esmfold_cost + boltz2_cost + chai1_cost
+        saved_time = esmfold_timeout + boltz2_timeout + (chai1_timeout * num_decoys)
+    
+    elif skipped_at_stage == "esmfold":
+        # Skipping after ESMFold avoids: Boltz-2 + Chai-1 * num_decoys
         boltz2_timeout = limits.get_timeout("boltz2")
         chai1_timeout = limits.get_timeout("chai1")
         num_decoys = config.foldseek.max_hits
@@ -259,7 +287,12 @@ def estimate_cost(config: PipelineConfig) -> dict:
     # Derived: total sequences in tree
     effective_sequences = effective_backbones * effective_seqs_per_backbone
     
+    # Level 2.5: ESMFold - gatekeeper validation (all sequences if enabled)
+    max_esmfold = limits.get_max_designs("esmfold")
+    effective_esmfold = min(effective_sequences, max_esmfold) if config.esmfold.enabled else 0
+    
     # Level 3: Boltz-2 - total cap on validations (cost control, not degree)
+    # Ceiling assumes all sequences proceed (no prune rate estimation)
     max_boltz2 = limits.get_max_designs("boltz2")
     effective_boltz2 = min(effective_sequences, max_boltz2)
     
@@ -276,6 +309,7 @@ def estimate_cost(config: PipelineConfig) -> dict:
     # Get effective timeouts from limits
     rfdiffusion_timeout = limits.get_timeout("rfdiffusion")
     proteinmpnn_timeout = limits.get_timeout("proteinmpnn")
+    esmfold_timeout = limits.get_timeout("esmfold")
     boltz2_timeout = limits.get_timeout("boltz2")
     foldseek_timeout = limits.get_timeout("foldseek")
     chai1_timeout = limits.get_timeout("chai1")
@@ -290,6 +324,10 @@ def estimate_cost(config: PipelineConfig) -> dict:
     # ProteinMPNN (L4) - timeout per backbone
     proteinmpnn_sec = proteinmpnn_timeout * effective_backbones
     costs["proteinmpnn"] = _calculate_step_cost("proteinmpnn", proteinmpnn_sec)
+    
+    # ESMFold (T4) - timeout per sequence (if enabled)
+    esmfold_sec = esmfold_timeout * effective_esmfold if config.esmfold.enabled else 0
+    costs["esmfold"] = _calculate_step_cost("esmfold", esmfold_sec) if config.esmfold.enabled else 0.0
     
     # Boltz-2 (A100) - timeout per sequence
     boltz2_sec = boltz2_timeout * effective_boltz2
@@ -310,6 +348,7 @@ def estimate_cost(config: PipelineConfig) -> dict:
         "backbones": effective_backbones,
         "seqs_per_backbone": effective_seqs_per_backbone,
         "sequences": effective_sequences,
+        "esmfold_validations": effective_esmfold,
         "boltz2_validations": effective_boltz2,
         "decoys": effective_decoys,
         "chai1_sequences": effective_chai1_sequences,
@@ -318,11 +357,12 @@ def estimate_cost(config: PipelineConfig) -> dict:
     costs["_timeouts"] = {
         "rfdiffusion": rfdiffusion_timeout,
         "proteinmpnn": proteinmpnn_timeout,
+        "esmfold": esmfold_timeout,
         "boltz2": boltz2_timeout,
         "foldseek": foldseek_timeout,
         "chai1": chai1_timeout,
     }
-    costs["_runtime_sec"] = rfdiffusion_sec + proteinmpnn_sec + boltz2_sec + foldseek_sec + chai1_sec
+    costs["_runtime_sec"] = rfdiffusion_sec + proteinmpnn_sec + esmfold_sec + boltz2_sec + foldseek_sec + chai1_sec
     
     return costs
 
