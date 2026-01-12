@@ -28,6 +28,7 @@ from common import (
     rfdiffusion_image,
     weights_volume,
     write_fasta,
+    GLOBAL_CONFIG,
 )
 
 # =============================================================================
@@ -37,8 +38,8 @@ from common import (
 
 @app.function(
     image=rfdiffusion_image,
-    gpu="A10G",  # Cost-effective GPU sufficient for RFDiffusion
-    timeout=1200, # Increased to 20 mins to support batch generation
+    gpu=GLOBAL_CONFIG.hardware.rfdiffusion_gpu,
+    timeout=GLOBAL_CONFIG.limits.get_timeout("rfdiffusion"),
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def run_rfdiffusion(
@@ -148,8 +149,8 @@ def run_rfdiffusion(
 
 @app.function(
     image=rfdiffusion_image,
-    gpu="A10G",
-    timeout=300,
+    gpu=GLOBAL_CONFIG.hardware.rfdiffusion_gpu,
+    timeout=600,  # Single generation is fast, keep tight limit or make separate config
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def run_rfdiffusion_single(
@@ -249,8 +250,8 @@ def _get_chain_residue_range(pdb_path: str, chain_id: str) -> tuple[int, int]:
 
 @app.function(
     image=proteinmpnn_image,
-    gpu="L4",  # Lightweight GPU sufficient for ProteinMPNN
-    timeout=300,
+    gpu=GLOBAL_CONFIG.hardware.proteinmpnn_gpu,
+    timeout=GLOBAL_CONFIG.limits.get_timeout("proteinmpnn"),
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def run_proteinmpnn(
@@ -341,8 +342,8 @@ def run_proteinmpnn(
 
 @app.function(
     image=proteinmpnn_image,
-    gpu="L4",
-    timeout=300,
+    gpu=GLOBAL_CONFIG.hardware.proteinmpnn_gpu,
+    timeout=GLOBAL_CONFIG.limits.get_timeout("proteinmpnn"),
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def run_proteinmpnn_batch(

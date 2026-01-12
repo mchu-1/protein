@@ -34,6 +34,7 @@ from common import (
     foldseek_image,
     generate_design_id,
     weights_volume,
+    GLOBAL_CONFIG,
 )
 
 # =============================================================================
@@ -43,8 +44,8 @@ from common import (
 
 @app.function(
     image=boltz2_image,
-    gpu="A100",  # A100 required for memory-intensive structure prediction
-    timeout=900,
+    gpu=GLOBAL_CONFIG.hardware.boltz2_gpu,
+    timeout=GLOBAL_CONFIG.limits.get_timeout("boltz2"),
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def run_boltz2(
@@ -209,8 +210,8 @@ def run_boltz2(
 
 @app.function(
     image=boltz2_image,
-    gpu="A100",
-    timeout=1800,
+    gpu=GLOBAL_CONFIG.hardware.boltz2_gpu,
+    timeout=GLOBAL_CONFIG.limits.get_timeout("boltz2") * 2,  # Double timeout for batch
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def run_boltz2_batch(
@@ -487,8 +488,8 @@ def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -
 
 @app.function(
     image=esmfold_image,
-    gpu="T4",  # T4 sufficient for ESMFold inference (cheaper than A100)
-    timeout=300,  # 5 min per sequence
+    gpu=GLOBAL_CONFIG.hardware.esmfold_gpu,
+    timeout=GLOBAL_CONFIG.limits.get_timeout("esmfold"),
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def run_esmfold_validation(
@@ -1025,7 +1026,7 @@ def save_decoys_to_cache(target: TargetProtein, decoys: list[DecoyHit]) -> None:
     image=foldseek_image,
     cpu=4,
     memory=8192,
-    timeout=2400,  # 40 min to allow for database download on first run
+    timeout=GLOBAL_CONFIG.limits.get_timeout("foldseek"),
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def run_foldseek(
@@ -1344,10 +1345,10 @@ def download_decoy_structures(
 
 @app.function(
     image=chai1_image,
-    gpu="A100",  # A100 for accurate docking predictions
-    timeout=900,  # 15 min per prediction
+    gpu=GLOBAL_CONFIG.hardware.chai1_gpu,
+    timeout=GLOBAL_CONFIG.limits.get_timeout("chai1"),
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
-    max_containers=2,  # Limit to 2 concurrent A100 workers to control costs
+    max_containers=2,
 )
 def run_chai1(
     sequence: SequenceDesign,
@@ -1514,8 +1515,8 @@ def run_chai1(
 
 @app.function(
     image=chai1_image,
-    gpu="A100",
-    timeout=1800,
+    gpu=GLOBAL_CONFIG.hardware.chai1_gpu,
+    timeout=GLOBAL_CONFIG.limits.get_timeout("chai1") * 2,
     volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
 )
 def run_chai1_batch(

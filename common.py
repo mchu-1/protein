@@ -57,6 +57,7 @@ base_image = (
         "peptides>=0.3.2",  # Solubility filtering (net charge, pI)
         "biotite>=1.0.0",  # SAP stickiness calculation
         "pyhmmer>=0.10.0",  # Novelty check vs UniRef50 (phmmer mode)
+        "pyyaml>=6.0",      # For loading config.yaml
     )
 )
 
@@ -228,6 +229,7 @@ def _add_local_modules(image: modal.Image) -> modal.Image:
         .add_local_file("validators.py", remote_path="/root/validators.py")
         .add_local_file("state_tree.py", remote_path="/root/state_tree.py")
         .add_local_file("optimizers.py", remote_path="/root/optimizers.py")
+        .add_local_file("config.yaml", remote_path="/root/config.yaml")
     )
 
 
@@ -623,6 +625,45 @@ class PipelineConfig(BaseModel):
 
     # Stage limits (timeouts per stage)
     limits: PipelineLimits = Field(default_factory=PipelineLimits, description="Per-stage timeout limits")
+
+
+def _load_global_config() -> PipelineConfig:
+    """
+    Load configuration globally for use in Modal decorators.
+    
+    This is required because @app.function decorators are evaluated at definition time,
+    so we need access to the config (GPUs, timeouts) before the pipeline actually runs.
+    """
+    import yaml
+    
+    # Try finding config.yaml in common locations
+    candidates = ["config.yaml", "/root/config.yaml"]
+    config_path = None
+    
+    for path in candidates:
+        if os.path.exists(path):
+            config_path = path
+            break
+            
+    if not config_path:
+        # Fallback to defaults if file not found (e.g. during some remote builds)
+        print("Warning: config.yaml not found, using defaults")
+        # Create a valid dummy target to satisfy validation
+        dummy_target = TargetProtein(pdb_id="XXXX", entity_id=1)
+        return PipelineConfig(target=dummy_target)
+        
+    try:
+        with open(config_path, "r") as f:
+            data = yaml.safe_load(f)
+        return PipelineConfig(**data)
+    except Exception as e:
+        print(f"Error loading global config: {e}")
+        # Return defaults on error to prevent import crash
+        dummy_target = TargetProtein(pdb_id="XXXX", entity_id=1)
+        return PipelineConfig(target=dummy_target)
+
+# Export global config for decorators
+GLOBAL_CONFIG = _load_global_config()
 
 
 # =============================================================================

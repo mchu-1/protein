@@ -38,9 +38,9 @@
 
 # Target protein specification (required)
 target:
-  pdb_id: "3DI3"              # 4-letter PDB code
-  entity_id: 2                # Polymer entity ID (check RCSB for correct entity)
-  hotspot_residues:           # Residue indices for binding interface
+  pdb_id: "3DI3" # 4-letter PDB code
+  entity_id: 2 # Polymer entity ID (check RCSB for correct entity)
+  hotspot_residues: # Residue indices for binding interface
     - 58
     - 80
     - 139
@@ -52,49 +52,49 @@ mode: bind
 # Stage Configurations
 # =============================================================================
 
-# RFDiffusion - Backbone Generation`  
+# RFDiffusion - Backbone Generation`
 rfdiffusion:
-  num_designs: 10             # Targeted screening campaign (10 backbones)
-  binder_length_min: 80       # Minimum binder length (residues)
-  binder_length_max: 120      # Maximum binder length (residues)
-  noise_scale: 1.0            # Diffusion noise scale
-  num_diffusion_steps: 50     # Pareto-maximal number of diffusion steps
+  num_designs: 100 # Targeted screening campaign (100 backbones)
+  binder_length_min: 80 # Minimum binder length (residues)
+  binder_length_max: 120 # Maximum binder length (residues)
+  noise_scale: 1.0 # Diffusion noise scale
+  num_diffusion_steps: 50 # Pareto-maximal number of diffusion steps
 
 # ProteinMPNN - Sequence Design
 proteinmpnn:
-  num_sequences: 10           # 10 sequences per backbone
-  temperature: 0.2            # 0.2: Slightly higher temp for more sequence diversity
+  num_sequences: 5 # 5 sequence per backbone
+  temperature: 0.2 # 0.2: Slightly higher temp for more sequence diversity
 
 # ESMFold - Orthogonal Validation (Gatekeeper)
 esmfold:
-  enabled: false              # Essential gatekeeper
-  min_plddt: 80.0             # Strict: Only pass high-confidence structures (cheaper to fail here)
-  max_rmsd: 1.5               # Strict: High consistency required
-  save_predictions: false     # Save storage cost
+  enabled: true # Essential gatekeeper
+  min_plddt: 80.0 # Strict: Only pass high-confidence structures (cheaper to fail here)
+  max_rmsd: 1.5 # Strict: High consistency required
+  save_predictions: false # Save storage cost
 
 # Boltz-2 - Structure Validation (AlphaProteo SI 2.2 thresholds)
 boltz2:
-  num_recycles: 3             # Number of recycling iterations
-  max_pae_interaction: 1.5    # Max PAE at hotspots (Å) - Anchor Lock
-  min_ptm_binder: 0.80        # Min pTM for binder-only - Fold Quality
-  max_rmsd: 2.5               # Max RMSD vs RFDiffusion (Å) - Self-Consistency
+  num_recycles: 3 # Number of recycling iterations
+  max_pae_interaction: 1.5 # Max PAE at hotspots (Å) - Anchor Lock
+  min_ptm_binder: 0.80 # Min pTM for binder-only - Fold Quality
+  max_rmsd: 2.5 # Max RMSD vs RFDiffusion (Å) - Self-Consistency
 
 # FoldSeek - Decoy Identification
 foldseek:
-  database: "pdb100"          # Database to search
-  max_hits: 1                 # Cost Saver: Only check against the single closest homolog
-  evalue_threshold: 0.001     # E-value cutoff
-  cache_results: true         # Cache decoys by target for reuse
+  database: "pdb100" # Database to search
+  max_hits: 1 # Cost Saver: Only check against the single closest homolog
+  evalue_threshold: 0.001 # E-value cutoff
+  cache_results: true # Cache decoys by target for reuse
 
 # Chai-1 - Cross-Reactivity Check
 chai1:
-  num_samples: 1              # Samples per binder-decoy pair
-  min_chain_pair_iptm: 0.5    # ipTM threshold for cross-reactivity
-  num_recycles: 3             # Number of recycling iterations
-  tiered_checking: true       # Critical: Use tiered checks to stop early
-  tier1_min_tm: 0.7           # Min TM-score for Tier 1 (highest risk)
-  tier2_min_tm: 0.5           # Min TM-score for Tier 2
-  tier2_max_decoys: 0         # Disable Tier 2 to minimize cost
+  num_samples: 1 # Samples per binder-decoy pair
+  min_chain_pair_iptm: 0.5 # ipTM threshold for cross-reactivity
+  num_recycles: 3 # Number of recycling iterations
+  tiered_checking: true # Critical: Use tiered checks to stop early
+  tier1_min_tm: 0.7 # Min TM-score for Tier 1 (highest risk)
+  tier2_min_tm: 0.5 # Min TM-score for Tier 2
+  tier2_max_decoys: 0 # Disable Tier 2 to minimize cost
 
 # =============================================================================
 # Hardware Optimization
@@ -102,11 +102,27 @@ chai1:
 # GPU selection for cost/performance optimization.
 # Options: T4, L4, A10G, A100 (40GB), A100-80GB, H100
 hardware:
-  rfdiffusion_gpu: "A10G"     # Balanced for generation
-  proteinmpnn_gpu: "T4"       # Optimized: T4 is sufficient and cheapest ($0.000164/s)
-  esmfold_gpu: "T4"           # Cheapest for validation ($0.000164/s)
-  boltz2_gpu: "A100"          # Optimized: A100 (40GB) for validation
-  chai1_gpu: "A100"           # Optimized: A100 (40GB) for cross-reactivity
+  rfdiffusion_gpu: "L4" # Optimized: L4 (24GB) is sufficient and cheaper than A10G
+  proteinmpnn_gpu: "T4" # Optimized: T4 is sufficient and cheapest ($0.000164/s)
+  esmfold_gpu: "T4" # Cheapest for validation ($0.000164/s)
+  boltz2_gpu: "A10G" # Optimized: A10G (24GB) sufficient for binders
+  chai1_gpu: "A10G" # Optimized: A10G (24GB) sufficient for single-sequence
+
+# Stage Timeouts (seconds)
+# Adjust based on protein size and batch volume.
+limits:
+  rfdiffusion:
+    timeout_seconds: 1200 # 20 min (allows for batch generation)
+  proteinmpnn:
+    timeout_seconds: 600 # 10 min
+  esmfold:
+    timeout_seconds: 600 # 10 min (generous for gatekeeper)
+  boltz2:
+    timeout_seconds: 1800 # 30 min (complex prediction is expensive)
+  foldseek:
+    timeout_seconds: 2400 # 40 min (includes DB download time)
+  chai1:
+    timeout_seconds: 1800 # 30 min (docking is expensive)
 
 # =============================================================================
 # Clustering & Novelty
@@ -114,23 +130,23 @@ hardware:
 
 # TM-score clustering for diversity
 cluster:
-  tm_threshold: 0.7           # TM-score threshold for clustering
-  select_best: true           # Select best representative per cluster
+  tm_threshold: 0.7 # TM-score threshold for clustering
+  select_best: true # Select best representative per cluster
 
 # Novelty check vs UniRef50 (phmmer sequence-vs-sequence search)
 # First run downloads ~12GB compressed → ~50GB uncompressed (persisted in Modal Volume)
 novelty:
-  max_evalue: 0.000001        # Max E-value to consider a hit (1e-6, stricter for IP/safety)
-  enabled: true               # Enable novelty filtering
-  auto_download: true         # Auto-download UniRef50 database if not present
+  max_evalue: 0.000001 # Max E-value to consider a hit (1e-6, stricter for IP/safety)
+  enabled: true # Enable novelty filtering
+  auto_download: true # Auto-download UniRef50 database if not present
 
 # =============================================================================
 # Scoring Weights
 # =============================================================================
 
 scoring:
-  alpha: 1.0                  # Weight for interface pLDDT (specificity)
-  beta: 0.5                   # Weight for max decoy affinity (selectivity penalty)
+  alpha: 1.0 # Weight for interface pLDDT (specificity)
+  beta: 0.5 # Weight for max decoy affinity (selectivity penalty)
 
 # =============================================================================
 # Cost Optimization
@@ -138,35 +154,35 @@ scoring:
 
 # Backbone quality pre-screening
 backbone_filter:
-  enabled: true               # Essential: Prune bad backbones early
-  min_score: 0.6              # Strict: Discard bottom 60% of backbones immediately
-  max_keep: null              # Max backbones to keep (null = no limit)
+  enabled: true # Essential: Prune bad backbones early
+  min_score: 0.6 # Strict: Discard bottom 60% of backbones immediately
+  max_keep: null # Max backbones to keep (null = no limit)
 
 # Adaptive generation with early termination
 adaptive:
-  enabled: true               # Enabled for batching
-  min_validated_candidates: 10 # Stop after 10 validated candidates (matches num_designs)
-  batch_size: 5               # Reduced to prevent RFDiffusion timeouts (from 16)
+  enabled: true # Enabled for batching
+  min_validated_candidates: 10 # Stop after 10 validated candidates
+  batch_size: 10 # Increased for throughput (was 5)
 
 # Solubility filter (1D chemistry gates)
 solubility_filter:
   enabled: true
-  min_abs_charge_ph7: 3.0     # Strict: Min |net charge| to prevent aggregation
-  max_abs_charge_ph7: 12.0    # Strict: Max |net charge| to avoid non-specific binding
-  forbidden_pi_min: 6.0       # Forbidden pI zone lower bound (dead zone)
-  forbidden_pi_max: 8.0       # Forbidden pI zone upper bound (near pH 7.4)
+  min_abs_charge_ph7: 3.0 # Strict: Min |net charge| to prevent aggregation
+  max_abs_charge_ph7: 12.0 # Strict: Max |net charge| to avoid non-specific binding
+  forbidden_pi_min: 6.0 # Forbidden pI zone lower bound (dead zone)
+  forbidden_pi_max: 8.0 # Forbidden pI zone upper bound (near pH 7.4)
 
 # Stickiness filter (3D structure gates)
 stickiness_filter:
   enabled: true
-  max_sap_score: 0.45         # Optimized: Slightly stricter (0.50 -> 0.45)
+  max_sap_score: 0.45 # Optimized: Slightly stricter (0.50 -> 0.45)
   hydrophobic_residues: "AVILMFYW"
 
 # Structural memoization (3Di fingerprinting)
 structural_memoization:
   enabled: true
-  similarity_threshold: 0.9   # Skip structural twins above this similarity
-  cache_ttl_hours: 168        # 7-day cache TTL
+  similarity_threshold: 0.9 # Skip structural twins above this similarity
+  cache_ttl_hours: 168 # 7-day cache TTL
 
 # =============================================================================
 # Stage Limits
@@ -178,19 +194,19 @@ structural_memoization:
 
 limits:
   rfdiffusion:
-    timeout_seconds: 1200     # Increased to 20 minutes (from 600s) for batch generation
-  
+    timeout_seconds: 1200 # Increased to 20 minutes (from 600s) for batch generation
+
   proteinmpnn:
-    timeout_seconds: 300      # 5 minutes per backbone
-  
+    timeout_seconds: 300 # 5 minutes per backbone
+
   esmfold:
-    timeout_seconds: 300      # 5 minutes per sequence validation
-  
+    timeout_seconds: 300 # 5 minutes per sequence validation
+
   boltz2:
-    timeout_seconds: 900      # 15 minutes per validation
-  
+    timeout_seconds: 900 # 15 minutes per validation
+
   foldseek:
-    timeout_seconds: 120      # 2 minutes for proteome search
-  
+    timeout_seconds: 120 # 2 minutes for proteome search
+
   chai1:
-    timeout_seconds: 900      # 15 minutes per pair
+    timeout_seconds: 900 # 15 minutes per pair
