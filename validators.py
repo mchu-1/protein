@@ -1553,11 +1553,17 @@ def validate_sequences_parallel(
     all_results = list(run_boltz2.starmap(args))
     
     batch_duration = time.time() - batch_start
-    successful = sum(1 for r in all_results if r is not None)
+    
+    # Combine input sequences with results (prediction, error)
+    # returns list[tuple[SequenceDesign, Optional[StructurePrediction], Optional[str]]]
+    combined_results = []
+    for i, res in enumerate(all_results):
+        combined_results.append((sequences[i], res[0], res[1]))
+        
+    successful = sum(1 for _, pred, _ in combined_results if pred is not None)
     print(f"  Batch complete: {successful}/{len(sequences)} in {batch_duration:.1f}s (avg {batch_duration/len(sequences):.1f}s/seq)")
 
-    # Filter None results
-    return [r for r in all_results if r is not None]
+    return combined_results
 
 
 @app.function(
