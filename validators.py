@@ -1396,8 +1396,11 @@ def run_chai1(
             f.write(f">protein|name=binder\n{sequence.sequence}\n")
 
         # Use a subdirectory for Chai-1 output to avoid "directory not empty" errors
-        # (Chai-1 expects to be able to write into a clean directory or manages it internally)
         output_subdir = Path(output_dir) / "predictions"
+        if output_subdir.exists():
+            import shutil
+            shutil.rmtree(output_subdir)
+        output_subdir.mkdir(parents=True, exist_ok=True)
 
         # Use chai_lab Python API
         try:
@@ -1503,7 +1506,10 @@ def run_chai1(
         print(f"Chai-1 error: {e}")
         return None
     finally:
-        data_volume.commit()
+        try:
+            data_volume.commit()
+        except RuntimeError:
+            pass  # Ignore "no attached volumes" when running in .local() context
 
 
 @app.function(
@@ -2232,9 +2238,14 @@ def check_novelty(
         # Process each query sequence
         for seq in sequences:
             # Create digital query sequence
+            # Ensure sequence is string (pyhmmer expects str, not bytes)
+            seq_str = seq.sequence
+            if isinstance(seq_str, bytes):
+                seq_str = seq_str.decode('utf-8')
+
             query = TextSequence(
                 name=seq.sequence_id.encode(),
-                sequence=seq.sequence,
+                sequence=seq_str,
             ).digitize(alphabet)
             
             # Create pipeline for this search
