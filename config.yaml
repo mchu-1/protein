@@ -102,11 +102,11 @@ chai1:
 # GPU selection for cost/performance optimization.
 # Options: T4, L4, A10G, A100 (40GB), A100-80GB, H100
 hardware:
-  rfdiffusion_gpu: "L4" # Optimized: L4 (24GB) is sufficient and cheaper than A10G
-  proteinmpnn_gpu: "T4" # Optimized: T4 is sufficient and cheapest ($0.000164/s)
-  esmfold_gpu: "T4" # Cheapest for validation ($0.000164/s)
-  boltz2_gpu: "A10G" # Optimized: A10G (24GB) sufficient for binders
-  chai1_gpu: "A10G" # Optimized: A10G (24GB) sufficient for single-sequence
+  rfdiffusion_gpu: "A10G"     # Balanced for generation
+  proteinmpnn_gpu: "T4"       # Optimized: T4 is sufficient and cheapest ($0.000164/s)
+  esmfold_gpu: "T4"           # Cheapest for validation ($0.000164/s)
+  boltz2_gpu: "A100"          # Optimized: A100 (40GB) for validation
+  chai1_gpu: "A100"           # Optimized: A100 (40GB) for cross-reactivity
 
 # Stage Timeouts (seconds)
 # Adjust based on protein size and batch volume.
