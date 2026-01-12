@@ -447,7 +447,6 @@ class AdaptiveGenerationConfig(BaseModel):
     enabled: bool = Field(default=True, description="Enable adaptive generation")
     min_validated_candidates: int = Field(default=3, description="Stop when this many pass Boltz-2")
     batch_size: int = Field(default=4, description="Backbones to generate per micro-batch (GPU-efficient)")
-    max_batches: int = Field(default=3, description="Maximum micro-batches before stopping")
 
 
 class SolubilityFilterConfig(BaseModel):
@@ -603,9 +602,6 @@ class PipelineConfig(BaseModel):
 
     # Stage limits (timeouts per stage)
     limits: PipelineLimits = Field(default_factory=PipelineLimits, description="Per-stage timeout limits")
-
-    # Budget control (optional - set to None to disable budget enforcement)
-    max_compute_usd: Optional[float] = Field(default=None, description="Maximum compute budget in USD (None = no limit)")
 
 
 # =============================================================================

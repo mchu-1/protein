@@ -491,23 +491,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     # Level 4: Chai-1
     # No limit enforcement on sequences to check
     
-    # Pre-flight cost check (only if budget is set)
+    # Pre-flight cost check
     cost_estimate = estimate_cost(config)
-    if config.max_compute_usd is not None and cost_estimate["total"] > config.max_compute_usd:
-        print(
-            f"WARNING: Estimated cost ${cost_estimate['total']:.2f} exceeds budget "
-            f"${config.max_compute_usd:.2f}. Reducing design count."
-        )
-        # Scale down to fit budget
-        scale_factor = config.max_compute_usd / cost_estimate["total"]
-        config.rfdiffusion.num_designs = max(
-            1, int(config.rfdiffusion.num_designs * scale_factor)
-        )
-        config.proteinmpnn.num_sequences = max(
-            1, int(config.proteinmpnn.num_sequences * scale_factor)
-        )
-        # Recalculate after scaling
-        cost_estimate = estimate_cost(config)
 
     # Pipeline configuration
     t = config.target
@@ -560,7 +545,6 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         },
         "effective_limits": cost_estimate["_effective"],
         "timeouts": cost_estimate["_timeouts"],
-        "max_compute_usd": config.max_compute_usd if config.max_compute_usd is not None else "unlimited",
     })
 
     validation_results: list[ValidationResult] = []
@@ -1518,15 +1502,21 @@ def _run_adaptive_generation(
     
     batch_num = 0
     
+    # Calculate max_batches from num_designs (high-level setting)
+    import math
+    max_batches = math.ceil(rfdiffusion_config.num_designs / adaptive_config.batch_size)
+    if max_batches < 1 and rfdiffusion_config.num_designs > 0:
+        max_batches = 1
+
     print(f"Adaptive mode: target {adaptive_config.min_validated_candidates} validated candidates")
-    print(f"  Micro-batch size: {adaptive_config.batch_size} backbones, max batches: {adaptive_config.max_batches}")
+    print(f"  Micro-batch size: {adaptive_config.batch_size} backbones, max batches: {max_batches} (from {rfdiffusion_config.num_designs} total designs)")
     print("  (GPU-efficient: full batch processing, early termination between batches)")
     
     while (len(validated_predictions) < adaptive_config.min_validated_candidates 
-           and batch_num < adaptive_config.max_batches):
+           and batch_num < max_batches):
         
         batch_num += 1
-        print(f"\n--- Micro-batch {batch_num}/{adaptive_config.max_batches} ---")
+        print(f"\n--- Micro-batch {batch_num}/{max_batches} ---")
         
         # =====================================================================
         # Step 1: Generate batch of backbones (GPU-efficient batch processing)
@@ -2338,6 +2328,27 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     est_runtime_sec = costs["_runtime_sec"]
     est_runtime_min = est_runtime_sec / 60
 
+    # Create human-readable timestamp
+    def format_runtime(seconds: float) -> str:
+        """Format seconds into human-readable days, hours, minutes, seconds."""
+        days = int(seconds // 86400)
+        hours = int((seconds % 86400) // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+
+        parts = []
+        if days > 0:
+            parts.append(f"{days}d")
+        if hours > 0 or days > 0:
+            parts.append(f"{hours}h")
+        if minutes > 0 or hours > 0 or days > 0:
+            parts.append(f"{minutes}m")
+        parts.append(f"{secs}s")
+
+        return " ".join(parts)
+
+    est_runtime_human = format_runtime(est_runtime_sec)
+
     t = config.target
     limits = config.limits
     
@@ -2405,24 +2416,8 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     print(f"{'CEILING TOTAL':<20} {'':<12} {'':<10} {int(est_runtime_sec):>6}s {'$' + f'{cost_total:.2f}':>12}")
     print()
     
-    if config.max_compute_usd is not None:
-        budget_status = "✓ WITHIN BUDGET" if costs["total"] <= config.max_compute_usd else "✗ EXCEEDS BUDGET"
-        print(f"Budget: ${config.max_compute_usd:.2f}  [{budget_status}]")
-    else:
-        print("Budget: unlimited")
-    print(f"Max runtime: ~{est_runtime_min:.0f} minutes (sequential worst-case)")
+    print(f"Max runtime: ~{est_runtime_human} (sequential worst-case)")
     print()
-
-    if config.max_compute_usd is not None and costs["total"] > config.max_compute_usd:
-        scale_factor = config.max_compute_usd / costs["total"]
-        suggested_designs = max(1, int(req_backbones * scale_factor))
-        suggested_sequences = max(1, int(config.proteinmpnn.num_sequences * scale_factor))
-        print("⚠ BUDGET WARNING")
-        print("-" * 70)
-        print("Options to reduce cost:")
-        print(f"  1. Reduce designs: --num-designs {suggested_designs} --num-sequences {suggested_sequences}")
-        print(f"  2. Increase budget: --max-budget {cost_total * 1.1:.2f}")
-        print()
 
     # Print optimization settings
     print("OPTIMIZATIONS (State Tree Based)")
@@ -2481,7 +2476,6 @@ def main(
     num_designs: int = 5,
     num_sequences: int = 4,
     use_mocks: bool = False,
-    max_budget: float = None,
     dry_run: bool = False,
 ):
     """
@@ -2496,7 +2490,6 @@ def main(
         num_designs: Number of backbone designs (default: 5)
         num_sequences: Sequences per backbone (default: 4)
         use_mocks: Use mock implementations for testing (default: False)
-        max_budget: Maximum compute budget in USD (default: None = no limit)
         dry_run: Preview deployment parameters and costs without running (default: False)
     
     Example with CLI args:
@@ -2623,7 +2616,6 @@ def main(
                 boltz2=Boltz2Config(),
                 foldseek=FoldSeekConfig(),
                 chai1=Chai1Config(),
-                max_compute_usd=max_budget,
             )
             print_dry_run_summary(pipeline_config)
             return None
@@ -2656,7 +2648,6 @@ def main(
             boltz2=Boltz2Config(),
             foldseek=FoldSeekConfig(),
             chai1=Chai1Config(),
-            max_compute_usd=max_budget,
         )
 
         # Run pipeline
@@ -2715,7 +2706,6 @@ def design_binders(
     chain_id: str = "A",
     num_designs: int = 5,
     num_sequences: int = 4,
-    max_budget: Optional[float] = None,
     use_mocks: bool = False,
 ) -> PipelineResult:
     """
@@ -2727,7 +2717,6 @@ def design_binders(
         chain_id: Target chain ID
         num_designs: Number of backbone designs
         num_sequences: Sequences per backbone
-        max_budget: Maximum compute budget in USD (None = no limit)
         use_mocks: Use mock implementations for testing
 
     Returns:
@@ -2742,7 +2731,6 @@ def design_binders(
         ),
         rfdiffusion=RFDiffusionConfig(num_designs=num_designs),
         proteinmpnn=ProteinMPNNConfig(num_sequences=num_sequences),
-        max_compute_usd=max_budget,
     )
 
     with modal.enable_local():
@@ -2777,7 +2765,6 @@ Examples:
     parser.add_argument("--mode", default="bind", help="Generation mode (default: bind)")
     parser.add_argument("--num-designs", type=int, default=5, help="Number of backbones (default: 5)")
     parser.add_argument("--num-sequences", type=int, default=4, help="Sequences per backbone (default: 4)")
-    parser.add_argument("--max-budget", type=float, default=None, help="Max budget in USD (default: no limit)")
     parser.add_argument("--dry-run", action="store_true", help="Preview costs without running")
     
     args = parser.parse_args()
@@ -2890,7 +2877,6 @@ Examples:
                 boltz2=Boltz2Config(),
                 foldseek=FoldSeekConfig(),
                 chai1=Chai1Config(),
-                max_compute_usd=args.max_budget,
             )
         
         # Print cost summary (local function, no Modal)

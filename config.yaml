@@ -34,17 +34,16 @@ mode: bind
 
 # RFDiffusion - Backbone Generation
 rfdiffusion:
-  num_designs: 96             # Number of backbones to generate
-  binder_length_min: 50        # Minimum binder length (residues)
-  binder_length_max: 100       # Maximum binder length (residues)
+  num_designs: 1200            # Number of backbones to generate
+  binder_length_min: 80        # Minimum binder length (residues)
+  binder_length_max: 120       # Maximum binder length (residues)
   noise_scale: 1.0             # Diffusion noise scale
   num_diffusion_steps: 50      # Number of diffusion steps
 
 # ProteinMPNN - Sequence Design
 proteinmpnn:
-  num_sequences: 1            # Optimized: Reduced from 50 to 20 to focus on quality over quantity
+  num_sequences: 50            # Number of sequences per backbone
   temperature: 0.2             # Sampling temperature (lower = more conservative)
-  backbone_noise: 0.0          # Backbone coordinate noise
 
 # ESMFold - Orthogonal Validation (Gatekeeper)
 esmfold:
@@ -63,7 +62,7 @@ boltz2:
 # FoldSeek - Decoy Identification
 foldseek:
   database: "pdb100"           # Database to search
-  max_hits: 1                  # Optimized: Reduced from 5 to 1 (Major cost saver for Chai-1)
+  max_hits: 5
   evalue_threshold: 0.001      # E-value cutoff
   cache_results: true          # Cache decoys by target for reuse
 
@@ -75,7 +74,7 @@ chai1:
   tiered_checking: true        # Use tiered decoy checking for cost savings
   tier1_min_tm: 0.7            # Min TM-score for Tier 1 (highest risk)
   tier2_min_tm: 0.5            # Min TM-score for Tier 2
-  tier2_max_decoys: 2          # Max decoys in Tier 2
+  tier2_max_decoys: 0          # Disable Tier 2 to minimize cost
 
 # =============================================================================
 # Clustering & Novelty
@@ -113,10 +112,9 @@ backbone_filter:
 
 # Adaptive generation with early termination
 adaptive:
-  enabled: true               # Enable adaptive generation
-  min_validated_candidates: 5 # Optimized: Reduced from 10 to 5 to stop early
+  enabled: false               # Disabled to ensure generation of all sequences
+  min_validated_candidates: 10 # Stop when this many pass Boltz-2
   batch_size: 4                # Backbones per micro-batch
-  max_batches: 3               # Maximum micro-batches
 
 # Solubility filter (1D chemistry gates)
 solubility_filter:
@@ -137,14 +135,6 @@ structural_memoization:
   enabled: true
   similarity_threshold: 0.9    # Skip structural twins above this similarity
   cache_ttl_hours: 168         # 7-day cache TTL
-
-# Beam pruning (tree width control)
-beam_pruning:
-  enabled: true
-  max_tree_nodes: 75000          # Maximum total nodes in state tree
-  sequences_per_backbone: 150   # Max sequences per backbone
-  predictions_per_sequence: 1  # Max predictions per sequence
-  prune_by_score: true         # Prune lowest-scoring siblings
 
 # =============================================================================
 # Stage Limits
@@ -172,10 +162,3 @@ limits:
   
   chai1:
     timeout_seconds: 900       # 15 minutes per pair
-
-# =============================================================================
-# Budget Control (Optional)
-# =============================================================================
-
-# Maximum compute budget in USD (optional - remove or set to null to disable)
-# max_compute_usd: 10.0
