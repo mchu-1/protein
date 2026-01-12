@@ -135,6 +135,7 @@ def run_boltz2(
             hotspot_residues=target.hotspot_residues,
             backbone_pdb=backbone_pdb,
             target_len=target_len,
+            binder_chain_id=getattr(sequence, 'binder_chain_id', 'B'),
         )
 
         if metrics is None:
@@ -158,6 +159,7 @@ def run_boltz2(
             pae_interaction=metrics.get("pae_interaction"),
             ptm_binder=metrics.get("ptm_binder"),
             rmsd_to_design=metrics.get("rmsd_to_design"),
+            binder_chain_id=getattr(sequence, 'binder_chain_id', 'B'),
         )
 
         # AlphaProteo filters (SI 2.2) - ONLY these 3 criteria
@@ -263,6 +265,7 @@ def _parse_boltz2_metrics(
     hotspot_residues: Optional[list[int]] = None,
     backbone_pdb: Optional[str] = None,
     target_len: int = 0,
+    binder_chain_id: str = "B",
 ) -> Optional[dict]:
     """
     Parse Boltz-2 output metrics from JSON or npz files.
@@ -305,7 +308,7 @@ def _parse_boltz2_metrics(
                 elif len(raw_metrics["chain_ptm"]) == 1:
                     metrics["ptm_binder"] = raw_metrics["chain_ptm"][0]
     
-    # Parse PAE matrix for hotspot-specific PAE (Anchor Lock)
+        # Parse PAE matrix for hotspot-specific PAE (Anchor Lock)
     if hotspot_residues:
         pae_files = glob.glob(f"{output_dir}/**/pae_*.npz", recursive=True)
         if pae_files:
@@ -314,8 +317,9 @@ def _parse_boltz2_metrics(
                 if "pae" in pae_data:
                     pae_matrix = pae_data["pae"]  # Shape: [N, N]
                     # Extract PAE between binder residues and hotspot residues on target
-                    # Hotspots are on target (first chain), binder is second chain
-                    # PAE[i, j] = error of residue i when aligned on residue j
+                    # Hotspots are on target, binder is the other chain
+                    # Boltz-2 might use different chain IDs than RFDiffusion
+                    # but typically target is first chain, binder is second.
                     if pae_matrix.ndim == 2 and target_len > 0:
                         binder_start = target_len
                         hotspot_pae_values = []
@@ -337,7 +341,8 @@ def _parse_boltz2_metrics(
                         glob.glob(f"{output_dir}/**/*.pdb", recursive=True)
         if predicted_pdbs:
             try:
-                rmsd = _calculate_backbone_rmsd(backbone_pdb, predicted_pdbs[0])
+                # Use the binder chain ID passed to the function
+                rmsd = _calculate_backbone_rmsd(backbone_pdb, predicted_pdbs[0], chain_id=binder_chain_id)
                 if rmsd is not None:
                     metrics["rmsd_to_design"] = rmsd
             except Exception as e:
@@ -556,7 +561,17 @@ def run_esmfold_validation(
         ref_structure = pdb.get_structure(ref_file, model=1)
         
         # Extract CA atoms from both structures
-        ref_ca = ref_structure[ref_structure.atom_name == "CA"]
+        # Use the binder chain ID to ensure we only compare against the generated part
+        binder_chain = getattr(sequence, 'binder_chain_id', 'B')
+        ref_ca = ref_structure[
+            (ref_structure.atom_name == "CA") & 
+            (ref_structure.chain_id == binder_chain)
+        ]
+        
+        # Fallback: if binder chain not found in reference, try all CA atoms (older behavior)
+        if len(ref_ca) == 0:
+            ref_ca = ref_structure[ref_structure.atom_name == "CA"]
+            
         esm_ca = esmfold_structure[ca_mask]
         
         # Align lengths (handle minor length mismatches)
@@ -713,7 +728,17 @@ def run_esmfold_validation_batch(
                 # Load RFDiffusion backbone
                 ref_file = pdb.PDBFile.read(backbone_pdb_path)
                 ref_structure = pdb.get_structure(ref_file, model=1)
-                ref_ca = ref_structure[ref_structure.atom_name == "CA"]
+                
+                # Use binder chain ID
+                binder_chain = sequence.binder_chain_id
+                ref_ca = ref_structure[
+                    (ref_structure.atom_name == "CA") & 
+                    (ref_structure.chain_id == binder_chain)
+                ]
+                
+                # Fallback
+                if len(ref_ca) == 0:
+                    ref_ca = ref_structure[ref_structure.atom_name == "CA"]
                 
                 # Align lengths
                 min_len = min(len(ref_ca), len(ca_atoms))
@@ -1933,7 +1958,12 @@ def cluster_by_tm_score(
         for i in range(n):
             tm_matrix[i, i] = 1.0
             for j in range(i + 1, n):
-                tm = _calculate_tm_score(predictions[i].pdb_path, predictions[j].pdb_path)
+                # Use binder chain ID from prediction
+                tm = _calculate_tm_score(
+                    predictions[i].pdb_path, 
+                    predictions[j].pdb_path,
+                    chain_id=predictions[i].binder_chain_id
+                )
                 tm_matrix[i, j] = tm
                 tm_matrix[j, i] = tm
         

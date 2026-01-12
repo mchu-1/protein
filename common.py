@@ -636,6 +636,7 @@ class BackboneDesign(BaseModel):
     target_pdb_path: str = Field(..., description="Path to target PDB used")
     hotspot_residues: list[int] = Field(..., description="Hotspot residues used")
     binder_length: int = Field(..., description="Length of designed binder")
+    binder_chain_id: str = Field(default="B", description="Chain ID of the designed binder")
     rfdiffusion_score: Optional[float] = Field(None, description="RFDiffusion confidence")
 
 
@@ -647,6 +648,7 @@ class SequenceDesign(BaseModel):
     sequence: str = Field(..., description="Amino acid sequence (one-letter codes)")
     fasta_path: str = Field(..., description="Path to FASTA file")
     score: float = Field(..., description="ProteinMPNN log-likelihood score")
+    binder_chain_id: str = Field(default="B", description="Chain ID of the designed binder")
     recovery: Optional[float] = Field(None, description="Sequence recovery if applicable")
     backbone_pdb: Optional[str] = Field(None, description="Path to RFDiffusion backbone PDB (for RMSD)")
 
@@ -680,6 +682,7 @@ class StructurePrediction(BaseModel):
     pae_interaction: Optional[float] = Field(None, description="Min PAE at hotspot residues (Anchor Lock)")
     ptm_binder: Optional[float] = Field(None, description="pTM for binder-only (Fold Quality)")
     rmsd_to_design: Optional[float] = Field(None, description="RMSD vs RFDiffusion backbone (Self-Consistency)")
+    binder_chain_id: str = Field(default="B", description="Chain ID of the designed binder")
 
     @property
     def ppi_score(self) -> float:

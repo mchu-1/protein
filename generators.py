@@ -111,13 +111,17 @@ def run_rfdiffusion(
             # Try to continue with any designs that were generated
 
         # Collect generated designs
+        # RFDiffusion usually assigns the first contig (the binder) to chain A
+        # but it might vary. We'll use a chain that isn't the target chain.
+        binder_chain = "A" if target.chain_id != "A" else "B"
+        
         for i in range(config.num_designs):
             pdb_path = f"{output_dir}/design_{i}.pdb"
             if os.path.exists(pdb_path):
                 design_id = generate_design_id("backbone")
 
                 # Extract binder length from PDB
-                binder_length = _count_binder_residues(pdb_path, "B")
+                binder_length = _count_binder_residues(pdb_path, binder_chain)
 
                 designs.append(
                     BackboneDesign(
@@ -126,6 +130,7 @@ def run_rfdiffusion(
                         target_pdb_path=target.pdb_path,
                         hotspot_residues=target.hotspot_residues,
                         binder_length=binder_length,
+                        binder_chain_id=binder_chain,
                         rfdiffusion_score=None,  # Score extracted if available
                     )
                 )
@@ -269,8 +274,8 @@ def run_proteinmpnn(
     sequences: list[SequenceDesign] = []
 
     try:
-        # Prepare chains to design (design binder chain B, fix target chain A)
-        chains_to_design = "B"
+        # Use the binder chain ID from the backbone design
+        chains_to_design = backbone.binder_chain_id
 
         # ProteinMPNN path from environment (set in image) or fallback
         proteinmpnn_path = os.environ.get("PROTEINMPNN_PATH", "/app/ProteinMPNN")
@@ -312,14 +317,16 @@ def run_proteinmpnn(
         output_fasta = f"{output_dir}/seqs/{Path(backbone.pdb_path).stem}.fa"
         if os.path.exists(output_fasta):
             sequences = _parse_proteinmpnn_output(
-                output_fasta, backbone.design_id, output_dir, backbone.pdb_path
+                output_fasta, backbone.design_id, output_dir, backbone.pdb_path,
+                binder_chain_id=backbone.binder_chain_id
             )
         else:
             # Try alternative output location
             alt_fasta = f"{output_dir}/{Path(backbone.pdb_path).stem}.fa"
             if os.path.exists(alt_fasta):
                 sequences = _parse_proteinmpnn_output(
-                    alt_fasta, backbone.design_id, output_dir, backbone.pdb_path
+                    alt_fasta, backbone.design_id, output_dir, backbone.pdb_path,
+                    binder_chain_id=backbone.binder_chain_id
                 )
 
     except Exception as e:
@@ -369,20 +376,46 @@ def _parse_proteinmpnn_output(
     backbone_id: str,
     output_dir: str,
     backbone_pdb: Optional[str] = None,
+    binder_chain_id: str = "B",
 ) -> list[SequenceDesign]:
     """
     Parse ProteinMPNN output FASTA file into SequenceDesign objects.
-
-    ProteinMPNN output format:
-    >design_name, score=X.XXX, global_score=X.XXX, ...
-    SEQUENCE...
     """
     from Bio import SeqIO
+    from Bio.PDB import PDBParser
 
     sequences: list[SequenceDesign] = []
 
+    # Determine the order of chains in the PDB to correctly extract the binder sequence
+    chain_order = []
+    if backbone_pdb and os.path.exists(backbone_pdb):
+        try:
+            parser = PDBParser(QUIET=True)
+            structure = parser.get_structure("backbone", backbone_pdb)
+            for model in structure:
+                for chain in model:
+                    if chain.id not in chain_order:
+                        chain_order.append(chain.id)
+                break # Only need first model
+        except Exception:
+            pass
+    
+    # Default to [A, B] if we couldn't parse
+    if not chain_order:
+        chain_order = ["A", "B"]
+    
+    # Find the index of the binder chain
+    try:
+        binder_index = chain_order.index(binder_chain_id)
+    except ValueError:
+        binder_index = 1 if len(chain_order) > 1 else 0
+
     try:
         for i, record in enumerate(SeqIO.parse(fasta_path, "fasta")):
+            if i == 0 and "score=" not in record.description:
+                # Skip the first record if it's the original sequence (sometimes present)
+                continue
+
             sequence_id = generate_design_id("seq")
 
             # Parse score from header
@@ -395,13 +428,14 @@ def _parse_proteinmpnn_output(
                 except (IndexError, ValueError):
                     pass
 
-            # Extract just the binder sequence (chain B)
-            # ProteinMPNN may output full sequence with chain separator
+            # Extract just the binder sequence using the correct chain index
             seq_str = str(record.seq)
             if "/" in seq_str:
-                # Take the designed chain (usually second after separator)
                 parts = seq_str.split("/")
-                seq_str = parts[-1] if len(parts) > 1 else parts[0]
+                if binder_index < len(parts):
+                    seq_str = parts[binder_index]
+                else:
+                    seq_str = parts[-1]
 
             # Write individual FASTA file
             individual_fasta = f"{output_dir}/{sequence_id}.fasta"
@@ -414,6 +448,7 @@ def _parse_proteinmpnn_output(
                     sequence=seq_str,
                     fasta_path=individual_fasta,
                     score=score,
+                    binder_chain_id=binder_chain_id,
                     recovery=None,
                     backbone_pdb=backbone_pdb,
                 )
