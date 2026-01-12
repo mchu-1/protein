@@ -375,7 +375,8 @@ def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -
     """
     Calculate backbone RMSD between RFDiffusion design and Boltz-2 prediction.
     
-    Uses CA atoms for alignment and RMSD calculation.
+    Uses robust sequence alignment (Biotite) to handle gaps, insertions, and 
+    residue mismatches correctly.
     
     Args:
         ref_pdb: Path to RFDiffusion backbone PDB
@@ -386,53 +387,113 @@ def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -
         RMSD in Angstroms, or None if calculation fails
     """
     try:
-        from Bio.PDB import PDBParser, MMCIFParser, Superimposer
+        import biotite.structure as struc
+        import biotite.structure.io as struc_io
+        import biotite.sequence as seq
+        import biotite.sequence.align as align
+        import numpy as np
         
-        # Parse reference (RFDiffusion backbone)
-        ref_parser = PDBParser(QUIET=True)
-        ref_structure = ref_parser.get_structure("ref", ref_pdb)
-        
-        # Parse prediction (Boltz-2, might be CIF)
-        if pred_pdb.endswith(".cif"):
-            pred_parser = MMCIFParser(QUIET=True)
+        # 1. Load structures (Robust to PDB/CIF/MMTF)
+        # Handle CIF files explicitly as struc_io.load_structure might need help detecting format
+        if ref_pdb.endswith(".cif"):
+            ref_file = struc_io.load_structure(ref_pdb, format="cif")
         else:
-            pred_parser = PDBParser(QUIET=True)
-        pred_structure = pred_parser.get_structure("pred", pred_pdb)
+            ref_file = struc_io.load_structure(ref_pdb)
+            
+        if pred_pdb.endswith(".cif"):
+            pred_file = struc_io.load_structure(pred_pdb, format="cif")
+        else:
+            pred_file = struc_io.load_structure(pred_pdb)
         
-        # Extract CA atoms from binder chain
-        ref_atoms = []
-        pred_atoms = []
+        # 2. Extract CA atoms
+        # For reference: Use the specified chain_id (usually B from RFDiffusion)
+        # If chain doesn't exist, fallback to first chain
+        ref_ca = ref_file[(ref_file.atom_name == "CA") & (ref_file.chain_id == chain_id)]
+        if len(ref_ca) == 0:
+            # Fallback: use first chain if specified chain empty
+            chains = np.unique(ref_file.chain_id)
+            if len(chains) > 0:
+                ref_ca = ref_file[(ref_file.atom_name == "CA") & (ref_file.chain_id == chains[0])]
         
-        for model in ref_structure:
-            for chain in model:
-                if chain.id == chain_id:
-                    for residue in chain:
-                        if residue.id[0] == " " and "CA" in residue:
-                            ref_atoms.append(residue["CA"])
+        if len(ref_ca) == 0:
+            return None
+            
+        # For prediction: Find chain matching the specified chain_id
+        pred_ca_all = pred_file[pred_file.atom_name == "CA"]
+        pred_ca = pred_ca_all[pred_ca_all.chain_id == chain_id]
         
-        for model in pred_structure:
-            for chain in model:
-                if chain.id == chain_id:
-                    for residue in chain:
-                        if residue.id[0] == " " and "CA" in residue:
-                            pred_atoms.append(residue["CA"])
-        
-        if not ref_atoms or not pred_atoms:
+        # If specified chain not found or empty, use heuristic (length matching)
+        if len(pred_ca) == 0:
+            min_len_diff = 9999
+            best_chain_atoms = None
+            
+            for chain in np.unique(pred_ca_all.chain_id):
+                chain_atoms = pred_ca_all[pred_ca_all.chain_id == chain]
+                diff = abs(len(chain_atoms) - len(ref_ca))
+                if diff < min_len_diff:
+                    min_len_diff = diff
+                    best_chain_atoms = chain_atoms
+            
+            if best_chain_atoms is None:
+                return None
+            pred_ca = best_chain_atoms
+
+        if len(pred_ca) == 0:
+            return None
+
+        # 3. Sequence Alignment (Robust to index shifts/gaps)
+        # Convert 3D atoms to 1D sequence
+        try:
+            ref_seq = seq.ProteinSequence(ref_ca.res_name)
+            pred_seq = seq.ProteinSequence(pred_ca.res_name)
+        except Exception:
+            # Fallback for non-standard residues
             return None
         
-        # Truncate to shorter length
-        min_len = min(len(ref_atoms), len(pred_atoms))
-        ref_atoms = ref_atoms[:min_len]
-        pred_atoms = pred_atoms[:min_len]
+        # Perform global alignment
+        matrix = align.SubstitutionMatrix.std_protein_matrix()
+        # Use semi-global alignment (penalize gaps)
+        alignment = align.global_align(ref_seq, pred_seq, matrix)[0]
         
-        # Superimpose and calculate RMSD
-        super_imposer = Superimposer()
-        super_imposer.set_atoms(ref_atoms, pred_atoms)
+        # Get indices of matches (ignoring gaps)
+        codes = alignment.trace
+        ref_indices = []
+        pred_indices = []
         
-        return super_imposer.rms
+        ref_curr = 0
+        pred_curr = 0
+        
+        for code in codes:
+            if code == 0:   # Match (residues aligned)
+                ref_indices.append(ref_curr)
+                pred_indices.append(pred_curr)
+                ref_curr += 1
+                pred_curr += 1
+            elif code == 1: # Gap in pred (insertion in ref)
+                ref_curr += 1
+            elif code == 2: # Gap in ref (insertion in pred)
+                pred_curr += 1
+        
+        if len(ref_indices) < 3: # Need at least 3 points for superposition
+            return None
+            
+        # 4. Superimpose & Calculate RMSD
+        # Filter atoms to the matched subset
+        ref_ca_aligned = ref_ca[ref_indices]
+        pred_ca_aligned = pred_ca[pred_indices]
+        
+        # Superimpose (Kabsch algorithm)
+        pred_ca_superimposed, transformation = struc.superimpose(
+            ref_ca_aligned, pred_ca_aligned
+        )
+        
+        # Calculate RMSD
+        rmsd = struc.rmsd(ref_ca_aligned, pred_ca_superimposed)
+        
+        return float(rmsd)
         
     except Exception as e:
-        print(f"  Warning: RMSD calculation failed: {e}")
+        print(f"  Warning: Robust RMSD calculation failed: {e}")
         return None
 
 

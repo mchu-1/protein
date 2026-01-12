@@ -52,18 +52,18 @@ mode: bind
 # Stage Configurations
 # =============================================================================
 
-# RFDiffusion - Backbone Generation
+# RFDiffusion - Backbone Generation`  
 rfdiffusion:
   num_designs: 10             # Targeted screening campaign (10 backbones)
   binder_length_min: 80       # Minimum binder length (residues)
   binder_length_max: 120      # Maximum binder length (residues)
   noise_scale: 1.0            # Diffusion noise scale
-  num_diffusion_steps: 50     # Number of diffusion steps
+  num_diffusion_steps: 50     # Pareto-maximal number of diffusion steps
 
 # ProteinMPNN - Sequence Design
 proteinmpnn:
-  num_sequences: 1            # 1 sequence per backbone (Minimal sampling)
-  temperature: 0.2            # Sampling temperature (lower = more conservative)
+  num_sequences: 10           # 10 sequences per backbone
+  temperature: 0.2            # 0.2: Slightly higher temp for more sequence diversity
 
 # ESMFold - Orthogonal Validation (Gatekeeper)
 esmfold:
@@ -151,8 +151,8 @@ adaptive:
 # Solubility filter (1D chemistry gates)
 solubility_filter:
   enabled: true
-  min_abs_charge_ph7: 3.0     # Min |net charge| - prevents clumping
-  max_abs_charge_ph7: 12.0    # Max |net charge| - rejects super-charged sludge
+  min_abs_charge_ph7: 3.0     # Strict: Min |net charge| to prevent aggregation
+  max_abs_charge_ph7: 12.0    # Strict: Max |net charge| to avoid non-specific binding
   forbidden_pi_min: 6.0       # Forbidden pI zone lower bound (dead zone)
   forbidden_pi_max: 8.0       # Forbidden pI zone upper bound (near pH 7.4)
 
