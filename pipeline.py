@@ -1457,11 +1457,17 @@ def _run_adaptive_generation(
         
         batch_output_dir = f"{dirs['backbones']}/batch_{batch_num}"
         
+        # Start timing RFDiffusion batch
+        batch_start_time = time.time()
+        
         try:
             batch_backbones = run_rfdiffusion.remote(target, batch_rfdiffusion_config, batch_output_dir)
         except Exception as e:
             print(f"  RFDiffusion batch failed: {e}")
             continue
+            
+        batch_end_time = time.time()
+        batch_duration = batch_end_time - batch_start_time
         
         if not batch_backbones:
             print(f"  No backbones generated in batch {batch_num}")
@@ -1500,6 +1506,9 @@ def _run_adaptive_generation(
         # Add backbone nodes to state tree DURING adaptive generation (for live stats)
         if state_tree and target_node_id:
             batch_id = f"rfdiff_batch{batch_num}"
+            # Calculate amortized duration per backbone
+            avg_duration = batch_duration / len(batch_backbones) if batch_backbones else 0.0
+            
             kept_bb_ids = {b.design_id for b in batch_backbones}
             for i, backbone in enumerate(batch_backbones):
                 backbone_node_id = state_tree.add_backbone(
@@ -1509,6 +1518,14 @@ def _run_adaptive_generation(
                     binder_length=backbone.binder_length,
                     rfdiffusion_score=backbone.rfdiffusion_score,
                 )
+                
+                # Manually set timing based on batch execution
+                if backbone_node_id in state_tree.graph:
+                    node_data = state_tree.graph.nodes[backbone_node_id]["data"]
+                    node_data.timing.start_time = batch_start_time + (i * avg_duration)
+                    node_data.timing.end_time = node_data.timing.start_time + avg_duration
+                    node_data.timing.duration_sec = avg_duration
+                
                 state_tree.end_timing(backbone_node_id, NodeStatus.COMPLETED)
                 state_tree.set_batch_info(backbone_node_id, batch_id, i, len(batch_backbones))
             
@@ -1529,6 +1546,9 @@ def _run_adaptive_generation(
         # =====================================================================
         # Step 2: Design sequences for ALL backbones in parallel (GPU-efficient)
         # =====================================================================
+        # Start timing ProteinMPNN batch
+        batch_start_time = time.time()
+        
         try:
             batch_sequences = generate_sequences_parallel.remote(
                 batch_backbones, 
@@ -1538,6 +1558,9 @@ def _run_adaptive_generation(
         except Exception as e:
             print(f"  ProteinMPNN batch failed: {e}")
             continue
+            
+        batch_end_time = time.time()
+        batch_duration = batch_end_time - batch_start_time
         
         if not batch_sequences:
             print(f"  No sequences designed in batch {batch_num}")
@@ -1566,6 +1589,9 @@ def _run_adaptive_generation(
         # Add sequence nodes to state tree DURING adaptive generation (for live stats)
         if state_tree:
             seq_batch_id = f"mpnn_batch{batch_num}"
+            # Calculate amortized duration per sequence
+            avg_duration = batch_duration / len(batch_sequences) if batch_sequences else 0.0
+            
             kept_seq_ids = {s.sequence_id for s in batch_sequences}
             for i, seq in enumerate(batch_sequences):
                 seq_node_id = state_tree.add_sequence(
@@ -1575,6 +1601,14 @@ def _run_adaptive_generation(
                     score=seq.score,
                     fasta_path=seq.fasta_path,
                 )
+                
+                # Manually set timing based on batch execution
+                if seq_node_id in state_tree.graph:
+                    node_data = state_tree.graph.nodes[seq_node_id]["data"]
+                    node_data.timing.start_time = batch_start_time + (i * avg_duration)
+                    node_data.timing.end_time = node_data.timing.start_time + avg_duration
+                    node_data.timing.duration_sec = avg_duration
+                
                 state_tree.end_timing(seq_node_id, NodeStatus.COMPLETED)
                 state_tree.set_batch_info(seq_node_id, seq_batch_id, i, len(batch_sequences))
             
@@ -1607,6 +1641,9 @@ def _run_adaptive_generation(
         else:
             sequences_for_validation = batch_sequences
         
+        # Start timing Boltz-2 batch
+        batch_start_time = time.time()
+        
         try:
             batch_predictions = validate_sequences_parallel.remote(
                 sequences_for_validation,
@@ -1617,11 +1654,20 @@ def _run_adaptive_generation(
         except Exception as e:
             print(f"  Boltz-2 batch failed: {e}")
             continue
+            
+        batch_end_time = time.time()
+        batch_duration = batch_end_time - batch_start_time
         
         if batch_predictions:
             # Add prediction nodes to state tree DURING adaptive generation (for live stats)
             if state_tree:
                 val_batch_id = f"boltz2_batch{batch_num}"
+                # Calculate amortized duration per prediction
+                # Note: We divide total time by number of *inputs* attempted, not just successes,
+                # but map cost only to successful predictions here (simplification)
+                # Better: attribute cost to failed nodes too if we tracked them
+                avg_duration = batch_duration / len(batch_predictions) if batch_predictions else 0.0
+                
                 for i, pred in enumerate(batch_predictions):
                     pred_node_id = state_tree.add_prediction(
                         prediction_id=pred.prediction_id,
@@ -1636,6 +1682,14 @@ def _run_adaptive_generation(
                         ptm_binder=pred.ptm_binder,
                         rmsd_to_design=pred.rmsd_to_design,
                     )
+                    
+                    # Manually set timing based on batch execution
+                    if pred_node_id in state_tree.graph:
+                        node_data = state_tree.graph.nodes[pred_node_id]["data"]
+                        node_data.timing.start_time = batch_start_time + (i * avg_duration)
+                        node_data.timing.end_time = node_data.timing.start_time + avg_duration
+                        node_data.timing.duration_sec = avg_duration
+                    
                     state_tree.end_timing(pred_node_id, NodeStatus.COMPLETED)
                     state_tree.set_batch_info(pred_node_id, val_batch_id, i, len(batch_predictions))
                 
