@@ -530,7 +530,7 @@ class StickinessFilterConfig(BaseModel):
 class StageLimits(BaseModel):
     """Limits for a single pipeline stage.
     
-    Used to enforce timeouts and max design counts per stage.
+    Used to enforce timeouts per stage.
     If not specified, defaults are used.
     """
     
@@ -539,21 +539,15 @@ class StageLimits(BaseModel):
         ge=1, 
         description="Max seconds for this stage (None = use default)"
     )
-    max_designs: Optional[int] = Field(
-        default=None, 
-        ge=1, 
-        description="Max designs/sequences to process in this stage (None = use default)"
-    )
 
 
 class PipelineLimits(BaseModel):
     """Limits for all pipeline stages.
     
-    Enforces timeouts and max design counts per stage.
+    Enforces timeouts per stage.
     Defaults are used if not specified in YAML config.
     
     Default timeouts are based on Modal @app.function decorators.
-    Default max_designs are reasonable limits for cost control.
     """
     
     # Stage-specific limits
@@ -575,29 +569,12 @@ class PipelineLimits(BaseModel):
         "chai1": 900,         # 15 min per binder-decoy pair
     }
     
-    # Default max_designs values - conservative limits for cost control
-    _default_max_designs: dict = {
-        "rfdiffusion": 4,     # Max backbones to generate
-        "proteinmpnn": 16,    # Max total sequences (backbones × seqs_per_backbone)
-        "esmfold": 16,        # Max sequences to validate (gatekeeper)
-        "boltz2": 3,          # Max sequences to validate (Boltz-2 @ $0.74/seq)
-        "foldseek": 2,        # Max decoys to find
-        "chai1": 3,           # Max binder-decoy pairs (Chai-1 @ $0.74/pair)
-    }
-    
     def get_timeout(self, stage: str) -> int:
         """Get timeout for a stage, using default if not specified."""
         stage_limits = getattr(self, stage, StageLimits())
         if stage_limits.timeout_seconds is not None:
             return stage_limits.timeout_seconds
         return self._default_timeouts.get(stage, 600)
-    
-    def get_max_designs(self, stage: str) -> int:
-        """Get max designs for a stage, using default if not specified."""
-        stage_limits = getattr(self, stage, StageLimits())
-        if stage_limits.max_designs is not None:
-            return stage_limits.max_designs
-        return self._default_max_designs.get(stage, 100)
 
 
 class PipelineConfig(BaseModel):
@@ -625,8 +602,8 @@ class PipelineConfig(BaseModel):
     beam_pruning: BeamPruningConfig = Field(default_factory=BeamPruningConfig, description="Greedy beam pruning to limit tree size")
     stickiness_filter: StickinessFilterConfig = Field(default_factory=StickinessFilterConfig, description="SAP stickiness check")
 
-    # Stage limits (timeouts and max designs per stage)
-    limits: PipelineLimits = Field(default_factory=PipelineLimits, description="Per-stage timeout and design limits")
+    # Stage limits (timeouts per stage)
+    limits: PipelineLimits = Field(default_factory=PipelineLimits, description="Per-stage timeout limits")
 
     # Budget control (optional - set to None to disable budget enforcement)
     max_compute_usd: Optional[float] = Field(default=None, ge=0.1, description="Maximum compute budget in USD (None = no limit)")

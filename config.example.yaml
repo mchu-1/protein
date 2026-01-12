@@ -46,6 +46,13 @@ proteinmpnn:
   temperature: 0.2             # Sampling temperature (lower = more conservative)
   backbone_noise: 0.0          # Backbone coordinate noise
 
+# ESMFold - Orthogonal Validation (Gatekeeper)
+esmfold:
+  enabled: true                # Enable ESMFold gatekeeper (validates all sequences)
+  min_plddt: 70.0              # Min mean pLDDT (confidence)
+  max_rmsd: 2.5                # Max RMSD to RFDiffusion backbone (consistency)
+  save_predictions: false      # Save ESMFold PDB predictions
+
 # Boltz-2 - Structure Validation (AlphaProteo SI 2.2 thresholds)
 boltz2:
   num_recycles: 3              # Number of recycling iterations
@@ -143,29 +150,28 @@ beam_pruning:
 # Stage Limits
 # =============================================================================
 #
-# Limits control branching at each stage of the pipeline.
-# Timeouts are in seconds. Max designs caps the output count per stage.
+# Limits define the worst-case duration (timeout) for each stage of the pipeline.
+# Used for cost forecasting and enforcing execution time boundaries.
+# Timeouts are in seconds.
 
 limits:
   rfdiffusion:
     timeout_seconds: 600       # 10 minutes for batch generation
-    max_designs: 4             # Max backbones to generate
   
   proteinmpnn:
     timeout_seconds: 300       # 5 minutes per backbone
-    max_designs: 4             # Max sequences per backbone
+  
+  esmfold:
+    timeout_seconds: 300       # 5 minutes per sequence validation
   
   boltz2:
     timeout_seconds: 900       # 15 minutes per validation
-    max_designs: 2             # Max sequences to validate
   
   foldseek:
     timeout_seconds: 120       # 2 minutes for proteome search
-    max_designs: 2             # Max decoys to find
   
   chai1:
     timeout_seconds: 900       # 15 minutes per pair
-    max_designs: 2             # Max sequences to check against decoys (2 seqs × 2 decoys = 4 pairs)
 
 # =============================================================================
 # Budget Control (Optional)

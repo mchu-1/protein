@@ -51,6 +51,7 @@ from common import (
     data_volume,
     generate_protein_id,
     generate_ulid,
+    generate_design_id,
     load_config_from_yaml,
 )
 from state_tree import (
@@ -120,16 +121,6 @@ DEFAULT_STEP_TIMEOUTS = {
     "boltz2": 900,        # validators.py: run_boltz2 timeout=900
     "foldseek": 120,      # validators.py: download_decoy_structures timeout=120
     "chai1": 900,         # validators.py: run_chai1 timeout=900
-}
-
-# Default max_designs per step when no limits are specified
-DEFAULT_MAX_DESIGNS = {
-    "rfdiffusion": 4,     # Max backbones to generate
-    "proteinmpnn": 16,    # Max total sequences
-    "esmfold": 16,        # Max sequences to validate (gatekeeper)
-    "boltz2": 3,          # Max sequences to validate (Boltz-2 @ $0.74/seq)
-    "foldseek": 2,        # Max decoys
-    "chai1": 3,           # Max binder-decoy pairs (Chai-1 @ $0.74/pair)
 }
 
 # Resource allocation per step - from @app.function decorators
@@ -256,12 +247,11 @@ def estimate_cost(config: PipelineConfig) -> dict:
     """
     Estimate the worst-case compute cost ceiling for a pipeline run.
     
-    Uses timeout ceilings and max_designs limits from config.limits to provide
-    a deterministic upper bound based on configured limits.
+    Uses timeout ceilings from config.limits to provide a deterministic upper bound.
     
-    Cost calculation uses min(requested, limit) for each dimension:
+    Cost calculation uses requested designs for each dimension:
     - Timeouts: Uses config.limits timeout or default
-    - Max designs: Uses min(requested designs, config.limits max_designs)
+    - Designs: Uses requested designs from config
 
     Args:
         config: Pipeline configuration
@@ -272,39 +262,33 @@ def estimate_cost(config: PipelineConfig) -> dict:
     limits = config.limits
     
     # ==========================================================================
-    # Tree Degree Indexing: limits represent branching factor at each level
+    # Pipeline Scaling: costs are proportional to branching factor at each level
     # ==========================================================================
     
     # Level 1: RFDiffusion - backbones per target (degree from root)
     requested_backbones = config.rfdiffusion.num_designs
-    max_backbones_per_target = limits.get_max_designs("rfdiffusion")
-    effective_backbones = min(requested_backbones, max_backbones_per_target)
+    effective_backbones = requested_backbones
     
     # Level 2: ProteinMPNN - sequences per backbone (degree per backbone)
     requested_seqs_per_backbone = config.proteinmpnn.num_sequences
-    max_seqs_per_backbone = limits.get_max_designs("proteinmpnn")
-    effective_seqs_per_backbone = min(requested_seqs_per_backbone, max_seqs_per_backbone)
+    effective_seqs_per_backbone = requested_seqs_per_backbone
     
     # Derived: total sequences in tree
     effective_sequences = effective_backbones * effective_seqs_per_backbone
     
     # Level 2.5: ESMFold - gatekeeper validation (all sequences if enabled)
-    max_esmfold = limits.get_max_designs("esmfold")
-    effective_esmfold = min(effective_sequences, max_esmfold) if config.esmfold.enabled else 0
+    effective_esmfold = effective_sequences if config.esmfold.enabled else 0
     
-    # Level 3: Boltz-2 - total cap on validations (cost control, not degree)
+    # Level 3: Boltz-2 - validations (cost control)
     # Ceiling assumes all sequences proceed (no prune rate estimation)
-    max_boltz2 = limits.get_max_designs("boltz2")
-    effective_boltz2 = min(effective_sequences, max_boltz2)
+    effective_boltz2 = effective_sequences
     
     # FoldSeek: decoys per target (degree from target)
     requested_decoys = config.foldseek.max_hits
-    max_decoys_per_target = limits.get_max_designs("foldseek")
-    effective_decoys = min(requested_decoys, max_decoys_per_target)
+    effective_decoys = requested_decoys
     
-    # Level 4: Chai-1 - max sequences to check (each checked against ALL decoys)
-    max_chai1_sequences = limits.get_max_designs("chai1")
-    effective_chai1_sequences = min(effective_boltz2, max_chai1_sequences)
+    # Level 4: Chai-1 - sequences to check (each checked against ALL decoys)
+    effective_chai1_sequences = effective_boltz2
     effective_chai1_pairs = effective_chai1_sequences * effective_decoys
     
     # Get effective timeouts from limits
@@ -475,50 +459,37 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         os.makedirs(d, exist_ok=True)
 
     # ==========================================================================
-    # ENFORCE HARD LIMITS from config.limits (Tree Degree Indexing)
+    # Configuration setup
     # ==========================================================================
-    # The pipeline creates a tree structure. Limits represent the DEGREE
-    # (branching factor) at each node level:
+    # The pipeline creates a tree structure.
     #
     #   Target (root)
-    #   ├── [RFDiffusion] → degree = max backbones per target
-    #   │   └── [ProteinMPNN] → degree = max sequences per backbone
-    #   │       └── [Boltz-2] → 1:1 mapping, capped by total (cost control)
-    #   │           └── [Chai-1] → degree = decoys per validated sequence
-    #   └── [FoldSeek] → degree = max decoys per target
+    #   ├── [RFDiffusion]
+    #   │   └── [ProteinMPNN]
+    #   │       └── [Boltz-2]
+    #   │           └── [Chai-1]
+    #   └── [FoldSeek]
     #
     # ==========================================================================
     limits = config.limits
     
-    # Level 1: RFDiffusion - max backbones per target (degree from root)
-    max_backbones_per_target = limits.get_max_designs("rfdiffusion")
-    if config.rfdiffusion.num_designs > max_backbones_per_target:
-        print(f"[LIMIT] RFDiffusion: {config.rfdiffusion.num_designs} → {max_backbones_per_target} backbones/target")
-        config.rfdiffusion.num_designs = max_backbones_per_target
+    # Level 1: RFDiffusion
+    # No limit enforcement on backbones per target
     
-    # Level 2: ProteinMPNN - max sequences per backbone (degree per backbone node)
-    max_seqs_per_backbone = limits.get_max_designs("proteinmpnn")
-    if config.proteinmpnn.num_sequences > max_seqs_per_backbone:
-        print(f"[LIMIT] ProteinMPNN: {config.proteinmpnn.num_sequences} → {max_seqs_per_backbone} seqs/backbone")
-        config.proteinmpnn.num_sequences = max_seqs_per_backbone
+    # Level 2: ProteinMPNN
+    # No limit enforcement on sequences per backbone
     
     # Derived: total sequences in tree
     total_sequences = config.rfdiffusion.num_designs * config.proteinmpnn.num_sequences
     
-    # Level 3: Boltz-2 - max validations total (cost control, not degree)
-    # This caps how many leaf nodes we validate, not branching factor
-    max_boltz2_validations = limits.get_max_designs("boltz2")
+    # Level 3: Boltz-2
+    # No limit enforcement on validations
     
-    # FoldSeek: max decoys per target (degree from target node)
-    max_decoys_per_target = limits.get_max_designs("foldseek")
-    if config.foldseek.max_hits > max_decoys_per_target:
-        print(f"[LIMIT] FoldSeek: {config.foldseek.max_hits} → {max_decoys_per_target} decoys/target")
-        config.foldseek.max_hits = max_decoys_per_target
+    # FoldSeek
+    # No limit enforcement on decoys per target
     
-    # Level 4: Chai-1 - max validated sequences to check (cost control)
-    # Each validated sequence is checked against ALL decoys
-    # Limit controls how many sequences proceed to cross-reactivity check
-    max_chai1_sequences = limits.get_max_designs("chai1")
+    # Level 4: Chai-1
+    # No limit enforcement on sequences to check
     
     # Pre-flight cost check (only if budget is set)
     cost_estimate = estimate_cost(config)
@@ -547,11 +518,11 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     print(f"PDB ID: {t.pdb_id} | Entity ID: {t.entity_id}")
     print(f"Hotspot residues: {', '.join(str(r) for r in t.hotspot_residues)}")
     print("\nConfiguration:")
-    print(f"├─ Backbones: {config.rfdiffusion.num_designs} (max: {max_backbones_per_target})")
-    print(f"│  └─ Sequences: {config.proteinmpnn.num_sequences}/backbone (max: {max_seqs_per_backbone}) → {total_sequences} total")
-    print(f"│     └─ Validations: up to {max_boltz2_validations}")
-    print(f"│        └─ Chai-1: up to {max_chai1_sequences} seqs × {config.foldseek.max_hits} decoys")
-    print(f"└─ Decoys: {config.foldseek.max_hits} (max: {max_decoys_per_target})")
+    print(f"├─ Backbones: {config.rfdiffusion.num_designs}")
+    print(f"│  └─ Sequences: {config.proteinmpnn.num_sequences}/backbone → {total_sequences} total")
+    print(f"│     └─ Validations: all generated sequences")
+    print(f"│        └─ Chai-1: all validated seqs × {config.foldseek.max_hits} decoys")
+    print(f"└─ Decoys: {config.foldseek.max_hits}")
     print(f"\nCost ceiling: ${cost_estimate['total']:.2f}")
     print(f"  ├─ RFDiffusion (A10G):  ${cost_estimate['rfdiffusion']:.3f}")
     print(f"  ├─ ProteinMPNN (L4):    ${cost_estimate['proteinmpnn']:.3f}")
@@ -624,7 +595,7 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
             config.adaptive,
             config.backbone_filter,
             dirs,
-            max_boltz2_per_batch=max_boltz2_validations,
+            max_boltz2_per_batch=None,
             structural_memo_config=config.structural_memoization,
             solubility_config=config.solubility_filter,
             stickiness_config=config.stickiness_filter,
@@ -980,20 +951,8 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
         # =========================================================================
 
         # Step 3: Boltz-2 - Structure Prediction & Filtering
-        # ENFORCE Boltz-2 limit: select TOP N sequences by ProteinMPNN score (descending)
-        if len(sequences) > max_boltz2_validations:
-            # Sort by ProteinMPNN score descending (higher score = better)
-            sequences_ranked = sorted(sequences, key=lambda s: s.score, reverse=True)
-            sequences_to_validate = sequences_ranked[:max_boltz2_validations]
-            skipped_sequences = sequences_ranked[max_boltz2_validations:]
-            top_scores = [f"{s.score:.2f}" for s in sequences_to_validate]
-            print(f"[LIMIT] Boltz-2: {len(sequences)} → {max_boltz2_validations} sequences (top by score: {', '.join(top_scores)})")
-            # Mark skipped sequences in state tree
-            for seq in skipped_sequences:
-                state_tree.set_status(seq.sequence_id, NodeStatus.SKIPPED)
-                state_tree.set_metrics(seq.sequence_id, {"skipped_by": "boltz2_limit", "score": seq.score})
-        else:
-            sequences_to_validate = sequences
+        # No limit enforcement on Boltz-2 validations
+        sequences_to_validate = sequences
         
         print("\n=== Phase 2: Structure Validation (Boltz-2) ===")
         print(f"[START] {time.strftime('%H:%M:%S')} | Input: {len(sequences_to_validate)} sequences")
@@ -1176,30 +1135,9 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     ]
 
     if validated_sequences:
-        # ENFORCE Chai-1 limit: select TOP N sequences by PPI score (descending)
+        # No limit enforcement on Chai-1 sequences
         # Each sequence is checked against ALL decoys
         num_decoys = len(decoys) if decoys else 0
-        
-        if len(validated_sequences) > max_chai1_sequences:
-            # Build mapping from sequence_id to PPI score from Boltz-2 predictions
-            ppi_scores = {p.sequence_id: p.ppi_score for p in predictions}
-            
-            # Sort by PPI score descending (higher = better target binding)
-            validated_sequences_ranked = sorted(
-                validated_sequences,
-                key=lambda s: ppi_scores.get(s.sequence_id, 0),
-                reverse=True
-            )
-            validated_sequences = validated_sequences_ranked[:max_chai1_sequences]
-            skipped_for_chai1 = validated_sequences_ranked[max_chai1_sequences:]
-            top_ppi = [f"{ppi_scores.get(s.sequence_id, 0):.3f}" for s in validated_sequences]
-            print(f"[LIMIT] Chai-1: {len(validated_sequences_ranked)} → {max_chai1_sequences} sequences (top by PPI: {', '.join(top_ppi)})")
-            # Mark skipped sequences in state tree
-            for seq in skipped_for_chai1:
-                state_tree.set_metrics(seq.sequence_id, {
-                    "skipped_chai1": True,
-                    "ppi_score": ppi_scores.get(seq.sequence_id, 0),
-                })
         
         print("\n=== Phase 3: Cross-Reactivity Check (Chai-1) ===")
         print(f"[START] {time.strftime('%H:%M:%S')} | Input: {len(validated_sequences)} sequences × {num_decoys} decoys")
@@ -2367,16 +2305,16 @@ def _create_best_symlinks(
 def print_dry_run_summary(config: PipelineConfig) -> None:
     """
     Print a detailed human-readable overview of deployment parameters and costs.
-    Uses limit-based ceiling forecasting for deterministic cost estimates.
+    Uses design-based ceiling forecasting for deterministic cost estimates.
     """
-    # Get accurate cost estimates with limit enforcement
+    # Get accurate cost estimates with design counts
     costs = estimate_cost(config)
     
-    # Extract effective counts (after applying limits)
+    # Extract effective counts (based on requested)
     eff = costs["_effective"]
     timeouts = costs["_timeouts"]
     
-    # Requested vs effective (limited) values
+    # Requested values
     req_backbones = config.rfdiffusion.num_designs
     req_decoys = config.foldseek.max_hits
     
@@ -2420,29 +2358,18 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     print("-" * 70)
     
     # Show as tree structure
-    backbone_limited = req_backbones > eff_backbones
-    seq_per_bb_limited = config.proteinmpnn.num_sequences > eff_seqs_per_backbone
-    decoy_limited = req_decoys > eff_decoys
-    
-    backbone_str = f"{req_backbones} → {eff_backbones}" if backbone_limited else str(eff_backbones)
-    seq_per_bb_str = f"{config.proteinmpnn.num_sequences} → {eff_seqs_per_backbone}" if seq_per_bb_limited else str(eff_seqs_per_backbone)
-    decoy_str = f"{req_decoys} → {eff_decoys}" if decoy_limited else str(eff_decoys)
-    
-    def cap_tag(capped: bool) -> str:
-        return " (capped)" if capped else ""
-    
-    print(f"├─ Backbones: {backbone_str}{cap_tag(backbone_limited)}")
-    print(f"│  └─ Sequences: {seq_per_bb_str}/backbone{cap_tag(seq_per_bb_limited)} → {eff_sequences} total")
+    print(f"├─ Backbones: {eff_backbones}")
+    print(f"│  └─ Sequences: {eff_seqs_per_backbone}/backbone → {eff_sequences} total")
     if config.esmfold.enabled:
         print(f"│     └─ ESMFold: {eff_esmfold} (gatekeeper)")
     print(f"│     └─ Validations: {eff_boltz2}")
     print(f"│        └─ Chai-1: {eff_chai1_seqs} seqs × {eff_decoys} decoys = {eff_chai1} pairs")
-    print(f"└─ Decoys: {decoy_str}{cap_tag(decoy_limited)}")
+    print(f"└─ Decoys: {eff_decoys}")
     print()
     
     print("STAGE LIMITS")
     print("-" * 70)
-    print(f"{'Stage':<20} {'Timeout':<15} {'Max Designs':<15}")
+    print(f"{'Stage':<20} {'Timeout':<15}")
     print("-" * 70)
     stages = ["rfdiffusion", "proteinmpnn"]
     if config.esmfold.enabled:
@@ -2451,10 +2378,9 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     
     for stage in stages:
         timeout = limits.get_timeout(stage)
-        max_designs = limits.get_max_designs(stage)
         timeout_str = f"{timeout}s"
         stage_name = "ESMFold" if stage == "esmfold" else stage.title()
-        print(f"{stage_name:<20} {timeout_str:<15} {max_designs:<15}")
+        print(f"{stage_name:<20} {timeout_str:<15}")
     print()
     
     print("COST BREAKDOWN (Modal pricing, ceiling estimate)")
@@ -2495,8 +2421,7 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
         print("-" * 70)
         print("Options to reduce cost:")
         print(f"  1. Reduce designs: --num-designs {suggested_designs} --num-sequences {suggested_sequences}")
-        print("  2. Lower stage limits in YAML config (limits.boltz2.max_designs, etc.)")
-        print(f"  3. Increase budget: --max-budget {cost_total * 1.1:.2f}")
+        print(f"  2. Increase budget: --max-budget {cost_total * 1.1:.2f}")
         print()
 
     # Print optimization settings
