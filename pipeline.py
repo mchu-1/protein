@@ -2196,6 +2196,7 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     eff_backbones = eff["backbones"]
     eff_seqs_per_backbone = eff["seqs_per_backbone"]
     eff_sequences = eff["sequences"]
+    eff_esmfold = eff.get("esmfold_validations", 0)
     eff_boltz2 = eff["boltz2_validations"]
     eff_decoys = eff["decoys"]
     eff_chai1_seqs = eff["chai1_sequences"]
@@ -2204,6 +2205,7 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     # Calculate time breakdown
     rfdiffusion_sec = timeouts["rfdiffusion"]
     proteinmpnn_sec = timeouts["proteinmpnn"] * eff_backbones
+    esmfold_sec = timeouts.get("esmfold", 0) * eff_esmfold if config.esmfold.enabled else 0
     boltz2_sec = timeouts["boltz2"] * eff_boltz2
     foldseek_sec = timeouts["foldseek"]
     chai1_sec = timeouts["chai1"] * eff_chai1
@@ -2244,6 +2246,8 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     
     print(f"├─ Backbones: {backbone_str}{cap_tag(backbone_limited)}")
     print(f"│  └─ Sequences: {seq_per_bb_str}/backbone{cap_tag(seq_per_bb_limited)} → {eff_sequences} total")
+    if config.esmfold.enabled:
+        print(f"│     └─ ESMFold: {eff_esmfold} (gatekeeper)")
     print(f"│     └─ Validations: {eff_boltz2}")
     print(f"│        └─ Chai-1: {eff_chai1_seqs} seqs × {eff_decoys} decoys = {eff_chai1} pairs")
     print(f"└─ Decoys: {decoy_str}{cap_tag(decoy_limited)}")
@@ -2253,11 +2257,17 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     print("-" * 70)
     print(f"{'Stage':<20} {'Timeout':<15} {'Max Designs':<15}")
     print("-" * 70)
-    for stage in ["rfdiffusion", "proteinmpnn", "boltz2", "foldseek", "chai1"]:
+    stages = ["rfdiffusion", "proteinmpnn"]
+    if config.esmfold.enabled:
+        stages.append("esmfold")
+    stages.extend(["boltz2", "foldseek", "chai1"])
+    
+    for stage in stages:
         timeout = limits.get_timeout(stage)
         max_designs = limits.get_max_designs(stage)
         timeout_str = f"{timeout}s"
-        print(f"{stage:<20} {timeout_str:<15} {max_designs:<15}")
+        stage_name = "ESMFold" if stage == "esmfold" else stage.title()
+        print(f"{stage_name:<20} {timeout_str:<15} {max_designs:<15}")
     print()
     
     print("COST BREAKDOWN (Modal pricing, ceiling estimate)")
@@ -2266,12 +2276,15 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     print("-" * 70)
     cost_rfd = costs["rfdiffusion"]
     cost_mpnn = costs["proteinmpnn"]
+    cost_esmfold = costs.get("esmfold", 0.0)
     cost_boltz = costs["boltz2"]
     cost_fseek = costs["foldseek"]
     cost_chai = costs["chai1"]
     cost_total = costs["total"]
     print(f"{'RFDiffusion':<20} {'A10G':<12} {eff_backbones:<10} {rfdiffusion_sec:>6}s {'$' + f'{cost_rfd:.3f}':>12}")
     print(f"{'ProteinMPNN':<20} {'L4':<12} {eff_backbones:<10} {proteinmpnn_sec:>6}s {'$' + f'{cost_mpnn:.3f}':>12}")
+    if config.esmfold.enabled:
+        print(f"{'ESMFold':<20} {'T4':<12} {eff_esmfold:<10} {esmfold_sec:>6}s {'$' + f'{cost_esmfold:.3f}':>12}")
     print(f"{'Boltz-2':<20} {'A100-80GB':<12} {eff_boltz2:<10} {boltz2_sec:>6}s {'$' + f'{cost_boltz:.3f}':>12}")
     print(f"{'FoldSeek':<20} {'CPU':<12} {1:<10} {foldseek_sec:>6}s {'$' + f'{cost_fseek:.3f}':>12}")
     print(f"{'Chai-1':<20} {'A100-80GB':<12} {eff_chai1:<10} {chai1_sec:>6}s {'$' + f'{cost_chai:.3f}':>12}")
@@ -2303,6 +2316,7 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     print("OPTIMIZATIONS (State Tree Based)")
     print("-" * 70)
     opt_settings = [
+        ("ESMFold Gatekeeper", config.esmfold.enabled, f"pLDDT≥{config.esmfold.min_plddt}, RMSD≤{config.esmfold.max_rmsd}Å"),
         ("Structural Memoization", config.structural_memoization.enabled, f"threshold={config.structural_memoization.similarity_threshold}"),
         ("Solubility Filter", config.solubility_filter.enabled, f"forbidden_pI={config.solubility_filter.forbidden_pi_min}-{config.solubility_filter.forbidden_pi_max}"),
         ("Stickiness Filter (SAP)", config.stickiness_filter.enabled, f"max_sap={config.stickiness_filter.max_sap_score}"),
