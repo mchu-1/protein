@@ -134,14 +134,16 @@ STEP_RESOURCES = {
 }
 
 
-def _calculate_step_cost(step: str, duration_sec: float) -> float:
+def _calculate_step_cost(step: str, duration_sec: float, gpu_override: Optional[str] = None) -> float:
     """Calculate cost for a single step including GPU, CPU, and memory."""
     resources = STEP_RESOURCES[step]
     
     # GPU cost
     gpu_cost = 0.0
-    if resources["gpu"]:
-        gpu_cost = MODAL_GPU_COST_PER_SEC[resources["gpu"]] * duration_sec
+    gpu_type = gpu_override if gpu_override else resources["gpu"]
+    
+    if gpu_type and gpu_type in MODAL_GPU_COST_PER_SEC:
+        gpu_cost = MODAL_GPU_COST_PER_SEC[gpu_type] * duration_sec
     
     # CPU cost
     cpu_cost = MODAL_CPU_COST_PER_CORE_SEC * resources["cpu_cores"] * duration_sec
@@ -184,18 +186,18 @@ def _calculate_downstream_savings(
         num_decoys = config.foldseek.max_hits
         
         # ProteinMPNN cost for this backbone
-        proteinmpnn_cost = _calculate_step_cost("proteinmpnn", proteinmpnn_timeout)
+        proteinmpnn_cost = _calculate_step_cost("proteinmpnn", proteinmpnn_timeout, config.hardware.proteinmpnn_gpu)
         
         # ESMFold cost for all sequences from this backbone (if enabled)
         esmfold_cost = 0.0
         if config.esmfold.enabled:
-            esmfold_cost = _calculate_step_cost("esmfold", esmfold_timeout) * num_seqs
+            esmfold_cost = _calculate_step_cost("esmfold", esmfold_timeout, config.hardware.esmfold_gpu) * num_seqs
         
         # Boltz-2 cost for all sequences from this backbone
-        boltz2_cost = _calculate_step_cost("boltz2", boltz2_timeout) * num_seqs
+        boltz2_cost = _calculate_step_cost("boltz2", boltz2_timeout, config.hardware.boltz2_gpu) * num_seqs
         
         # Chai-1 cost for all sequence × decoy pairs
-        chai1_cost = _calculate_step_cost("chai1", chai1_timeout) * num_seqs * num_decoys
+        chai1_cost = _calculate_step_cost("chai1", chai1_timeout, config.hardware.chai1_gpu) * num_seqs * num_decoys
         
         saved_cost = proteinmpnn_cost + esmfold_cost + boltz2_cost + chai1_cost
         saved_time = proteinmpnn_timeout + (esmfold_timeout * num_seqs) + (boltz2_timeout * num_seqs) + (chai1_timeout * num_seqs * num_decoys)
@@ -210,10 +212,10 @@ def _calculate_downstream_savings(
         # ESMFold cost (if enabled)
         esmfold_cost = 0.0
         if config.esmfold.enabled:
-            esmfold_cost = _calculate_step_cost("esmfold", esmfold_timeout)
+            esmfold_cost = _calculate_step_cost("esmfold", esmfold_timeout, config.hardware.esmfold_gpu)
         
-        boltz2_cost = _calculate_step_cost("boltz2", boltz2_timeout)
-        chai1_cost = _calculate_step_cost("chai1", chai1_timeout) * num_decoys
+        boltz2_cost = _calculate_step_cost("boltz2", boltz2_timeout, config.hardware.boltz2_gpu)
+        chai1_cost = _calculate_step_cost("chai1", chai1_timeout, config.hardware.chai1_gpu) * num_decoys
         
         saved_cost = esmfold_cost + boltz2_cost + chai1_cost
         saved_time = esmfold_timeout + boltz2_timeout + (chai1_timeout * num_decoys)
@@ -224,8 +226,8 @@ def _calculate_downstream_savings(
         chai1_timeout = limits.get_timeout("chai1")
         num_decoys = config.foldseek.max_hits
         
-        boltz2_cost = _calculate_step_cost("boltz2", boltz2_timeout)
-        chai1_cost = _calculate_step_cost("chai1", chai1_timeout) * num_decoys
+        boltz2_cost = _calculate_step_cost("boltz2", boltz2_timeout, config.hardware.boltz2_gpu)
+        chai1_cost = _calculate_step_cost("chai1", chai1_timeout, config.hardware.chai1_gpu) * num_decoys
         
         saved_cost = boltz2_cost + chai1_cost
         saved_time = boltz2_timeout + (chai1_timeout * num_decoys)
@@ -235,7 +237,7 @@ def _calculate_downstream_savings(
         chai1_timeout = limits.get_timeout("chai1")
         num_decoys = config.foldseek.max_hits
         
-        chai1_cost = _calculate_step_cost("chai1", chai1_timeout) * num_decoys
+        chai1_cost = _calculate_step_cost("chai1", chai1_timeout, config.hardware.chai1_gpu) * num_decoys
         
         saved_cost = chai1_cost
         saved_time = chai1_timeout * num_decoys
@@ -304,27 +306,27 @@ def estimate_cost(config: PipelineConfig) -> dict:
     
     # RFDiffusion (A10G) - timeout for batch generation (all backbones in one call)
     rfdiffusion_sec = rfdiffusion_timeout
-    costs["rfdiffusion"] = _calculate_step_cost("rfdiffusion", rfdiffusion_sec)
+    costs["rfdiffusion"] = _calculate_step_cost("rfdiffusion", rfdiffusion_sec, config.hardware.rfdiffusion_gpu)
     
     # ProteinMPNN (L4) - timeout per backbone
     proteinmpnn_sec = proteinmpnn_timeout * effective_backbones
-    costs["proteinmpnn"] = _calculate_step_cost("proteinmpnn", proteinmpnn_sec)
+    costs["proteinmpnn"] = _calculate_step_cost("proteinmpnn", proteinmpnn_sec, config.hardware.proteinmpnn_gpu)
     
     # ESMFold (T4) - timeout per sequence (if enabled)
     esmfold_sec = esmfold_timeout * effective_esmfold if config.esmfold.enabled else 0
-    costs["esmfold"] = _calculate_step_cost("esmfold", esmfold_sec) if config.esmfold.enabled else 0.0
+    costs["esmfold"] = _calculate_step_cost("esmfold", esmfold_sec, config.hardware.esmfold_gpu) if config.esmfold.enabled else 0.0
     
     # Boltz-2 (A100) - timeout per sequence
     boltz2_sec = boltz2_timeout * effective_boltz2
-    costs["boltz2"] = _calculate_step_cost("boltz2", boltz2_sec)
+    costs["boltz2"] = _calculate_step_cost("boltz2", boltz2_sec, config.hardware.boltz2_gpu)
     
     # FoldSeek (CPU only) - single timeout
     foldseek_sec = foldseek_timeout
-    costs["foldseek"] = _calculate_step_cost("foldseek", foldseek_sec)
+    costs["foldseek"] = _calculate_step_cost("foldseek", foldseek_sec, None)
     
     # Chai-1 (A100) - timeout per binder-decoy pair
     chai1_sec = chai1_timeout * effective_chai1_pairs
-    costs["chai1"] = _calculate_step_cost("chai1", chai1_sec)
+    costs["chai1"] = _calculate_step_cost("chai1", chai1_sec, config.hardware.chai1_gpu)
     
     costs["total"] = sum(costs.values())
     
@@ -509,11 +511,11 @@ def run_pipeline(config: PipelineConfig, use_mocks: bool = False) -> PipelineRes
     print(f"│        └─ Chai-1: all validated seqs × {config.foldseek.max_hits} decoys")
     print(f"└─ Decoys: {config.foldseek.max_hits}")
     print(f"\nCost ceiling: ${cost_estimate['total']:.2f}")
-    print(f"  ├─ RFDiffusion (A10G):  ${cost_estimate['rfdiffusion']:.3f}")
-    print(f"  ├─ ProteinMPNN (L4):    ${cost_estimate['proteinmpnn']:.3f}")
-    print(f"  ├─ Boltz-2 (A100):      ${cost_estimate['boltz2']:.3f}")
+    print(f"  ├─ RFDiffusion ({config.hardware.rfdiffusion_gpu}):  ${cost_estimate['rfdiffusion']:.3f}")
+    print(f"  ├─ ProteinMPNN ({config.hardware.proteinmpnn_gpu}):    ${cost_estimate['proteinmpnn']:.3f}")
+    print(f"  ├─ Boltz-2 ({config.hardware.boltz2_gpu}):      ${cost_estimate['boltz2']:.3f}")
     print(f"  ├─ FoldSeek (CPU):      ${cost_estimate['foldseek']:.3f}")
-    print(f"  └─ Chai-1 (A100):       ${cost_estimate['chai1']:.3f}")
+    print(f"  └─ Chai-1 ({config.hardware.chai1_gpu}):       ${cost_estimate['chai1']:.3f}")
 
     # Write run manifest to campaign directory
     _write_run_manifest(campaign_dir, run_id, config, cost_estimate)
@@ -1887,9 +1889,15 @@ def _run_adaptive_generation(
             print("  Savings from early termination:")
             print(f"    Skipped: {saved_backbones} backbones, {saved_sequences} sequences")
             # Estimate cost savings (rough)
-            backbone_cost_per = 600 * MODAL_GPU_COST_PER_SEC["A10G"]  # 600s timeout
-            sequence_cost_per = 300 * MODAL_GPU_COST_PER_SEC["L4"] / proteinmpnn_config.num_sequences
-            validation_cost_per = 900 * MODAL_GPU_COST_PER_SEC["A100"]
+            # Use configured hardware prices
+            import pipeline
+            rfd_cost = pipeline.MODAL_GPU_COST_PER_SEC.get(config.hardware.rfdiffusion_gpu, 0.000306)
+            mpnn_cost = pipeline.MODAL_GPU_COST_PER_SEC.get(config.hardware.proteinmpnn_gpu, 0.000222)
+            boltz_cost = pipeline.MODAL_GPU_COST_PER_SEC.get(config.hardware.boltz2_gpu, 0.000583)
+            
+            backbone_cost_per = 600 * rfd_cost  # 600s timeout (approx)
+            sequence_cost_per = 300 * mpnn_cost / proteinmpnn_config.num_sequences
+            validation_cost_per = 900 * boltz_cost
             saved_cost = (saved_backbones * backbone_cost_per + 
                          saved_sequences * (sequence_cost_per + validation_cost_per))
             print(f"    Est. cost saved: ${saved_cost:.2f}")
@@ -2405,13 +2413,13 @@ def print_dry_run_summary(config: PipelineConfig) -> None:
     cost_fseek = costs["foldseek"]
     cost_chai = costs["chai1"]
     cost_total = costs["total"]
-    print(f"{'RFDiffusion':<20} {'A10G':<12} {eff_backbones:<10} {rfdiffusion_sec:>6}s {'$' + f'{cost_rfd:.3f}':>12}")
-    print(f"{'ProteinMPNN':<20} {'L4':<12} {eff_backbones:<10} {proteinmpnn_sec:>6}s {'$' + f'{cost_mpnn:.3f}':>12}")
+    print(f"{'RFDiffusion':<20} {config.hardware.rfdiffusion_gpu:<12} {eff_backbones:<10} {rfdiffusion_sec:>6}s {'$' + f'{cost_rfd:.3f}':>12}")
+    print(f"{'ProteinMPNN':<20} {config.hardware.proteinmpnn_gpu:<12} {eff_backbones:<10} {proteinmpnn_sec:>6}s {'$' + f'{cost_mpnn:.3f}':>12}")
     if config.esmfold.enabled:
-        print(f"{'ESMFold':<20} {'T4':<12} {eff_esmfold:<10} {esmfold_sec:>6}s {'$' + f'{cost_esmfold:.3f}':>12}")
-    print(f"{'Boltz-2':<20} {'A100-80GB':<12} {eff_boltz2:<10} {boltz2_sec:>6}s {'$' + f'{cost_boltz:.3f}':>12}")
+        print(f"{'ESMFold':<20} {config.hardware.esmfold_gpu:<12} {eff_esmfold:<10} {esmfold_sec:>6}s {'$' + f'{cost_esmfold:.3f}':>12}")
+    print(f"{'Boltz-2':<20} {config.hardware.boltz2_gpu:<12} {eff_boltz2:<10} {boltz2_sec:>6}s {'$' + f'{cost_boltz:.3f}':>12}")
     print(f"{'FoldSeek':<20} {'CPU':<12} {1:<10} {foldseek_sec:>6}s {'$' + f'{cost_fseek:.3f}':>12}")
-    print(f"{'Chai-1':<20} {'A100-80GB':<12} {eff_chai1:<10} {chai1_sec:>6}s {'$' + f'{cost_chai:.3f}':>12}")
+    print(f"{'Chai-1':<20} {config.hardware.chai1_gpu:<12} {eff_chai1:<10} {chai1_sec:>6}s {'$' + f'{cost_chai:.3f}':>12}")
     print("-" * 70)
     print(f"{'CEILING TOTAL':<20} {'':<12} {'':<10} {int(est_runtime_sec):>6}s {'$' + f'{cost_total:.2f}':>12}")
     print()
