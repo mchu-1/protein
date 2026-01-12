@@ -314,7 +314,7 @@ class TargetProtein(BaseModel):
 class RFDiffusionConfig(BaseModel):
     """Configuration for RFDiffusion backbone generation."""
 
-    num_designs: int = Field(default=10, ge=1, le=100, description="Number of backbones to generate")
+    num_designs: int = Field(default=10, ge=1, description="Number of backbones to generate")
     binder_length_min: int = Field(default=50, ge=30, description="Minimum binder length")
     binder_length_max: int = Field(default=100, le=200, description="Maximum binder length")
     noise_scale: float = Field(default=1.0, ge=0.1, le=2.0, description="Diffusion noise scale")
