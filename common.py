@@ -521,6 +521,22 @@ class StickinessFilterConfig(BaseModel):
     hydrophobic_residues: str = Field(default="AVILMFYW", description="Residues considered hydrophobic")
 
 
+class HardwareConfig(BaseModel):
+    """Configuration for hardware resources (GPUs) for cost optimization.
+    
+    Allows selecting optimal GPU types based on model size and budget.
+    Note: Changing these requires updating the code to read them dynamically, 
+    or they serve as documentation for the hardcoded values if dynamic allocation is limited.
+    """
+    
+    rfdiffusion_gpu: str = Field(default="A10G", description="GPU for RFDiffusion")
+    proteinmpnn_gpu: str = Field(default="L4", description="GPU for ProteinMPNN")
+    esmfold_gpu: str = Field(default="T4", description="GPU for ESMFold")
+    boltz2_gpu: str = Field(default="A100", description="GPU for Boltz-2 (A100=40GB, A100-80GB=80GB)")
+    chai1_gpu: str = Field(default="A100", description="GPU for Chai-1 (A100=40GB, A100-80GB=80GB)")
+
+
+
 # =============================================================================
 # Stage Limits Configuration
 # =============================================================================
@@ -589,6 +605,9 @@ class PipelineConfig(BaseModel):
     cluster: ClusterConfig = Field(default_factory=ClusterConfig, description="TM-score clustering for diversity")
     novelty: NoveltyConfig = Field(default_factory=NoveltyConfig, description="Novelty check vs UniRef50")
     scoring: ScoringWeights = Field(default_factory=ScoringWeights)
+
+    # Hardware configuration
+    hardware: HardwareConfig = Field(default_factory=HardwareConfig, description="GPU hardware selection")
 
     # Cost optimization configs
     backbone_filter: BackboneFilterConfig = Field(default_factory=BackboneFilterConfig, description="Backbone quality pre-screening")

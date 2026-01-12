@@ -34,7 +34,7 @@ mode: bind
 
 # RFDiffusion - Backbone Generation
 rfdiffusion:
-  num_designs: 1200            # Number of backbones to generate
+  num_designs: 1200            # High-throughput screening campaign
   binder_length_min: 80        # Minimum binder length (residues)
   binder_length_max: 120       # Maximum binder length (residues)
   noise_scale: 1.0             # Diffusion noise scale
@@ -42,15 +42,15 @@ rfdiffusion:
 
 # ProteinMPNN - Sequence Design
 proteinmpnn:
-  num_sequences: 50            # Number of sequences per backbone
+  num_sequences: 50            # Minimal sampling per backbone to save cost
   temperature: 0.2             # Sampling temperature (lower = more conservative)
 
 # ESMFold - Orthogonal Validation (Gatekeeper)
 esmfold:
-  enabled: true                # Enable ESMFold gatekeeper (validates all sequences)
-  min_plddt: 75.0              # Optimized: Increased from 70.0 to 75.0 (Stricter filter)
-  max_rmsd: 2.0                # Optimized: Decreased from 2.5 to 2.0 (Stricter consistency)
-  save_predictions: false      # Save ESMFold PDB predictions
+  enabled: true                # Essential gatekeeper
+  min_plddt: 80.0              # Strict: Only pass high-confidence structures (cheaper to fail here)
+  max_rmsd: 1.5                # Strict: High consistency required
+  save_predictions: false      # Save storage cost
 
 # Boltz-2 - Structure Validation (AlphaProteo SI 2.2 thresholds)
 boltz2:
@@ -62,7 +62,7 @@ boltz2:
 # FoldSeek - Decoy Identification
 foldseek:
   database: "pdb100"           # Database to search
-  max_hits: 5
+  max_hits: 1                  # Cost Saver: Only check against the single closest homolog
   evalue_threshold: 0.001      # E-value cutoff
   cache_results: true          # Cache decoys by target for reuse
 
@@ -71,10 +71,22 @@ chai1:
   num_samples: 1               # Samples per binder-decoy pair
   min_chain_pair_iptm: 0.5     # ipTM threshold for cross-reactivity
   num_recycles: 3              # Number of recycling iterations
-  tiered_checking: true        # Use tiered decoy checking for cost savings
+  tiered_checking: true        # Critical: Use tiered checks to stop early
   tier1_min_tm: 0.7            # Min TM-score for Tier 1 (highest risk)
   tier2_min_tm: 0.5            # Min TM-score for Tier 2
   tier2_max_decoys: 0          # Disable Tier 2 to minimize cost
+
+# =============================================================================
+# Hardware Optimization
+# =============================================================================
+# GPU selection for cost/performance optimization.
+# Options: T4, L4, A10G, A100 (40GB), A100-80GB, H100
+hardware:
+  rfdiffusion_gpu: "A10G"      # Balanced for generation
+  proteinmpnn_gpu: "L4"        # Efficient for sequence design
+  esmfold_gpu: "T4"            # Cheapest for validation
+  boltz2_gpu: "A100"           # Optimized: A100 (40GB) for validation
+  chai1_gpu: "A100"            # Optimized: A100 (40GB) for cross-reactivity
 
 # =============================================================================
 # Clustering & Novelty
@@ -106,15 +118,15 @@ scoring:
 
 # Backbone quality pre-screening
 backbone_filter:
-  enabled: true                # Enable backbone quality filtering
-  min_score: 0.4               # Min RFDiffusion confidence score
+  enabled: true                # Essential: Prune bad backbones early
+  min_score: 0.6               # Strict: Discard bottom 60% of backbones immediately
   max_keep: null               # Max backbones to keep (null = no limit)
 
 # Adaptive generation with early termination
 adaptive:
-  enabled: false               # Disabled to ensure generation of all sequences
-  min_validated_candidates: 10 # Stop when this many pass Boltz-2
-  batch_size: 4                # Backbones per micro-batch
+  enabled: true                # Enabled for batching
+  min_validated_candidates: 60000 # Attempt to process all designs (no early stopping)
+  batch_size: 16               # Small batches to prevent RFDiffusion timeouts (600s)
 
 # Solubility filter (1D chemistry gates)
 solubility_filter:

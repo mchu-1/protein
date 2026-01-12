@@ -128,9 +128,9 @@ STEP_RESOURCES = {
     "rfdiffusion": {"gpu": "A10G", "cpu_cores": 2, "memory_gib": 16},
     "proteinmpnn": {"gpu": "L4", "cpu_cores": 2, "memory_gib": 8},
     "esmfold": {"gpu": "T4", "cpu_cores": 2, "memory_gib": 16},
-    "boltz2": {"gpu": "A100-80GB", "cpu_cores": 4, "memory_gib": 32},
+    "boltz2": {"gpu": "A100", "cpu_cores": 4, "memory_gib": 32},
     "foldseek": {"gpu": None, "cpu_cores": 2, "memory_gib": 8},
-    "chai1": {"gpu": "A100-80GB", "cpu_cores": 4, "memory_gib": 32},
+    "chai1": {"gpu": "A100", "cpu_cores": 4, "memory_gib": 32},
 }
 
 

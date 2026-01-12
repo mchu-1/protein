@@ -280,9 +280,9 @@ class PipelineStateTree:
     STAGE_RESOURCES = {
         StageType.RFDIFFUSION: {"gpu": "A10G", "cpu_cores": 2, "memory_gib": 16},
         StageType.PROTEINMPNN: {"gpu": "L4", "cpu_cores": 2, "memory_gib": 8},
-        StageType.BOLTZ2: {"gpu": "A100-80GB", "cpu_cores": 4, "memory_gib": 32},
+        StageType.BOLTZ2: {"gpu": "A100", "cpu_cores": 4, "memory_gib": 32},
         StageType.FOLDSEEK: {"gpu": None, "cpu_cores": 2, "memory_gib": 8},
-        StageType.CHAI1: {"gpu": "A100-80GB", "cpu_cores": 4, "memory_gib": 32},
+        StageType.CHAI1: {"gpu": "A100", "cpu_cores": 4, "memory_gib": 32},
         StageType.SCORING: {"gpu": None, "cpu_cores": 1, "memory_gib": 4},
         # Optimization stages (minimal CPU cost, but track for observability)
         StageType.STRUCTURAL_MEMOIZATION: {"gpu": None, "cpu_cores": 1, "memory_gib": 2},
