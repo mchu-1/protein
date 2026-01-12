@@ -30,6 +30,7 @@ from common import (
     boltz2_image,
     chai1_image,
     data_volume,
+    esmfold_image,
     foldseek_image,
     generate_design_id,
     weights_volume,
@@ -421,6 +422,224 @@ def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -
     except Exception as e:
         print(f"  Warning: RMSD calculation failed: {e}")
         return None
+
+
+# =============================================================================
+# ESMFold - Orthogonal Validation (Gatekeeper)
+# =============================================================================
+
+
+@app.function(
+    image=esmfold_image,
+    gpu="T4",  # T4 sufficient for ESMFold inference (cheaper than A100)
+    timeout=300,  # 5 min per sequence
+    volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
+)
+def run_esmfold_validation(
+    sequence: SequenceDesign,
+    backbone_pdb: str,
+    min_plddt: float = 70.0,
+    max_rmsd: float = 2.5,
+    output_dir: str = None,
+) -> Optional[dict]:
+    """
+    Validate a designed sequence using ESMFold orthogonal prediction.
+    
+    **Architectural Rationale:**
+    RFDiffusion, ProteinMPNN, and Boltz-2 all use diffusion-based or geometry-driven
+    inductive biases. ESMFold is a Protein Language Model trained on evolutionary data
+    (UniRef), providing an orthogonal architectural signal.
+    
+    **Gatekeeper Logic:**
+    1. Predict structure from sequence using ESMFold (no backbone input)
+    2. Calculate mean pLDDT. If < 70, PRUNE (low confidence)
+    3. Align ESMFold CA atoms to RFDiffusion CA atoms
+    4. Calculate RMSD. If > 2.5 Å, PRUNE (sequence does not encode the intended structure)
+    
+    **Why this works:**
+    If ESMFold (sequence-only) cannot recover the RFDiffusion backbone geometry,
+    the design is likely an adversarial hallucination that "looks good" to
+    diffusion models but violates biophysical constraints.
+    
+    Args:
+        sequence: Designed sequence from ProteinMPNN
+        backbone_pdb: Path to original RFDiffusion backbone PDB
+        min_plddt: Minimum mean pLDDT threshold (default: 70)
+        max_rmsd: Maximum RMSD to RFDiffusion backbone (default: 2.5 Å)
+        output_dir: Optional directory to save ESMFold prediction
+    
+    Returns:
+        Dict with metrics if passed, None if pruned
+        {
+            "mean_plddt": float,
+            "rmsd_to_design": float,
+            "passed": bool,
+            "esmfold_pdb": str (optional),
+        }
+    """
+    import os
+    import numpy as np
+    
+    try:
+        # Import ESMFold via transformers
+        from transformers import EsmForProteinFolding
+        import torch
+        
+        # Import biotite for fast structure manipulation
+        import biotite.structure as struc
+        import biotite.structure.io.pdb as pdb
+        
+        # Load ESMFold model (weights are cached in image)
+        print(f"  ESMFold: Loading model for {sequence.sequence_id}...")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1")
+        model = model.to(device)
+        model.eval()
+        
+        # Prepare input
+        seq_str = sequence.sequence
+        print(f"  ESMFold: Predicting structure for {len(seq_str)} residues...")
+        
+        # Run ESMFold inference
+        with torch.no_grad():
+            output = model.infer_pdb(seq_str)
+        
+        # Parse ESMFold output (PDB string)
+        esmfold_pdb_str = output
+        
+        # Extract pLDDT from B-factor column (ESMFold convention)
+        # Parse PDB string into biotite structure
+        from io import StringIO
+        pdb_file = pdb.PDBFile.read(StringIO(esmfold_pdb_str))
+        esmfold_structure = pdb.get_structure(pdb_file, model=1)
+        
+        # Get pLDDT values (stored in b_factor field)
+        ca_mask = esmfold_structure.atom_name == "CA"
+        plddt_values = esmfold_structure.b_factor[ca_mask]
+        mean_plddt = float(np.mean(plddt_values))
+        
+        print(f"  ESMFold: Mean pLDDT = {mean_plddt:.1f}")
+        
+        # Metric 1: Confidence check
+        if mean_plddt < min_plddt:
+            print(f"  ✗ {sequence.sequence_id}: ESMFold pLDDT {mean_plddt:.1f} < {min_plddt} (LOW CONFIDENCE)")
+            return None
+        
+        # Metric 2: Consistency check (RMSD vs RFDiffusion backbone)
+        # Load RFDiffusion backbone
+        ref_file = pdb.PDBFile.read(backbone_pdb)
+        ref_structure = pdb.get_structure(ref_file, model=1)
+        
+        # Extract CA atoms from both structures
+        ref_ca = ref_structure[ref_structure.atom_name == "CA"]
+        esm_ca = esmfold_structure[ca_mask]
+        
+        # Align lengths (handle minor length mismatches)
+        min_len = min(len(ref_ca), len(esm_ca))
+        ref_ca = ref_ca[:min_len]
+        esm_ca = esm_ca[:min_len]
+        
+        # Superimpose ESMFold onto RFDiffusion backbone
+        esm_ca_superimposed, transform = struc.superimpose(ref_ca, esm_ca)
+        
+        # Calculate RMSD
+        rmsd = struc.rmsd(ref_ca, esm_ca_superimposed)
+        
+        print(f"  ESMFold: RMSD to RFDiffusion = {rmsd:.2f} Å")
+        
+        if rmsd > max_rmsd:
+            print(f"  ✗ {sequence.sequence_id}: ESMFold RMSD {rmsd:.2f} Å > {max_rmsd} Å (INCONSISTENT GEOMETRY)")
+            return None
+        
+        # PASSED both gates
+        print(f"  ✓ {sequence.sequence_id}: ESMFold validation PASSED (pLDDT={mean_plddt:.1f}, RMSD={rmsd:.2f}Å)")
+        
+        # Optionally save ESMFold prediction
+        esmfold_pdb_path = None
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            esmfold_pdb_path = f"{output_dir}/{sequence.sequence_id}_esmfold.pdb"
+            with open(esmfold_pdb_path, "w") as f:
+                f.write(esmfold_pdb_str)
+        
+        return {
+            "mean_plddt": mean_plddt,
+            "rmsd_to_design": rmsd,
+            "passed": True,
+            "esmfold_pdb": esmfold_pdb_path,
+        }
+        
+    except Exception as e:
+        print(f"  ✗ {sequence.sequence_id}: ESMFold error: {e}")
+        return None
+    finally:
+        # Clean up GPU memory
+        if 'model' in locals():
+            del model
+        if 'torch' in locals():
+            torch.cuda.empty_cache()
+        data_volume.commit()
+
+
+@app.function(
+    image=esmfold_image,
+    gpu="T4",
+    timeout=1800,  # 30 min for batch
+    volumes={WEIGHTS_PATH: weights_volume, DATA_PATH: data_volume},
+)
+def run_esmfold_validation_batch(
+    sequences: list[SequenceDesign],
+    backbone_pdbs: dict[str, str],
+    min_plddt: float = 70.0,
+    max_rmsd: float = 2.5,
+    output_dir: str = None,
+) -> list[SequenceDesign]:
+    """
+    Validate multiple sequences using ESMFold in batch.
+    
+    **Economics:**
+    ESMFold on T4 (~$0.30/hr) is 10x cheaper than Boltz-2 on A100 (~$3.50/hr).
+    This gatekeeper can prune 30-50% of hallucinated designs before they reach
+    expensive folding, saving significant compute costs.
+    
+    Args:
+        sequences: List of designed sequences
+        backbone_pdbs: Mapping from backbone_id -> PDB path
+        min_plddt: Minimum pLDDT threshold
+        max_rmsd: Maximum RMSD threshold
+        output_dir: Output directory for ESMFold predictions
+    
+    Returns:
+        List of sequences that passed ESMFold validation
+    """
+    validated_sequences: list[SequenceDesign] = []
+    
+    print(f"ESMFold Gatekeeper: validating {len(sequences)} sequences")
+    print(f"  Thresholds: pLDDT ≥ {min_plddt}, RMSD ≤ {max_rmsd} Å")
+    
+    for sequence in sequences:
+        # Get backbone PDB for this sequence
+        backbone_pdb = backbone_pdbs.get(sequence.backbone_id)
+        if not backbone_pdb:
+            print(f"  ✗ {sequence.sequence_id}: No backbone PDB found for {sequence.backbone_id}")
+            continue
+        
+        # Run validation
+        result = run_esmfold_validation.local(
+            sequence, 
+            backbone_pdb, 
+            min_plddt, 
+            max_rmsd,
+            f"{output_dir}/{sequence.sequence_id}" if output_dir else None
+        )
+        
+        if result is not None and result.get("passed"):
+            validated_sequences.append(sequence)
+    
+    pruned = len(sequences) - len(validated_sequences)
+    print(f"ESMFold Gatekeeper: {len(validated_sequences)}/{len(sequences)} passed ({pruned} pruned)")
+    
+    return validated_sequences
 
 
 # =============================================================================

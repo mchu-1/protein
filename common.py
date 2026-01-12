@@ -185,6 +185,34 @@ foldseek_image = (
     )
 )
 
+# ESMFold image for orthogonal validation
+# Uses ESM-2 protein language model to predict structure from sequence
+# Provides architectural diversity vs. RFDiffusion/Boltz-2 (diffusion models)
+esmfold_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git", "wget", "build-essential")
+    .pip_install(
+        "torch==2.0.1",  # Pin for stability
+        "numpy>=1.24.0,<2.0.0",
+        "scipy>=1.11.0",
+        "biotite>=1.0.0",  # For fast RMSD calculations
+        "pydantic>=2.0.0",
+        "fair-esm",  # Facebook ESM library (includes ESMFold)
+        "transformers>=4.30.0",  # For ESMFold via HuggingFace
+        index_url="https://pypi.org/simple",
+    )
+    .run_commands(
+        # Pre-download ESMFold model weights to bake into image (avoids 15GB download on every run)
+        "python -c 'from transformers import EsmForProteinFolding; "
+        "model = EsmForProteinFolding.from_pretrained(\"facebook/esmfold_v1\"); "
+        "print(\"ESMFold weights cached successfully\")'",
+    )
+    .env({
+        "TRANSFORMERS_CACHE": "/root/.cache/huggingface",
+        "HF_HOME": "/root/.cache/huggingface",
+    })
+)
+
 
 def _add_local_modules(image: modal.Image) -> modal.Image:
     """Add local Python modules to a Modal image for cross-module imports."""
@@ -205,6 +233,7 @@ proteinmpnn_image = _add_local_modules(proteinmpnn_image)
 boltz2_image = _add_local_modules(boltz2_image)
 chai1_image = _add_local_modules(chai1_image)
 foldseek_image = _add_local_modules(foldseek_image)
+esmfold_image = _add_local_modules(esmfold_image)
 
 
 # =============================================================================
@@ -300,6 +329,23 @@ class ProteinMPNNConfig(BaseModel):
     num_sequences: int = Field(default=8, ge=1, le=64, description="Sequences per backbone")
     temperature: float = Field(default=0.2, ge=0.01, le=1.0, description="Sampling temperature")
     backbone_noise: float = Field(default=0.0, ge=0.0, le=0.5, description="Backbone coordinate noise")
+
+
+class ESMFoldConfig(BaseModel):
+    """Configuration for ESMFold orthogonal validation (gatekeeper).
+    
+    ESMFold provides an orthogonal architectural signal to detect hallucinations:
+    - RFDiffusion/Boltz-2: Diffusion-based, geometry-driven
+    - ESMFold: Protein language model, evolutionary data (UniRef)
+    
+    If ESMFold (sequence-only) cannot recover the RFDiffusion backbone,
+    the design is likely an adversarial example.
+    """
+    
+    enabled: bool = Field(default=True, description="Enable ESMFold gatekeeper")
+    min_plddt: float = Field(default=70.0, ge=0.0, le=100.0, description="Min mean pLDDT (confidence)")
+    max_rmsd: float = Field(default=2.5, ge=0.0, le=10.0, description="Max RMSD to RFDiffusion backbone (consistency)")
+    save_predictions: bool = Field(default=False, description="Save ESMFold PDB predictions")
 
 
 class Boltz2Config(BaseModel):
@@ -555,6 +601,7 @@ class PipelineConfig(BaseModel):
     mode: GenerationMode = Field(default=GenerationMode.BIND, description="Semantic generation mode")
     rfdiffusion: RFDiffusionConfig = Field(default_factory=RFDiffusionConfig)
     proteinmpnn: ProteinMPNNConfig = Field(default_factory=ProteinMPNNConfig)
+    esmfold: ESMFoldConfig = Field(default_factory=ESMFoldConfig, description="ESMFold orthogonal validation (gatekeeper)")
     boltz2: Boltz2Config = Field(default_factory=Boltz2Config)
     foldseek: FoldSeekConfig = Field(default_factory=FoldSeekConfig)
     chai1: Chai1Config = Field(default_factory=Chai1Config)

@@ -29,3 +29,6 @@ venv/
 
 # Data outputs (generated at runtime)
 data/
+
+# Feature notes
+esmfold/
