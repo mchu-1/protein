@@ -63,13 +63,11 @@ def run_rfdiffusion(
     os.makedirs(output_dir, exist_ok=True)
 
     # Build hotspot string for RFDiffusion (e.g., "A10,A15,A20")
-    hotspot_str = ",".join(
-        f"{target.chain_id}{res}" for res in target.hotspot_residues
-    )
+    hotspot_str = ",".join(f"{target.chain_id}{res}" for res in target.hotspot_residues)
 
     # Determine target chain residue range from PDB file
     min_res, max_res = _get_chain_residue_range(target.pdb_path, target.chain_id)
-    
+
     # Build contigmap: defines binder length range and target interaction
     # Format: [binder_length/0 target_chain_residues]
     # Use actual residue numbering from PDB (may not start at 1)
@@ -117,7 +115,7 @@ def run_rfdiffusion(
         # Since we put the binder first ([binder/0 target]), binder is ALWAYS A.
         # The target (regardless of its original ID) becomes Chain B.
         binder_chain = "A"
-        
+
         for i in range(config.num_designs):
             pdb_path = f"{output_dir}/design_{i}.pdb"
             if os.path.exists(pdb_path):
@@ -220,7 +218,7 @@ def _count_binder_residues(pdb_path: str, chain_id: str = "B") -> int:
 
 def _get_chain_residue_range(pdb_path: str, chain_id: str) -> tuple[int, int]:
     """Get the (min, max) residue numbers for a chain in a PDB file."""
-    min_res = float('inf')
+    min_res = float("inf")
     max_res = 0
     try:
         with open(pdb_path, "r") as f:
@@ -235,13 +233,13 @@ def _get_chain_residue_range(pdb_path: str, chain_id: str) -> tuple[int, int]:
                             pass
     except Exception:
         pass
-    
+
     # Default to reasonable values if we couldn't parse
-    if min_res == float('inf'):
+    if min_res == float("inf"):
         min_res = 1
     if max_res == 0:
         max_res = 200
-    
+
     return (int(min_res), max_res)
 
 
@@ -279,7 +277,7 @@ def run_proteinmpnn(
     try:
         # ProteinMPNN path from environment (set in image) or fallback
         proteinmpnn_path = os.environ.get("PROTEINMPNN_PATH", "/app/ProteinMPNN")
-        
+
         # ProteinMPNN CLI expects a JSONL file to handle multiple chains correctly
         # (specifying which ones to design vs fix).
         # Format: {pdb_name: [designed_chain_list, fixed_chain_list]}
@@ -328,16 +326,22 @@ def run_proteinmpnn(
         output_fasta = f"{output_dir}/seqs/{Path(backbone.pdb_path).stem}.fa"
         if os.path.exists(output_fasta):
             sequences = _parse_proteinmpnn_output(
-                output_fasta, backbone.design_id, output_dir, backbone.pdb_path,
-                binder_chain_id=backbone.binder_chain_id
+                output_fasta,
+                backbone.design_id,
+                output_dir,
+                backbone.pdb_path,
+                binder_chain_id=backbone.binder_chain_id,
             )
         else:
             # Try alternative output location
             alt_fasta = f"{output_dir}/{Path(backbone.pdb_path).stem}.fa"
             if os.path.exists(alt_fasta):
                 sequences = _parse_proteinmpnn_output(
-                    alt_fasta, backbone.design_id, output_dir, backbone.pdb_path,
-                    binder_chain_id=backbone.binder_chain_id
+                    alt_fasta,
+                    backbone.design_id,
+                    output_dir,
+                    backbone.pdb_path,
+                    binder_chain_id=backbone.binder_chain_id,
                 )
 
     except Exception as e:
@@ -407,14 +411,14 @@ def _parse_proteinmpnn_output(
                 for chain in model:
                     if chain.id not in chain_order:
                         chain_order.append(chain.id)
-                break # Only need first model
+                break  # Only need first model
         except Exception:
             pass
-    
+
     # Default to [A, B] if we couldn't parse
     if not chain_order:
         chain_order = ["A", "B"]
-    
+
     # Find the index of the binder chain
     try:
         binder_index = chain_order.index(binder_chain_id)
@@ -450,7 +454,9 @@ def _parse_proteinmpnn_output(
 
             # Write individual FASTA file
             individual_fasta = f"{output_dir}/{sequence_id}.fasta"
-            write_fasta(seq_str, f"{sequence_id}|backbone={backbone_id}", individual_fasta)
+            write_fasta(
+                seq_str, f"{sequence_id}|backbone={backbone_id}", individual_fasta
+            )
 
             sequences.append(
                 SequenceDesign(
@@ -459,6 +465,7 @@ def _parse_proteinmpnn_output(
                     sequence=seq_str,
                     fasta_path=individual_fasta,
                     score=score,
+                    backbone_chain_id=binder_chain_id,
                     binder_chain_id=binder_chain_id,
                     recovery=None,
                     backbone_pdb=backbone_pdb,
@@ -503,15 +510,18 @@ def generate_sequences_parallel(
         Flattened list of all sequence designs
     """
     import time
+
     batch_start = time.time()
-    
+
     # Generate batch ID if not provided
     if batch_id is None:
         batch_id = f"mpnn_batch_{int(batch_start * 1000)}"
-    
+
     print(f"ProteinMPNN: generating sequences for {len(backbones)} backbones")
-    print(f"  Batch ID: {batch_id} | Batch size: {len(backbones)} (cold start amortized)")
-    
+    print(
+        f"  Batch ID: {batch_id} | Batch size: {len(backbones)} (cold start amortized)"
+    )
+
     # Prepare arguments for starmap
     args = [
         (backbone, config, f"{base_output_dir}/{backbone.design_id}")
@@ -525,9 +535,11 @@ def generate_sequences_parallel(
     all_sequences: list[SequenceDesign] = []
     for seq_list in all_results:
         all_sequences.extend(seq_list)
-    
+
     batch_duration = time.time() - batch_start
-    print(f"  Batch complete: {len(all_sequences)} sequences in {batch_duration:.1f}s (avg {batch_duration/len(backbones):.1f}s/backbone)")
+    print(
+        f"  Batch complete: {len(all_sequences)} sequences in {batch_duration:.1f}s (avg {batch_duration / len(backbones):.1f}s/backbone)"
+    )
 
     return all_sequences
 
@@ -544,46 +556,50 @@ def filter_backbones_by_quality(
 ) -> list[BackboneDesign]:
     """
     Filter backbones by RFDiffusion confidence score.
-    
+
     Prevents wasted ProteinMPNN and Boltz-2 calls on poor designs.
     Backbones without scores are kept (assumed acceptable).
-    
+
     Args:
         backbones: List of backbone designs from RFDiffusion
         min_score: Minimum RFDiffusion confidence score (0-1)
         max_keep: Maximum number of backbones to keep (None = no limit)
-    
+
     Returns:
         Filtered list of high-quality backbones, sorted by score descending
     """
     if not backbones:
         return backbones
-    
+
     # Separate scored and unscored backbones
-    scored = [(b, b.rfdiffusion_score) for b in backbones if b.rfdiffusion_score is not None]
+    scored = [
+        (b, b.rfdiffusion_score) for b in backbones if b.rfdiffusion_score is not None
+    ]
     unscored = [b for b in backbones if b.rfdiffusion_score is None]
-    
+
     # Filter by score threshold
     passing_scored = [(b, s) for b, s in scored if s >= min_score]
     rejected_count = len(scored) - len(passing_scored)
-    
+
     # Sort by score descending (best first)
     passing_scored.sort(key=lambda x: x[1], reverse=True)
-    
+
     # Combine: scored first (sorted), then unscored
     filtered = [b for b, _ in passing_scored] + unscored
-    
+
     # Apply max_keep limit
     if max_keep is not None and len(filtered) > max_keep:
         filtered = filtered[:max_keep]
-    
+
     if rejected_count > 0 or (max_keep and len(backbones) > max_keep):
         kept = len(filtered)
         original = len(backbones)
-        print(f"Backbone filter: {original} → {kept} (score ≥ {min_score}, max {max_keep or 'unlimited'})")
+        print(
+            f"Backbone filter: {original} → {kept} (score ≥ {min_score}, max {max_keep or 'unlimited'})"
+        )
         if rejected_count > 0:
             print(f"  Rejected {rejected_count} backbones below score threshold")
-    
+
     return filtered
 
 
@@ -677,7 +693,7 @@ def _create_mock_pdb(pdb_path: str, num_residues: int) -> None:
             # Write a single CA atom per residue
             x, y, z = i * 3.8, 0.0, 0.0  # Linear chain
             f.write(
-                f"ATOM  {atom_num:5d}  CA  ALA B{i+1:4d}    "
+                f"ATOM  {atom_num:5d}  CA  ALA B{i + 1:4d}    "
                 f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C\n"
             )
             atom_num += 1

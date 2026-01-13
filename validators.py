@@ -111,9 +111,10 @@ def run_boltz2(
 
         # Find output structure file
         import glob
+
         pdb_files = glob.glob(f"{output_dir}/**/*.pdb", recursive=True)
         cif_files = glob.glob(f"{output_dir}/**/*.cif", recursive=True)
-        
+
         # Use PDB or CIF output (Boltz may output either format)
         output_pdb = None
         if pdb_files:
@@ -127,16 +128,26 @@ def run_boltz2(
 
         # Parse Boltz-2 output metrics with AlphaProteo metrics
         # Pass hotspots for pae_interaction, backbone for RMSD
-        target_len = len(target_sequence)
-        backbone_pdb = getattr(sequence, 'backbone_pdb', None)  # Set by pipeline if available
-        
+
+        # CRITICAL: Extract target length from the OUTPUT structure (Chain A)
+        # This ensures we slice the PAE matrix correctly if Boltz hallucinated/dropped residues.
+        # Target is always Chain A in Boltz output.
+        try:
+            modeled_target_seq = _extract_sequence_from_pdb(output_pdb, "A")
+            target_len = len(modeled_target_seq)
+        except Exception:
+            # Fallback to input target length if output parsing fails
+            target_len = len(target_sequence)
+
+        backbone_pdb = getattr(sequence, "backbone_pdb", None)
+
         metrics = _parse_boltz2_metrics(
             output_dir=output_dir,
             sequence_id=sequence.sequence_id,
             hotspot_residues=target.hotspot_residues,
             backbone_pdb=backbone_pdb,
             target_len=target_len,
-            binder_chain_id=getattr(sequence, 'binder_chain_id', 'B'),
+            binder_chain_id=sequence.backbone_chain_id,
         )
 
         if metrics is None:
@@ -160,7 +171,7 @@ def run_boltz2(
             pae_interaction=metrics.get("pae_interaction"),
             ptm_binder=metrics.get("ptm_binder"),
             rmsd_to_design=metrics.get("rmsd_to_design"),
-            binder_chain_id=getattr(sequence, 'binder_chain_id', 'B'),
+            binder_chain_id=sequence.backbone_chain_id,
         )
 
         # AlphaProteo filters (SI 2.2) - ONLY these 3 criteria
@@ -170,14 +181,16 @@ def run_boltz2(
                 msg = f"PAE@hotspots {prediction.pae_interaction:.2f} Å > {config.max_pae_interaction} Å"
                 print(f"  ✗ {sequence.sequence_id}: {msg}")
                 return None, msg
-        
+
         # 2. Fold Quality: binder-only pTM > 0.80
         if prediction.ptm_binder is not None:
             if prediction.ptm_binder < config.min_ptm_binder:
-                msg = f"pTM(binder) {prediction.ptm_binder:.3f} < {config.min_ptm_binder}"
+                msg = (
+                    f"pTM(binder) {prediction.ptm_binder:.3f} < {config.min_ptm_binder}"
+                )
                 print(f"  ✗ {sequence.sequence_id}: {msg}")
                 return None, msg
-        
+
         # 3. Self-Consistency: RMSD vs RFDiffusion < 2.5 Å
         if prediction.rmsd_to_design is not None:
             if prediction.rmsd_to_design > config.max_rmsd:
@@ -233,7 +246,9 @@ def run_boltz2_batch(
         List of tuples (sequence, prediction, error_message).
         Prediction is None if failed/filtered.
     """
-    results: list[tuple[SequenceDesign, Optional[StructurePrediction], Optional[str]]] = []
+    results: list[
+        tuple[SequenceDesign, Optional[StructurePrediction], Optional[str]]
+    ] = []
 
     for sequence in sequences:
         seq_output_dir = f"{output_dir}/{sequence.sequence_id}"
@@ -270,7 +285,7 @@ def _parse_boltz2_metrics(
 ) -> Optional[dict]:
     """
     Parse Boltz-2 output metrics from JSON or npz files.
-    
+
     Includes AlphaProteo SI 2.2 metrics:
     - pae_interaction: min PAE at hotspot residues
     - ptm_binder: pTM for binder chain only
@@ -280,10 +295,10 @@ def _parse_boltz2_metrics(
     import glob
 
     metrics = {}
-    
+
     # Boltz outputs are in: {output_dir}/boltz_results_*/predictions/*/
     # Files: confidence_*.json, plddt_*.npz, pae_*.npz
-    
+
     # Find confidence JSON file - contains comprehensive metrics
     confidence_files = glob.glob(f"{output_dir}/**/confidence_*.json", recursive=True)
     if confidence_files:
@@ -300,15 +315,17 @@ def _parse_boltz2_metrics(
             metrics["plddt_interface"] = complex_iplddt * 100.0  # Scale to 0-100
             # Use complex_ipde for interface PAE
             metrics["pae_interface"] = raw_metrics.get("complex_ipde", 5.0)
-            
+
             # AlphaProteo: binder-only pTM (chain_ptm for second chain)
-            if "chain_ptm" in raw_metrics and isinstance(raw_metrics["chain_ptm"], list):
+            if "chain_ptm" in raw_metrics and isinstance(
+                raw_metrics["chain_ptm"], list
+            ):
                 # Assuming binder is second chain (after target)
                 if len(raw_metrics["chain_ptm"]) > 1:
                     metrics["ptm_binder"] = raw_metrics["chain_ptm"][1]
                 elif len(raw_metrics["chain_ptm"]) == 1:
                     metrics["ptm_binder"] = raw_metrics["chain_ptm"][0]
-    
+
         # Parse PAE matrix for hotspot-specific PAE (Anchor Lock)
     if hotspot_residues:
         pae_files = glob.glob(f"{output_dir}/**/pae_*.npz", recursive=True)
@@ -332,18 +349,23 @@ def _parse_boltz2_metrics(
                                 hotspot_pae_values.extend(binder_to_hs.tolist())
                         if hotspot_pae_values:
                             # Use minimum PAE at hotspots (best contact)
-                            metrics["pae_interaction"] = float(np.min(hotspot_pae_values))
+                            metrics["pae_interaction"] = float(
+                                np.min(hotspot_pae_values)
+                            )
             except Exception as e:
                 print(f"  Warning: Could not parse PAE matrix: {e}")
-    
+
     # Calculate RMSD vs RFDiffusion backbone (Self-Consistency)
     if backbone_pdb:
-        predicted_pdbs = glob.glob(f"{output_dir}/**/*.cif", recursive=True) + \
-                        glob.glob(f"{output_dir}/**/*.pdb", recursive=True)
+        predicted_pdbs = glob.glob(
+            f"{output_dir}/**/*.cif", recursive=True
+        ) + glob.glob(f"{output_dir}/**/*.pdb", recursive=True)
         if predicted_pdbs:
             try:
                 # Use the binder chain ID passed to the function
-                rmsd = _calculate_backbone_rmsd(backbone_pdb, predicted_pdbs[0], chain_id=binder_chain_id)
+                rmsd = _calculate_backbone_rmsd(
+                    backbone_pdb, predicted_pdbs[0], chain_id=binder_chain_id
+                )
                 if rmsd is not None:
                     metrics["rmsd_to_design"] = rmsd
             except Exception as e:
@@ -372,7 +394,9 @@ def _parse_boltz2_metrics(
     return None
 
 
-def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -> float | None:
+def _calculate_backbone_rmsd(
+    ref_pdb: str, pred_pdb: str, chain_id: str = "B"
+) -> float | None:
     """
     Calculate backbone RMSD between RFDiffusion design and Boltz-2 prediction.
     Correctly parses Biotite Alignment.trace (N x 2 array of indices).
@@ -384,7 +408,7 @@ def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -
         import biotite.sequence as seq
         import biotite.sequence.align as align
         import numpy as np
-        
+
         # [Helper function to load PDB/CIF safely]
         def load_safe(path):
             with warnings.catch_warnings():
@@ -395,10 +419,12 @@ def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -
                     # Fallback for specific formats
                     if path.endswith(".cif") or path.endswith(".mmcif"):
                         import biotite.structure.io.mmcif as mmcif
+
                         f = mmcif.MMCIFFile.read(path)
                         return mmcif.get_structure(f, model=1)
                     elif path.endswith(".pdb"):
                         import biotite.structure.io.pdb as pdb
+
                         f = pdb.PDBFile.read(path)
                         return pdb.get_structure(f, model=1)
                     raise
@@ -412,7 +438,7 @@ def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -
 
         # 2. Extract CA Atoms (With Robust Chain Filtering)
         ref_ca = ref_file[(ref_file.atom_name == "CA") & (ref_file.element == "C")]
-        
+
         # Filter Ref Chain
         ref_chain_atoms = ref_ca[ref_ca.chain_id == chain_id]
         if len(ref_chain_atoms) > 0:
@@ -424,12 +450,14 @@ def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -
             return None
 
         # Filter Pred Chain (Heuristic: Best Length Match)
-        pred_ca_all = pred_file[(pred_file.atom_name == "CA") & (pred_file.element == "C")]
+        pred_ca_all = pred_file[
+            (pred_file.atom_name == "CA") & (pred_file.element == "C")
+        ]
         pred_ca = pred_ca_all[pred_ca_all.chain_id == chain_id]
-        
+
         if len(pred_ca) == 0:
             best_chain = None
-            min_diff = float('inf')
+            min_diff = float("inf")
             for cid in np.unique(pred_ca_all.chain_id):
                 candidate = pred_ca_all[pred_ca_all.chain_id == cid]
                 diff = abs(len(candidate) - len(ref_ca))
@@ -449,31 +477,33 @@ def _calculate_backbone_rmsd(ref_pdb: str, pred_pdb: str, chain_id: str = "B") -
             return None
 
         matrix = align.SubstitutionMatrix.std_protein_matrix()
-        alignments = align.align_optimal(ref_seq, pred_seq, matrix, terminal_penalty=False)
-        
+        alignments = align.align_optimal(
+            ref_seq, pred_seq, matrix, terminal_penalty=False
+        )
+
         if not alignments:
             return None
-            
+
         # DOCS CONFIRMATION: trace is (N, 2) array. -1 is a gap.
-        trace = alignments[0].trace 
-        
+        trace = alignments[0].trace
+
         # We want rows where neither column is -1
         # Column 0 = Ref Index, Column 1 = Pred Index
         match_mask = (trace[:, 0] != -1) & (trace[:, 1] != -1)
-        
+
         ref_indices = trace[match_mask, 0]
         pred_indices = trace[match_mask, 1]
-        
+
         if len(ref_indices) < 3:
             return None
-            
+
         # 4. RMSD Calculation
         ref_ca_aligned = ref_ca[ref_indices]
         pred_ca_aligned = pred_ca[pred_indices]
-        
+
         pred_ca_superimposed, _ = struc.superimpose(ref_ca_aligned, pred_ca_aligned)
         rmsd = struc.rmsd(ref_ca_aligned, pred_ca_superimposed)
-        
+
         return float(rmsd)
 
     except Exception as e:
@@ -501,30 +531,30 @@ def run_esmfold_validation(
 ) -> Optional[dict]:
     """
     Validate a designed sequence using ESMFold orthogonal prediction.
-    
+
     **Architectural Rationale:**
     RFDiffusion, ProteinMPNN, and Boltz-2 all use diffusion-based or geometry-driven
     inductive biases. ESMFold is a Protein Language Model trained on evolutionary data
     (UniRef), providing an orthogonal architectural signal.
-    
+
     **Gatekeeper Logic:**
     1. Predict structure from sequence using ESMFold (no backbone input)
     2. Calculate mean pLDDT. If < 70, PRUNE (low confidence)
     3. Align ESMFold CA atoms to RFDiffusion CA atoms
     4. Calculate RMSD. If > 2.5 Å, PRUNE (sequence does not encode the intended structure)
-    
+
     **Why this works:**
     If ESMFold (sequence-only) cannot recover the RFDiffusion backbone geometry,
     the design is likely an adversarial hallucination that "looks good" to
     diffusion models but violates biophysical constraints.
-    
+
     Args:
         sequence: Designed sequence from ProteinMPNN
         backbone_pdb: Path to original RFDiffusion backbone PDB
         min_plddt: Minimum mean pLDDT threshold (default: 70)
         max_rmsd: Maximum RMSD to RFDiffusion backbone (default: 2.5 Å)
         output_dir: Optional directory to save ESMFold prediction
-    
+
     Returns:
         Dict with metrics if passed, None if pruned
         {
@@ -536,106 +566,109 @@ def run_esmfold_validation(
     """
     import os
     import numpy as np
-    
+
     try:
         # Import ESMFold via transformers
         from transformers import EsmForProteinFolding
         import torch
-        
+
         # Import biotite for fast structure manipulation
-        import biotite.structure as struc
         import biotite.structure.io.pdb as pdb
-        
+
         # Load ESMFold model (weights are cached in image)
         print(f"  ESMFold: Loading model for {sequence.sequence_id}...")
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1")
         model = model.to(device)
         model.eval()
-        
+
         # Prepare input
         seq_str = sequence.sequence
         print(f"  ESMFold: Predicting structure for {len(seq_str)} residues...")
-        
+
         # Run ESMFold inference
         with torch.no_grad():
             output = model.infer_pdb(seq_str)
-        
+
         # Parse ESMFold output (PDB string)
         esmfold_pdb_str = output
-        
+
         # Extract pLDDT from B-factor column (ESMFold convention)
         # Parse PDB string into biotite structure
         from io import StringIO
+
         pdb_file = pdb.PDBFile.read(StringIO(esmfold_pdb_str))
         esmfold_structure = pdb.get_structure(pdb_file, model=1)
-        
+
         # Get pLDDT values (stored in b_factor annotation in Biotite)
         ca_mask = esmfold_structure.atom_name == "CA"
         ca_atoms = esmfold_structure[ca_mask]
-        
+
         # Access b_factor from the annotation dict (Biotite stores it here)
-        if hasattr(ca_atoms, 'b_factor'):
+        if hasattr(ca_atoms, "b_factor"):
             plddt_values = ca_atoms.b_factor
-        elif 'b_factor' in ca_atoms.get_annotation_categories():
-            plddt_values = ca_atoms.get_annotation('b_factor')
+        elif "b_factor" in ca_atoms.get_annotation_categories():
+            plddt_values = ca_atoms.get_annotation("b_factor")
         else:
             # Fallback: extract from PDB file directly
             plddt_values = []
-            for line in esmfold_pdb_str.split('\n'):
-                if line.startswith('ATOM') and ' CA ' in line:
+            for line in esmfold_pdb_str.split("\n"):
+                if line.startswith("ATOM") and " CA " in line:
                     try:
                         b_factor = float(line[60:66].strip())
                         plddt_values.append(b_factor)
                     except (ValueError, IndexError):
                         continue
             plddt_values = np.array(plddt_values)
-        
+
         mean_plddt = float(np.mean(plddt_values))
-        
+
         print(f"  ESMFold: Mean pLDDT = {mean_plddt:.1f}")
-        
+
         # Metric 1: Confidence check
         if mean_plddt < min_plddt:
-            print(f"  ✗ {sequence.sequence_id}: ESMFold pLDDT {mean_plddt:.1f} < {min_plddt} (LOW CONFIDENCE)")
+            print(
+                f"  ✗ {sequence.sequence_id}: ESMFold pLDDT {mean_plddt:.1f} < {min_plddt} (LOW CONFIDENCE)"
+            )
             return None
-        
+
         # Metric 2: Consistency check (RMSD vs RFDiffusion backbone)
         # Create temporary file for ESMFold structure since _calculate_backbone_rmsd expects paths
         import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_esm:
-            tmp_esm.write(esmfold_pdb_str.encode())
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".pdb", mode="w", delete=False
+        ) as tmp_esm:
+            tmp_esm.write(esmfold_pdb_str)
             tmp_esm_path = tmp_esm.name
 
         try:
-            # Use binder chain ID - default to 'A' if not specified
-            binder_chain = getattr(sequence, 'binder_chain_id', 'A')
-            
             rmsd = _calculate_backbone_rmsd(
                 ref_pdb=backbone_pdb,
                 pred_pdb=tmp_esm_path,
-                chain_id=binder_chain
+                chain_id=sequence.backbone_chain_id,
             )
-            
-            if rmsd is None and binder_chain == 'A':
-                 rmsd = _calculate_backbone_rmsd(
-                    ref_pdb=backbone_pdb,
-                    pred_pdb=tmp_esm_path,
-                    chain_id='B'
-                )
 
-            print(f"  ESMFold: RMSD to RFDiffusion = {rmsd if rmsd is not None else 'N/A'}")
-            
+            print(
+                f"  ESMFold: RMSD to RFDiffusion = {rmsd if rmsd is not None else 'N/A'}"
+            )
+
             if rmsd is None:
-                 print(f"  ? {sequence.sequence_id}: Could not calculate RMSD (alignment failed)")
-                 return None
-            elif rmsd > max_rmsd:
-                print(f"  ✗ {sequence.sequence_id}: ESMFold RMSD {rmsd:.2f} Å > {max_rmsd} Å (INCONSISTENT GEOMETRY)")
+                print(
+                    f"  ? {sequence.sequence_id}: Could not calculate RMSD (alignment failed)"
+                )
                 return None
-            
+            elif rmsd > max_rmsd:
+                print(
+                    f"  ✗ {sequence.sequence_id}: ESMFold RMSD {rmsd:.2f} Å > {max_rmsd} Å (INCONSISTENT GEOMETRY)"
+                )
+                return None
+
             # PASSED both gates
-            print(f"  ✓ {sequence.sequence_id}: ESMFold validation PASSED (pLDDT={mean_plddt:.1f}, RMSD={rmsd:.2f}Å)")
-            
+            print(
+                f"  ✓ {sequence.sequence_id}: ESMFold validation PASSED (pLDDT={mean_plddt:.1f}, RMSD={rmsd:.2f}Å)"
+            )
+
             # Optionally save ESMFold prediction
             esmfold_pdb_path = None
             if output_dir:
@@ -643,7 +676,7 @@ def run_esmfold_validation(
                 esmfold_pdb_path = f"{output_dir}/{sequence.sequence_id}_esmfold.pdb"
                 with open(esmfold_pdb_path, "w") as f:
                     f.write(esmfold_pdb_str)
-            
+
             return {
                 "mean_plddt": mean_plddt,
                 "rmsd_to_design": rmsd,
@@ -653,15 +686,15 @@ def run_esmfold_validation(
         finally:
             if os.path.exists(tmp_esm_path):
                 os.remove(tmp_esm_path)
-        
+
     except Exception as e:
         print(f"  ✗ {sequence.sequence_id}: ESMFold error: {e}")
         return None
     finally:
         # Clean up GPU memory
-        if 'model' in locals():
+        if "model" in locals():
             del model
-        if 'torch' in locals():
+        if "torch" in locals():
             torch.cuda.empty_cache()
         data_volume.commit()
 
@@ -681,23 +714,23 @@ def run_esmfold_validation_batch(
 ) -> list[SequenceDesign]:
     """
     Validate multiple sequences using ESMFold in batch.
-    
+
     **Economics:**
     ESMFold on T4 (~$0.30/hr) is 10x cheaper than Boltz-2 on A100 (~$3.50/hr).
     This gatekeeper can prune 30-50% of hallucinated designs before they reach
     expensive folding, saving significant compute costs.
-    
+
     **Performance Optimization:**
     Loads the model ONCE per batch, increasing throughput by ~100x compared to
     loading it for every sequence.
-    
+
     Args:
         sequences: List of designed sequences
         backbone_pdbs: Mapping from backbone_id -> PDB path
         min_plddt: Minimum pLDDT threshold
         max_rmsd: Maximum RMSD threshold
         output_dir: Output directory for ESMFold predictions
-    
+
     Returns:
         List of sequences that passed ESMFold validation
     """
@@ -705,15 +738,17 @@ def run_esmfold_validation_batch(
     import numpy as np
     import torch
     from transformers import EsmForProteinFolding
-    import biotite.structure as struc
     import biotite.structure.io.pdb as pdb
     from io import StringIO
-    
+
     validated_sequences: list[SequenceDesign] = []
-    
+
+    if not sequences:
+        return []
+
     print(f"ESMFold Gatekeeper: validating {len(sequences)} sequences")
     print(f"  Thresholds: pLDDT ≥ {min_plddt}, RMSD ≤ {max_rmsd} Å")
-    
+
     try:
         # 1. Load Model ONCE
         print("  ESMFold: Loading model (cached)...")
@@ -721,40 +756,42 @@ def run_esmfold_validation_batch(
         model = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1")
         model = model.to(device)
         model.eval()
-        
+
         # 2. Process Batch
         for sequence in sequences:
             # Get backbone PDB for this sequence
             backbone_pdb_path = backbone_pdbs.get(sequence.backbone_id)
             if not backbone_pdb_path:
-                print(f"  ✗ {sequence.sequence_id}: No backbone PDB found for {sequence.backbone_id}")
+                print(
+                    f"  ✗ {sequence.sequence_id}: No backbone PDB found for {sequence.backbone_id}"
+                )
                 continue
-            
+
             try:
                 # Inference
                 with torch.no_grad():
                     # EsmForProteinFolding can handle single string input
                     output = model.infer_pdb(sequence.sequence)
-                
+
                 esmfold_pdb_str = output
-                
+
                 # Parse structure for metrics
                 pdb_file = pdb.PDBFile.read(StringIO(esmfold_pdb_str))
                 esmfold_structure = pdb.get_structure(pdb_file, model=1)
-                
+
                 # Get pLDDT (stored in b_factor)
                 ca_mask = esmfold_structure.atom_name == "CA"
                 ca_atoms = esmfold_structure[ca_mask]
-                
-                if hasattr(ca_atoms, 'b_factor'):
+
+                if hasattr(ca_atoms, "b_factor"):
                     plddt_values = ca_atoms.b_factor
-                elif 'b_factor' in ca_atoms.get_annotation_categories():
-                    plddt_values = ca_atoms.get_annotation('b_factor')
+                elif "b_factor" in ca_atoms.get_annotation_categories():
+                    plddt_values = ca_atoms.get_annotation("b_factor")
                 else:
                     # Fallback parsing
                     plddt_values = []
-                    for line in esmfold_pdb_str.split('\n'):
-                        if line.startswith('ATOM') and ' CA ' in line:
+                    for line in esmfold_pdb_str.split("\n"):
+                        if line.startswith("ATOM") and " CA " in line:
                             try:
                                 b_factor = float(line[60:66].strip())
                                 plddt_values.append(b_factor)
@@ -763,57 +800,58 @@ def run_esmfold_validation_batch(
                     plddt_values = np.array(plddt_values)
 
                 mean_plddt = float(np.mean(plddt_values))
-                
+
                 # Check pLDDT
                 if mean_plddt < min_plddt:
-                    print(f"  ✗ {sequence.sequence_id}: pLDDT {mean_plddt:.1f} < {min_plddt}")
+                    print(
+                        f"  ✗ {sequence.sequence_id}: pLDDT {mean_plddt:.1f} < {min_plddt}"
+                    )
                     continue
 
                 # Check RMSD
                 # Create temporary file for ESMFold structure since _calculate_backbone_rmsd expects paths
                 import tempfile
-                with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_esm:
-                    tmp_esm.write(esmfold_pdb_str.encode())
+
+                with tempfile.NamedTemporaryFile(
+                    suffix=".pdb", mode="w", delete=False
+                ) as tmp_esm:
+                    tmp_esm.write(esmfold_pdb_str)
                     tmp_esm_path = tmp_esm.name
 
                 try:
-                    # Use binder chain ID - default to 'A' if not specified (RFDiffusion convention)
-                    binder_chain = getattr(sequence, 'binder_chain_id', 'A')
-                    
                     rmsd = _calculate_backbone_rmsd(
                         ref_pdb=backbone_pdb_path,
                         pred_pdb=tmp_esm_path,
-                        chain_id=binder_chain
+                        chain_id=sequence.backbone_chain_id,
                     )
-                    
-                    if rmsd is None:
-                        # Try fallback chain "B" if "A" failed (legacy/default)
-                        if binder_chain == 'A':
-                             rmsd = _calculate_backbone_rmsd(
-                                ref_pdb=backbone_pdb_path,
-                                pred_pdb=tmp_esm_path,
-                                chain_id='B'
-                            )
 
                     if rmsd is None:
-                         print(f"  ? {sequence.sequence_id}: Could not calculate RMSD (alignment failed)")
-                         # We could fail or pass here. Let's fail for safety if we can't align.
-                         # But ensure we clean up
-                         pass
+                        print(
+                            f"  ? {sequence.sequence_id}: Could not calculate RMSD (alignment failed)"
+                        )
+                        # We could fail or pass here. Let's fail for safety if we can't align.
+                        # But ensure we clean up
+                        pass
                     elif rmsd > max_rmsd:
-                        print(f"  ✗ {sequence.sequence_id}: RMSD {rmsd:.2f} > {max_rmsd}")
+                        print(
+                            f"  ✗ {sequence.sequence_id}: RMSD {rmsd:.2f} > {max_rmsd}"
+                        )
                         continue
                     else:
                         # Passed
-                         print(f"  ✓ {sequence.sequence_id}: pLDDT={mean_plddt:.1f}, RMSD={rmsd:.2f}Å")
-                         validated_sequences.append(sequence)
-                         
-                         # Save PDB if requested
-                         if output_dir:
+                        print(
+                            f"  ✓ {sequence.sequence_id}: pLDDT={mean_plddt:.1f}, RMSD={rmsd:.2f}Å"
+                        )
+                        validated_sequences.append(sequence)
+
+                        # Save PDB if requested
+                        if output_dir:
                             if not os.path.exists(output_dir):
                                 os.makedirs(output_dir, exist_ok=True)
-                            
-                            save_path = f"{output_dir}/{sequence.sequence_id}_esmfold.pdb"
+
+                            save_path = (
+                                f"{output_dir}/{sequence.sequence_id}_esmfold.pdb"
+                            )
                             with open(save_path, "w") as f:
                                 f.write(esmfold_pdb_str)
 
@@ -825,19 +863,21 @@ def run_esmfold_validation_batch(
             except Exception as e:
                 print(f"  ✗ {sequence.sequence_id}: Validation failed: {e}")
                 continue
-                
+
     except Exception as e:
         print(f"ESMFold Batch Error: {e}")
     finally:
-         if 'model' in locals():
+        if "model" in locals():
             del model
-         if 'torch' in locals():
+        if "torch" in locals():
             torch.cuda.empty_cache()
-         data_volume.commit()
+        data_volume.commit()
 
     pruned = len(sequences) - len(validated_sequences)
-    print(f"ESMFold Gatekeeper: {len(validated_sequences)}/{len(sequences)} passed ({pruned} pruned)")
-    
+    print(
+        f"ESMFold Gatekeeper: {len(validated_sequences)}/{len(sequences)} passed ({pruned} pruned)"
+    )
+
     return validated_sequences
 
 
@@ -849,27 +889,27 @@ def run_esmfold_validation_batch(
 def _get_uniprot_from_pdb(pdb_id: str) -> set[str]:
     """
     Get UniProt accession IDs associated with a PDB entry.
-    
+
     Uses the RCSB PDB API to look up the UniProt mapping.
-    
+
     Args:
         pdb_id: 4-letter PDB code (e.g., "3DI3")
-    
+
     Returns:
         Set of UniProt accession IDs (e.g., {"P16871", "P13232"})
     """
     import urllib.request
     import urllib.error
-    
+
     uniprot_ids: set[str] = set()
-    
+
     try:
         # RCSB GraphQL API endpoint
         url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id.upper()}"
-        
+
         with urllib.request.urlopen(url, timeout=10) as response:
             data = json.loads(response.read().decode())
-            
+
             # Extract polymer entities which contain UniProt references
             if "rcsb_entry_container_identifiers" in data:
                 container = data["rcsb_entry_container_identifiers"]
@@ -877,49 +917,60 @@ def _get_uniprot_from_pdb(pdb_id: str) -> set[str]:
                     for entity_id in container["polymer_entity_ids"]:
                         entity_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id.upper()}/{entity_id}"
                         try:
-                            with urllib.request.urlopen(entity_url, timeout=10) as entity_response:
-                                entity_data = json.loads(entity_response.read().decode())
-                                if "rcsb_polymer_entity_container_identifiers" in entity_data:
-                                    identifiers = entity_data["rcsb_polymer_entity_container_identifiers"]
+                            with urllib.request.urlopen(
+                                entity_url, timeout=10
+                            ) as entity_response:
+                                entity_data = json.loads(
+                                    entity_response.read().decode()
+                                )
+                                if (
+                                    "rcsb_polymer_entity_container_identifiers"
+                                    in entity_data
+                                ):
+                                    identifiers = entity_data[
+                                        "rcsb_polymer_entity_container_identifiers"
+                                    ]
                                     if "uniprot_ids" in identifiers:
                                         uniprot_ids.update(identifiers["uniprot_ids"])
                         except Exception:
                             continue
     except urllib.error.HTTPError as e:
-        print(f"  Warning: Could not fetch UniProt mapping for PDB {pdb_id}: HTTP {e.code}")
+        print(
+            f"  Warning: Could not fetch UniProt mapping for PDB {pdb_id}: HTTP {e.code}"
+        )
     except Exception as e:
         print(f"  Warning: Could not fetch UniProt mapping for PDB {pdb_id}: {e}")
-    
+
     return uniprot_ids
 
 
 def _get_pdbs_from_uniprot(uniprot_id: str) -> set[str]:
     """
     Get all PDB IDs associated with a UniProt accession.
-    
+
     Uses the UniProt REST API to fetch cross-references to PDB.
-    
+
     Args:
         uniprot_id: UniProt accession (e.g., "P16871")
-    
+
     Returns:
         Set of 4-letter PDB codes (e.g., {"3DI3", "7OPB"})
     """
     import urllib.request
     import urllib.error
-    
+
     pdb_ids: set[str] = set()
-    
+
     try:
         # Use UniProt REST API - stable and reliable
         url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id.upper()}.json"
-        
+
         req = urllib.request.Request(url)
-        req.add_header('Accept', 'application/json')
-        
+        req.add_header("Accept", "application/json")
+
         with urllib.request.urlopen(req, timeout=15) as response:
             data = json.loads(response.read().decode())
-            
+
             # Extract PDB cross-references from UniProt entry
             if "uniProtKBCrossReferences" in data:
                 for xref in data["uniProtKBCrossReferences"]:
@@ -927,44 +978,46 @@ def _get_pdbs_from_uniprot(uniprot_id: str) -> set[str]:
                         pdb_id = xref.get("id", "").upper()
                         if len(pdb_id) == 4:
                             pdb_ids.add(pdb_id)
-                    
+
     except urllib.error.HTTPError as e:
         if e.code == 404:
             # UniProt ID not found - that's okay
             pass
         else:
-            print(f"  Warning: Could not fetch PDB mapping for UniProt {uniprot_id}: HTTP {e.code}")
+            print(
+                f"  Warning: Could not fetch PDB mapping for UniProt {uniprot_id}: HTTP {e.code}"
+            )
     except Exception as e:
         print(f"  Warning: Could not fetch PDB mapping for UniProt {uniprot_id}: {e}")
-    
+
     return pdb_ids
 
 
 def _extract_pdb_id_from_path(pdb_path: str) -> Optional[str]:
     """
     Extract PDB ID from a file path.
-    
+
     Handles formats like:
     - /data/targets/3di3_target.pdb -> 3DI3
     - /path/to/il7ra_target.pdb -> None (not a PDB ID)
     - /path/to/3DI3.pdb -> 3DI3
     """
     import re
-    
+
     filename = Path(pdb_path).stem.upper()
-    
+
     # Try to find a 4-character PDB ID pattern
     # PDB IDs are 4 alphanumeric characters, typically starting with a digit
-    match = re.search(r'\b([0-9][A-Z0-9]{3})\b', filename)
+    match = re.search(r"\b([0-9][A-Z0-9]{3})\b", filename)
     if match:
         return match.group(1)
-    
+
     # Also check for pattern at start of filename
     if len(filename) >= 4 and filename[0].isdigit():
         potential_id = filename[:4]
         if all(c.isalnum() for c in potential_id):
             return potential_id
-    
+
     return None
 
 
@@ -976,20 +1029,20 @@ def _extract_pdb_id_from_path(pdb_path: str) -> Optional[str]:
 def get_cached_decoys(target: TargetProtein) -> Optional[list[DecoyHit]]:
     """
     Check for cached FoldSeek results using Modal Dict (TTL key-value store).
-    
+
     Cache key is based on PDB ID + entity ID, so same protein = same decoys.
     Reading extends TTL by 7 days (LRU-like behavior).
-    
+
     Args:
         target: Target protein specification
-    
+
     Returns:
         List of cached DecoyHit objects, or None if no cache exists
     """
     from common import foldseek_cache
-    
+
     cache_key = f"{target.pdb_id.upper()}_E{target.entity_id}"
-    
+
     try:
         cached_data = foldseek_cache.get(cache_key)
         if cached_data is not None:
@@ -998,7 +1051,7 @@ def get_cached_decoys(target: TargetProtein) -> Optional[list[DecoyHit]]:
             return decoys
     except Exception as e:
         print(f"FoldSeek: Cache read failed ({e}), will recompute")
-    
+
     print(f"FoldSeek: Cache MISS for {cache_key}")
     return None
 
@@ -1006,15 +1059,15 @@ def get_cached_decoys(target: TargetProtein) -> Optional[list[DecoyHit]]:
 def save_decoys_to_cache(target: TargetProtein, decoys: list[DecoyHit]) -> None:
     """
     Save FoldSeek results to Modal Dict cache (7-day TTL, refreshed on read).
-    
+
     Args:
         target: Target protein specification
         decoys: List of decoy hits to cache
     """
     from common import foldseek_cache
-    
+
     cache_key = f"{target.pdb_id.upper()}_E{target.entity_id}"
-    
+
     try:
         # Store as list of dicts for JSON serialization
         foldseek_cache.put(cache_key, [d.model_dump() for d in decoys])
@@ -1040,7 +1093,7 @@ def run_foldseek(
 
     These structural homologs serve as potential off-targets (decoys)
     for selectivity filtering.
-    
+
     **Filters out self-hits:** Decoys that map to the same UniProt accession
     as the target are excluded to avoid false cross-reactivity signals.
 
@@ -1059,10 +1112,14 @@ def run_foldseek(
     try:
         # Step 1: Get target's UniProt accessions to filter self-hits
         # Use target.pdb_id directly (no need to extract from path)
-        target_pdb_id = target.pdb_id if hasattr(target, 'pdb_id') and target.pdb_id else _extract_pdb_id_from_path(target.pdb_path)
+        target_pdb_id = (
+            target.pdb_id
+            if hasattr(target, "pdb_id") and target.pdb_id
+            else _extract_pdb_id_from_path(target.pdb_path)
+        )
         target_uniprots: set[str] = set()
         target_pdb_ids: set[str] = set()
-        
+
         if target_pdb_id:
             print(f"FoldSeek: Target PDB ID = {target_pdb_id}")
             target_uniprots = _get_uniprot_from_pdb(target_pdb_id)
@@ -1072,8 +1129,10 @@ def run_foldseek(
                 for uniprot in target_uniprots:
                     target_pdb_ids.update(_get_pdbs_from_uniprot(uniprot))
                 if target_pdb_ids:
-                    print(f"  Excluding {len(target_pdb_ids)} PDB entries of same protein")
-        
+                    print(
+                        f"  Excluding {len(target_pdb_ids)} PDB entries of same protein"
+                    )
+
         # Output files
         results_file = f"{output_dir}/foldseek_results.tsv"
         tmp_dir = f"{output_dir}/tmp"
@@ -1146,7 +1205,9 @@ def run_foldseek(
                 results_file, output_dir, config.max_hits, target_pdb_ids
             )
             if total_hits > len(decoys):
-                print(f"FoldSeek: {total_hits} hits -> {len(decoys)} unique off-target proteins")
+                print(
+                    f"FoldSeek: {total_hits} hits -> {len(decoys)} unique off-target proteins"
+                )
 
     except subprocess.TimeoutExpired:
         print("FoldSeek timeout")
@@ -1165,10 +1226,10 @@ def _parse_foldseek_results(
     exclude_pdb_ids: Optional[set[str]] = None,
 ) -> list[DecoyHit]:
     """Parse FoldSeek tabular output into DecoyHit objects.
-    
+
     Deduplicates based on core protein ID to avoid redundant Chai-1 runs.
     For AlphaFold entries, extracts UniProt ID; for PDB entries, extracts PDB code.
-    
+
     Args:
         results_file: Path to FoldSeek TSV output
         output_dir: Directory for output files
@@ -1178,7 +1239,7 @@ def _parse_foldseek_results(
     decoys: list[DecoyHit] = []
     seen_ids: set[str] = set()  # Track unique protein IDs
     excluded_count = 0
-    
+
     if exclude_pdb_ids is None:
         exclude_pdb_ids = set()
 
@@ -1192,7 +1253,7 @@ def _parse_foldseek_results(
                 continue
 
             target_id = parts[0]
-            
+
             # Extract core protein ID for deduplication
             # AlphaFold: AF-P16871-F1-model_v6 or AF-P16871-2-F1-model_v6 -> P16871
             # PDB: 7opb-assembly3_C -> 7OPB, 4HN6_A -> 4HN6
@@ -1204,12 +1265,12 @@ def _parse_foldseek_results(
                 # Extract 4-letter PDB code
                 pdb_code = target_id.split("-")[0].split("_")[0].upper()[:4]
                 core_id = pdb_code
-            
+
             # Skip if this PDB is the target protein (same UniProt)
             if pdb_code and pdb_code in exclude_pdb_ids:
                 excluded_count += 1
                 continue
-            
+
             # Skip if we've already seen this protein
             if core_id in seen_ids:
                 continue
@@ -1234,7 +1295,7 @@ def _parse_foldseek_results(
                     sequence_identity=seq_identity,
                 )
             )
-    
+
     if excluded_count > 0:
         print(f"  Excluded {excluded_count} self-hits (same protein as target)")
 
@@ -1268,12 +1329,13 @@ def download_decoy_structures(
 
     # Use Biopython's PDBList for robust downloads
     from Bio.PDB import PDBList
+
     pdbl = PDBList(verbose=False)
 
     for decoy in decoys:
         try:
             decoy_id = decoy.decoy_id
-            
+
             # Extract 4-letter PDB code from FoldSeek ID
             # Formats: 7opb-assembly3_C -> 7OPB, 4HN6_A -> 4HN6, AF-P16871-F1 -> skip
             if decoy_id.startswith("AF-"):
@@ -1293,7 +1355,9 @@ def download_decoy_structures(
                         except Exception:
                             continue
                     if not downloaded:
-                        print(f"Could not download AlphaFold structure for {uniprot_id}")
+                        print(
+                            f"Could not download AlphaFold structure for {uniprot_id}"
+                        )
                         continue
                 else:
                     continue
@@ -1302,14 +1366,12 @@ def download_decoy_structures(
                 # Format: 7opb-assembly3_C or 4HN6_A or just 4HN6
                 pdb_code = decoy_id.split("-")[0].split("_")[0].lower()[:4]
                 pdb_path = f"{output_dir}/{pdb_code}.pdb"
-                
+
                 if not os.path.exists(pdb_path):
                     # Use Biopython PDBList for robust download
                     try:
                         downloaded_file = pdbl.retrieve_pdb_file(
-                            pdb_code, 
-                            pdir=output_dir, 
-                            file_format="pdb"
+                            pdb_code, pdir=output_dir, file_format="pdb"
                         )
                         if downloaded_file and os.path.exists(downloaded_file):
                             # Rename to consistent format
@@ -1372,7 +1434,7 @@ def run_chai1(
     from pathlib import Path
     import numpy as np
     import json
-    
+
     os.makedirs(output_dir, exist_ok=True)
 
     try:
@@ -1385,7 +1447,7 @@ def run_chai1(
                     break
             except Exception:
                 continue
-        
+
         if not decoy_sequence:
             print(f"  ✗ Could not extract sequence from {decoy.pdb_path}")
             return None
@@ -1401,32 +1463,37 @@ def run_chai1(
         output_subdir = Path(output_dir) / "predictions"
         if output_subdir.exists():
             import shutil
+
             shutil.rmtree(output_subdir)
         output_subdir.mkdir(parents=True, exist_ok=True)
 
         # Use chai_lab Python API
         try:
             from chai_lab.chai1 import run_inference
-            
+
             candidates = run_inference(
                 fasta_file=Path(input_fasta),
                 output_dir=output_subdir,
-                num_trunk_recycles=config.num_recycles if hasattr(config, 'num_recycles') else 3,
+                num_trunk_recycles=config.num_recycles
+                if hasattr(config, "num_recycles")
+                else 3,
                 num_diffn_timesteps=200,
                 seed=42,
                 device=None,  # Auto-detect CUDA
                 use_esm_embeddings=True,
             )
-            
+
             # Parse output from saved files instead of object attributes
             # Chai-1 saves scores.json and plddt files in output directory
             plddt_interface = 0.0
             affinity = 0.0
             ptm_score = None
             iptm_score = None
-            
+
             # Look for scores file
-            scores_files = list(output_subdir.glob("**/scores*.json")) + list(output_subdir.glob("scores.json"))
+            scores_files = list(output_subdir.glob("**/scores*.json")) + list(
+                output_subdir.glob("scores.json")
+            )
             if scores_files:
                 with open(scores_files[0], "r") as f:
                     scores_data = json.load(f)
@@ -1440,30 +1507,34 @@ def run_chai1(
                         affinity = -float(scores_data["aggregate_score"])
                     elif ptm_score is not None:
                         affinity = -ptm_score * 10  # Scale pTM as affinity proxy
-            
+
             # Look for pLDDT in npz files
-            plddt_files = list(output_subdir.glob("**/plddt*.npz")) + list(output_subdir.glob("plddt.npz"))
+            plddt_files = list(output_subdir.glob("**/plddt*.npz")) + list(
+                output_subdir.glob("plddt.npz")
+            )
             if plddt_files:
                 plddt_data = np.load(plddt_files[0])
                 if "plddt" in plddt_data:
                     plddt_interface = float(np.mean(plddt_data["plddt"])) * 100
-            
+
             # Fallback: check if candidates has any usable attributes for plddt
             if plddt_interface == 0.0 and candidates is not None:
                 # Try different possible attribute names
-                for attr in ['plddt', 'per_token_plddt', 'confidence']:
+                for attr in ["plddt", "per_token_plddt", "confidence"]:
                     if hasattr(candidates, attr):
                         val = getattr(candidates, attr)
                         if val is not None:
                             try:
-                                if hasattr(val, 'cpu'):
-                                    plddt_interface = float(np.mean(val[0].cpu().numpy())) * 100
+                                if hasattr(val, "cpu"):
+                                    plddt_interface = (
+                                        float(np.mean(val[0].cpu().numpy())) * 100
+                                    )
                                 else:
                                     plddt_interface = float(np.mean(val)) * 100
                                 break
                             except Exception:
                                 pass
-            
+
             # Extract chain_pair_iptm from scores (Chai-1 single-sequence mode)
             chain_pair_iptm = None
             if scores_files:
@@ -1473,9 +1544,9 @@ def run_chai1(
                     # Fallback to iptm if chain_pair_iptm not available
                     if chain_pair_iptm is None:
                         chain_pair_iptm = iptm_score
-            
+
             # Off-target threshold: chain_pair_iptm > 0.5 indicates cross-reactivity
-            binds_decoy = (chain_pair_iptm is not None and chain_pair_iptm > 0.5)
+            binds_decoy = chain_pair_iptm is not None and chain_pair_iptm > 0.5
 
             return CrossReactivityResult(
                 binder_id=sequence.sequence_id,
@@ -1487,7 +1558,7 @@ def run_chai1(
                 iptm=iptm_score,
                 chain_pair_iptm=chain_pair_iptm,
             )
-                
+
         except ImportError as e:
             print(f"Chai-1 import error: {e}")
             # Fallback: return a conservative result (assume no cross-reactivity)
@@ -1501,7 +1572,7 @@ def run_chai1(
                 iptm=None,
                 chain_pair_iptm=None,
             )
-            
+
         return None
 
     except Exception as e:
@@ -1608,18 +1679,23 @@ def validate_sequences_parallel(
         List of successful structure predictions
     """
     import time
+
     batch_start = time.time()
-    
+
     # Generate batch ID if not provided
     if batch_id is None:
         batch_id = f"boltz2_batch_{int(batch_start * 1000)}"
-    
+
     # Print common parameters once
     if sequences:
         target_len = len(_extract_sequence_from_pdb(target.pdb_path, target.chain_id))
         binder_len = len(sequences[0].sequence)
-        print(f"Boltz-2: validating {len(sequences)} sequences (target: {target_len} res, binder: {binder_len} res)")
-        print(f"  Batch ID: {batch_id} | Batch size: {len(sequences)} (cold start amortized)")
+        print(
+            f"Boltz-2: validating {len(sequences)} sequences (target: {target_len} res, binder: {binder_len} res)"
+        )
+        print(
+            f"  Batch ID: {batch_id} | Batch size: {len(sequences)} (cold start amortized)"
+        )
 
     # Prepare arguments for starmap
     args = [
@@ -1629,17 +1705,19 @@ def validate_sequences_parallel(
 
     # Use starmap for parallel execution
     all_results = list(run_boltz2.starmap(args))
-    
+
     batch_duration = time.time() - batch_start
-    
+
     # Combine input sequences with results (prediction, error)
     # returns list[tuple[SequenceDesign, Optional[StructurePrediction], Optional[str]]]
     combined_results = []
     for i, res in enumerate(all_results):
         combined_results.append((sequences[i], res[0], res[1]))
-        
+
     successful = sum(1 for _, pred, _ in combined_results if pred is not None)
-    print(f"  Batch complete: {successful}/{len(sequences)} in {batch_duration:.1f}s (avg {batch_duration/len(sequences):.1f}s/seq)")
+    print(
+        f"  Batch complete: {successful}/{len(sequences)} in {batch_duration:.1f}s (avg {batch_duration / len(sequences):.1f}s/seq)"
+    )
 
     return combined_results
 
@@ -1659,9 +1737,9 @@ def check_cross_reactivity_parallel(
 ) -> tuple[dict[str, CrossReactivityResult], dict[str, list[CrossReactivityResult]]]:
     """
     Check cross-reactivity for multiple sequences against decoys in parallel.
-    
+
     Optionally includes the target as a positive control to verify binding.
-    
+
     **Economical optimizations:**
     - Decoys are sorted by TM-score (most similar first = highest risk)
     - Early termination: stops testing a sequence once cross-reactivity detected
@@ -1682,11 +1760,13 @@ def check_cross_reactivity_parallel(
     """
     positive_control_results: dict[str, CrossReactivityResult] = {}
     decoy_results: dict[str, list[CrossReactivityResult]] = {}
-    
+
     # Step 1: Run positive control (binder vs target) if target provided
     if target is not None:
-        print(f"Chai-1 Positive Control: checking {len(sequences)} sequences against target")
-        
+        print(
+            f"Chai-1 Positive Control: checking {len(sequences)} sequences against target"
+        )
+
         # Create a DecoyHit for the target (reusing the structure)
         target_as_decoy = DecoyHit(
             decoy_id="TARGET",
@@ -1696,15 +1776,20 @@ def check_cross_reactivity_parallel(
             aligned_length=0,
             sequence_identity=1.0,
         )
-        
+
         # Run positive control checks
         pos_ctrl_args = [
-            (seq, target_as_decoy, config, f"{base_output_dir}/{seq.sequence_id}/positive_control")
+            (
+                seq,
+                target_as_decoy,
+                config,
+                f"{base_output_dir}/{seq.sequence_id}/positive_control",
+            )
             for seq in sequences
         ]
-        
+
         pos_ctrl_results = list(run_chai1.starmap(pos_ctrl_args))
-        
+
         for result in pos_ctrl_results:
             if result is not None:
                 positive_control_results[result.binder_id] = result
@@ -1715,130 +1800,173 @@ def check_cross_reactivity_parallel(
                 if result.ptm is not None:
                     metrics_str += f", pTM={result.ptm:.3f}"
                 print(f"  {result.binder_id}: {metrics_str} {status}")
-        
-        print(f"  Positive control: {len(positive_control_results)}/{len(sequences)} sequences bind target")
-    
+
+        print(
+            f"  Positive control: {len(positive_control_results)}/{len(sequences)} sequences bind target"
+        )
+
     # Step 2: Run decoy checks with tiered or early termination optimization
     if decoys:
         # Sort decoys by TM-score descending (most similar = highest risk, test first)
         sorted_decoys = sorted(decoys, key=lambda d: d.tm_score, reverse=True)
-        
+
         if config.tiered_checking:
             # Tiered decoy checking (#6 optimization)
             # Tier 1: Highest-risk decoys (TM > tier1_min_tm) - MUST pass all
             # Tier 2: Medium-risk decoys (TM > tier2_min_tm) - check up to tier2_max_decoys
             # Tier 3: Lower-risk decoys - skip for budget runs
-            tier1_decoys = [d for d in sorted_decoys if d.tm_score >= config.tier1_min_tm]
-            tier2_candidates = [d for d in sorted_decoys if config.tier2_min_tm <= d.tm_score < config.tier1_min_tm]
-            tier2_decoys = tier2_candidates[:config.tier2_max_decoys]
-            
+            tier1_decoys = [
+                d for d in sorted_decoys if d.tm_score >= config.tier1_min_tm
+            ]
+            tier2_candidates = [
+                d
+                for d in sorted_decoys
+                if config.tier2_min_tm <= d.tm_score < config.tier1_min_tm
+            ]
+            tier2_decoys = tier2_candidates[: config.tier2_max_decoys]
+
             print(f"Chai-1 Tiered Decoy Check: {len(sequences)} sequences")
-            print(f"  Tier 1 (TM ≥ {config.tier1_min_tm}): {len(tier1_decoys)} decoys - MUST pass all")
-            print(f"  Tier 2 (TM ≥ {config.tier2_min_tm}): {len(tier2_decoys)}/{len(tier2_candidates)} decoys")
+            print(
+                f"  Tier 1 (TM ≥ {config.tier1_min_tm}): {len(tier1_decoys)} decoys - MUST pass all"
+            )
+            print(
+                f"  Tier 2 (TM ≥ {config.tier2_min_tm}): {len(tier2_decoys)}/{len(tier2_candidates)} decoys"
+            )
             print("  Tier 3 (lower TM): skipped for cost savings")
-            
+
             total_calls = 0
             rejected_sequences: set[str] = set()
-            
+
             for seq in sequences:
                 decoy_results[seq.sequence_id] = []
                 rejected = False
-                
+
                 # Tier 1: Must pass all high-risk decoys
                 for decoy in tier1_decoys:
                     # Use .local() to run synchronously in this container
                     # This avoids the runtime crash of accessing Future result immediately
                     result = run_chai1.local(
-                        seq, decoy, config, 
-                        f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}"
+                        seq,
+                        decoy,
+                        config,
+                        f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}",
                     )
                     total_calls += 1
-                    
+
                     if result is not None:
                         decoy_results[seq.sequence_id].append(result)
                         if result.binds_decoy:
                             rejected_sequences.add(seq.sequence_id)
-                            print(f"  ✗ {seq.sequence_id}: Tier 1 fail - {decoy.decoy_id} (TM={decoy.tm_score:.2f})")
+                            print(
+                                f"  ✗ {seq.sequence_id}: Tier 1 fail - {decoy.decoy_id} (TM={decoy.tm_score:.2f})"
+                            )
                             rejected = True
                             break
-                
+
                 if rejected:
                     continue
-                
+
                 # Tier 2: Check medium-risk decoys (early termination within tier)
                 for decoy in tier2_decoys:
                     result = run_chai1.local(
-                        seq, decoy, config, 
-                        f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}"
+                        seq,
+                        decoy,
+                        config,
+                        f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}",
                     )
                     total_calls += 1
-                    
+
                     if result is not None:
                         decoy_results[seq.sequence_id].append(result)
                         if result.binds_decoy:
                             rejected_sequences.add(seq.sequence_id)
-                            print(f"  ✗ {seq.sequence_id}: Tier 2 fail - {decoy.decoy_id} (TM={decoy.tm_score:.2f})")
+                            print(
+                                f"  ✗ {seq.sequence_id}: Tier 2 fail - {decoy.decoy_id} (TM={decoy.tm_score:.2f})"
+                            )
                             rejected = True
                             break
-                
+
                 if not rejected:
                     checked = len(tier1_decoys) + len(tier2_decoys)
                     print(f"  ✓ {seq.sequence_id}: passed {checked} decoys (Tier 1+2)")
-            
+
             max_possible = len(sequences) * len(sorted_decoys)
             saved = max_possible - total_calls
-            print(f"  Tiered checking saved ~{saved} Chai-1 calls ({100*saved/max_possible:.0f}% reduction)")
-            print(f"  Result: {len(sequences) - len(rejected_sequences)}/{len(sequences)} sequences passed selectivity")
-        
+            print(
+                f"  Tiered checking saved ~{saved} Chai-1 calls ({100 * saved / max_possible:.0f}% reduction)"
+            )
+            print(
+                f"  Result: {len(sequences) - len(rejected_sequences)}/{len(sequences)} sequences passed selectivity"
+            )
+
         elif early_termination:
             # Sequential per-sequence with early termination (economical mode)
-            print(f"Chai-1 Decoy Check: {len(sequences)} sequences × up to {len(sorted_decoys)} decoys (early termination enabled)")
-            print(f"  Decoys sorted by TM-score: {', '.join(f'{d.decoy_id[:8]}({d.tm_score:.2f})' for d in sorted_decoys[:3])}...")
-            
+            print(
+                f"Chai-1 Decoy Check: {len(sequences)} sequences × up to {len(sorted_decoys)} decoys (early termination enabled)"
+            )
+            print(
+                f"  Decoys sorted by TM-score: {', '.join(f'{d.decoy_id[:8]}({d.tm_score:.2f})' for d in sorted_decoys[:3])}..."
+            )
+
             total_calls = 0
             rejected_sequences: set[str] = set()
-            
+
             for seq in sequences:
                 decoy_results[seq.sequence_id] = []
-                
+
                 for decoy in sorted_decoys:
                     # Run single prediction synchronously
                     result = run_chai1.local(
-                        seq, decoy, config, 
-                        f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}"
+                        seq,
+                        decoy,
+                        config,
+                        f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}",
                     )
                     total_calls += 1
-                    
+
                     if result is not None:
                         decoy_results[seq.sequence_id].append(result)
-                        
+
                         # Early termination: if cross-reactive, skip remaining decoys
                         if result.binds_decoy:
                             rejected_sequences.add(seq.sequence_id)
-                            print(f"  ✗ {seq.sequence_id}: cross-reactive with {decoy.decoy_id} (pLDDT={result.plddt_interface:.1f})")
+                            print(
+                                f"  ✗ {seq.sequence_id}: cross-reactive with {decoy.decoy_id} (pLDDT={result.plddt_interface:.1f})"
+                            )
                             break
-                
+
                 if seq.sequence_id not in rejected_sequences:
                     print(f"  ✓ {seq.sequence_id}: passed {len(sorted_decoys)} decoys")
-            
-            print(f"  Early termination saved ~{len(sequences) * len(sorted_decoys) - total_calls} Chai-1 calls")
-            print(f"  Result: {len(sequences) - len(rejected_sequences)}/{len(sequences)} sequences passed selectivity")
+
+            print(
+                f"  Early termination saved ~{len(sequences) * len(sorted_decoys) - total_calls} Chai-1 calls"
+            )
+            print(
+                f"  Result: {len(sequences) - len(rejected_sequences)}/{len(sequences)} sequences passed selectivity"
+            )
         else:
             # Full parallel mode (test all combinations)
             num_pairs = len(sequences) * len(sorted_decoys)
-            print(f"Chai-1 Decoy Check: {len(sequences)} sequences × {len(sorted_decoys)} decoys = {num_pairs} pairs")
+            print(
+                f"Chai-1 Decoy Check: {len(sequences)} sequences × {len(sorted_decoys)} decoys = {num_pairs} pairs"
+            )
             print("  (concurrency limited to 2 A100 workers)")
-            
+
             # Prepare all combinations for starmap
             args = [
-                (seq, decoy, config, f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}")
+                (
+                    seq,
+                    decoy,
+                    config,
+                    f"{base_output_dir}/{seq.sequence_id}/{decoy.decoy_id}",
+                )
                 for seq in sequences
                 for decoy in sorted_decoys
             ]
-            
+
             # Use starmap - concurrency is controlled by run_chai1's max_containers=2
             all_results = list(run_chai1.starmap(args))
-            
+
             # Group results by sequence
             for result in all_results:
                 if result is not None:
@@ -1847,11 +1975,11 @@ def check_cross_reactivity_parallel(
                     decoy_results[result.binder_id].append(result)
 
             total_success = sum(len(v) for v in decoy_results.values())
-            print(f"  Decoy check completed: {total_success}/{num_pairs} successful predictions")
-    
+            print(
+                f"  Decoy check completed: {total_success}/{num_pairs} successful predictions"
+            )
+
     return positive_control_results, decoy_results
-
-
 
 
 # =============================================================================
@@ -1874,7 +2002,7 @@ def mock_boltz2(
     plddt_interface = random.uniform(50, 95)
     pae_interface = random.uniform(2, 15)
     iptm_score = random.uniform(0.4, 0.95)
-    
+
     # AlphaProteo SI 2.2 metrics
     pae_interaction = random.uniform(0.5, 3.0)  # PAE at hotspots
     ptm_binder = random.uniform(0.6, 0.95)  # Binder-only pTM
@@ -1922,7 +2050,18 @@ def mock_foldseek(
     os.makedirs(f"{output_dir}/decoys", exist_ok=True)
     decoys: list[DecoyHit] = []
 
-    mock_pdb_ids = ["1ABC", "2DEF", "3GHI", "4JKL", "5MNO", "6PQR", "7STU", "8VWX", "9YZA", "1BCD"]
+    mock_pdb_ids = [
+        "1ABC",
+        "2DEF",
+        "3GHI",
+        "4JKL",
+        "5MNO",
+        "6PQR",
+        "7STU",
+        "8VWX",
+        "9YZA",
+        "1BCD",
+    ]
 
     for i in range(min(config.max_hits, len(mock_pdb_ids))):
         pdb_id = mock_pdb_ids[i]
@@ -1987,63 +2126,65 @@ def cluster_by_tm_score(
 ) -> list[StructurePrediction]:
     """
     Cluster predicted structures by TM-score and select representatives.
-    
+
     Uses FoldSeek for fast TM-score calculation between structures.
     Structures with TM-score > threshold are grouped into same cluster.
-    
+
     Args:
         predictions: List of validated structure predictions
         tm_threshold: TM-score threshold for clustering (default: 0.7)
         select_best: If True, select best (highest ppi_score) per cluster
-    
+
     Returns:
         List of representative predictions (one per cluster)
     """
     if len(predictions) <= 1:
         return predictions
-    
+
     try:
         import numpy as np
-        
+
         # Calculate pairwise TM-scores using structure comparison
         n = len(predictions)
         tm_matrix = np.zeros((n, n))
-        
+
         for i in range(n):
             tm_matrix[i, i] = 1.0
             for j in range(i + 1, n):
                 # Use binder chain ID from prediction
                 tm = _calculate_tm_score(
-                    predictions[i].pdb_path, 
+                    predictions[i].pdb_path,
                     predictions[j].pdb_path,
-                    chain_id=predictions[i].binder_chain_id
+                    chain_id=predictions[i].binder_chain_id,
                 )
                 tm_matrix[i, j] = tm
                 tm_matrix[j, i] = tm
-        
+
         # Greedy clustering
         assigned = [False] * n
         clusters: list[list[int]] = []
-        
+
         # Sort by ppi_score (best first)
-        sorted_indices = sorted(range(n), key=lambda i: predictions[i].ppi_score, reverse=True)
-        
+        sorted_indices = sorted(
+            range(n), key=lambda i: predictions[i].ppi_score, reverse=True
+        )
+
         for i in sorted_indices:
             if assigned[i]:
                 continue
-            
+
             # Start new cluster with this structure as representative
             cluster = [i]
             assigned[i] = True
-            
+
             # Add similar structures to this cluster
             for j in sorted_indices:
                 if not assigned[j] and tm_matrix[i, j] > tm_threshold:
                     cluster.append(j)
                     assigned[j] = True
-            
+
             clusters.append(cluster)
-        
+
         # Select representatives
         if select_best:
             # Return the first (best ppi_score) member of each cluster
@@ -2051,10 +2192,12 @@ def cluster_by_tm_score(
         else:
             # Return all predictions but with cluster info
             representatives = [predictions[cluster[0]] for cluster in clusters]
-        
-        print(f"Clustering: {n} structures → {len(clusters)} clusters (TM > {tm_threshold})")
+
+        print(
+            f"Clustering: {n} structures → {len(clusters)} clusters (TM > {tm_threshold})"
+        )
         return representatives
-        
+
     except Exception as e:
         print(f"Warning: Clustering failed ({e}), returning all predictions")
         return predictions
@@ -2063,23 +2206,27 @@ def cluster_by_tm_score(
 def _calculate_tm_score(pdb1: str, pdb2: str, chain_id: str = "B") -> float:
     """
     Calculate TM-score between two structures.
-    
+
     Uses simplified CA-based alignment.
-    
+
     Returns:
         TM-score in range [0, 1]
     """
     try:
         from Bio.PDB import PDBParser, MMCIFParser
         import numpy as np
-        
+
         # Parse structures
-        parser1 = MMCIFParser(QUIET=True) if pdb1.endswith(".cif") else PDBParser(QUIET=True)
-        parser2 = MMCIFParser(QUIET=True) if pdb2.endswith(".cif") else PDBParser(QUIET=True)
-        
+        parser1 = (
+            MMCIFParser(QUIET=True) if pdb1.endswith(".cif") else PDBParser(QUIET=True)
+        )
+        parser2 = (
+            MMCIFParser(QUIET=True) if pdb2.endswith(".cif") else PDBParser(QUIET=True)
+        )
+
         struct1 = parser1.get_structure("s1", pdb1)
         struct2 = parser2.get_structure("s2", pdb2)
-        
+
         # Extract CA atoms from binder chain
         def get_ca_coords(structure, chain_id):
             coords = []
@@ -2090,41 +2237,41 @@ def _calculate_tm_score(pdb1: str, pdb2: str, chain_id: str = "B") -> float:
                             if residue.id[0] == " " and "CA" in residue:
                                 coords.append(residue["CA"].get_coord())
             return np.array(coords)
-        
+
         ca1 = get_ca_coords(struct1, chain_id)
         ca2 = get_ca_coords(struct2, chain_id)
-        
+
         if len(ca1) == 0 or len(ca2) == 0:
             return 0.0
-        
+
         # Align lengths
         min_len = min(len(ca1), len(ca2))
         ca1 = ca1[:min_len]
         ca2 = ca2[:min_len]
-        
+
         # Calculate RMSD after superposition
         centroid1 = np.mean(ca1, axis=0)
         centroid2 = np.mean(ca2, axis=0)
         ca1_centered = ca1 - centroid1
         ca2_centered = ca2 - centroid2
-        
+
         # SVD for optimal rotation
         H = ca1_centered.T @ ca2_centered
         U, S, Vt = np.linalg.svd(H)
         R = Vt.T @ U.T
-        
+
         # Apply rotation
         ca2_aligned = ca2_centered @ R.T
-        
+
         # Calculate TM-score
-        d0 = 1.24 * (min_len - 15) ** (1/3) - 1.8 if min_len > 15 else 0.5
+        d0 = 1.24 * (min_len - 15) ** (1 / 3) - 1.8 if min_len > 15 else 0.5
         d0 = max(d0, 0.5)
-        
+
         distances = np.linalg.norm(ca1_centered - ca2_aligned, axis=1)
         tm_score = np.sum(1 / (1 + (distances / d0) ** 2)) / min_len
-        
+
         return float(tm_score)
-        
+
     except Exception:
         return 0.0
 
@@ -2135,55 +2282,57 @@ def _calculate_tm_score(pdb1: str, pdb2: str, chain_id: str = "B") -> float:
 
 # UniRef50 sequence database URL (UniProt FTP)
 # ~12GB compressed, ~50GB uncompressed - persisted in Modal Volume
-UNIREF50_URL = "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz"
+UNIREF50_URL = (
+    "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz"
+)
 UNIREF50_DB_PATH = "/data/uniref50/uniref50.fasta"
 
 
 def _ensure_uniref50_database(auto_download: bool = True) -> str | None:
     """
     Ensure UniRef50 FASTA database is available, downloading if necessary.
-    
+
     UniRef50 is persisted in the Modal data volume and only downloaded once.
     This is a ~12GB download that expands to ~50GB.
-    
+
     Args:
         auto_download: If True, download database if not present
-        
+
     Returns:
         Path to the database, or None if unavailable
     """
     import gzip
     import shutil
     import urllib.request
-    
+
     if os.path.exists(UNIREF50_DB_PATH):
         return UNIREF50_DB_PATH
-    
+
     if not auto_download:
         print(f"Warning: UniRef50 database not found at {UNIREF50_DB_PATH}")
         return None
-    
+
     # Create directory if needed
     os.makedirs(os.path.dirname(UNIREF50_DB_PATH), exist_ok=True)
-    
+
     gz_path = UNIREF50_DB_PATH + ".gz"
-    
+
     try:
         print(f"Downloading UniRef50 database from {UNIREF50_URL}...")
         print("  ⚠️  One-time download: ~12GB compressed → ~50GB uncompressed")
         print("  ⚠️  This may take 10-30 minutes depending on network speed")
         urllib.request.urlretrieve(UNIREF50_URL, gz_path)
-        
+
         print("  Extracting database (streaming to minimize RAM usage)...")
-        with gzip.open(gz_path, 'rb') as f_in:
-            with open(UNIREF50_DB_PATH, 'wb') as f_out:
+        with gzip.open(gz_path, "rb") as f_in:
+            with open(UNIREF50_DB_PATH, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out)
-        
+
         # Clean up compressed file to save ~12GB
         os.remove(gz_path)
         print(f"  UniRef50 database ready at {UNIREF50_DB_PATH}")
         return UNIREF50_DB_PATH
-        
+
     except Exception as e:
         print(f"Warning: Failed to download UniRef50 database: {e}")
         # Clean up partial downloads
@@ -2201,68 +2350,70 @@ def check_novelty(
 ) -> list[SequenceDesign]:
     """
     Filter sequences for novelty using pyhmmer phmmer against UniRef50.
-    
+
     Uses sequence-vs-sequence search (phmmer mode) to find sequences with
     high similarity to known proteins in UniRef50. Critical for:
     - Patentability (IP): Avoid sequences too similar to known/patented proteins
     - Safety (Immunogenicity): Flag sequences similar to human proteins
-    
+
     Args:
         sequences: List of designed sequences
         max_evalue: Maximum E-value to consider a hit (lower = stricter, default 1e-6)
         auto_download: Auto-download UniRef50 database if not present
-    
+
     Returns:
         List of novel sequences (no significant UniRef50 hits)
     """
     if not sequences:
         return sequences
-    
+
     try:
         from pyhmmer.easel import TextSequence, Alphabet, SequenceFile
         from pyhmmer.plan7 import Pipeline
-        
+
         # Ensure database is available (persisted in Modal Volume)
         db_path = _ensure_uniref50_database(auto_download=auto_download)
         if db_path is None:
             print("Warning: UniRef50 database unavailable, skipping novelty check")
             return sequences
-        
+
         alphabet = Alphabet.amino()
-        
-        print(f"  Scanning {len(sequences)} sequences against UniRef50 (phmmer mode)...")
+
+        print(
+            f"  Scanning {len(sequences)} sequences against UniRef50 (phmmer mode)..."
+        )
         print(f"  E-value threshold: {max_evalue:.0e}")
-        
+
         # Track which sequences have hits
         seq_hits: dict[str, tuple[str, float]] = {}  # seq_id -> (hit_name, evalue)
-        
+
         # Process each query sequence
         for seq in sequences:
             # Create digital query sequence
             # Ensure sequence is string (pyhmmer expects str, not bytes)
             seq_str = seq.sequence
             if isinstance(seq_str, bytes):
-                seq_str = seq_str.decode('utf-8')
+                seq_str = seq_str.decode("utf-8")
 
             query = TextSequence(
                 name=seq.sequence_id.encode(),
                 sequence=seq_str,
             ).digitize(alphabet)
-            
+
             # Create pipeline for this search
             pipeline = Pipeline(alphabet)
-            
+
             # Stream through UniRef50 FASTA - avoids loading 50GB into RAM
             # This is phmmer mode: sequence vs sequence database
             with SequenceFile(db_path, digital=True, alphabet=alphabet) as seq_file:
                 hits = pipeline.search_seq(query, seq_file)
-                
+
                 # Check for significant hits
                 for hit in hits:
                     if hit.evalue < max_evalue:
                         seq_hits[seq.sequence_id] = (hit.name.decode(), hit.evalue)
                         break  # One significant hit is enough to flag as non-novel
-        
+
         # Separate novel from non-novel sequences
         novel_sequences = []
         for seq in sequences:
@@ -2270,14 +2421,18 @@ def check_novelty(
                 hit_name, evalue = seq_hits[seq.sequence_id]
                 # Truncate long UniRef IDs for display
                 display_name = hit_name[:40] + "..." if len(hit_name) > 40 else hit_name
-                print(f"  ✗ {seq.sequence_id}: hit {display_name} (E={evalue:.2e}) - NOT NOVEL")
+                print(
+                    f"  ✗ {seq.sequence_id}: hit {display_name} (E={evalue:.2e}) - NOT NOVEL"
+                )
             else:
                 novel_sequences.append(seq)
                 print(f"  ✓ {seq.sequence_id}: no significant hits - NOVEL")
-        
-        print(f"Novelty: {len(novel_sequences)}/{len(sequences)} sequences are novel (E > {max_evalue})")
+
+        print(
+            f"Novelty: {len(novel_sequences)}/{len(sequences)} sequences are novel (E > {max_evalue})"
+        )
         return novel_sequences
-        
+
     except ImportError:
         print("Warning: pyhmmer not installed, skipping novelty check")
         return sequences
