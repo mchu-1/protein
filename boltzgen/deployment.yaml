@@ -10,5 +10,5 @@ config_file: "3di3-config.yaml"
 script_file: "job.sh"
 
 # Run Strategy (1K designs)
-total_designs: 1000
-batch_size: 200       # 5 parallel GPUs running 200 designs each
+total_designs: 100
+batch_size: 10       # 10 parallel GPUs running 10 designs each
