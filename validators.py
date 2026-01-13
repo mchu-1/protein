@@ -469,30 +469,36 @@ def _calculate_backbone_rmsd(
         if pred_ca is None or len(ref_ca) < 3 or len(pred_ca) < 3:
             return None
 
-        # 3. Sequence Alignment (Strictly following Biotite Docs)
-        try:
-            ref_seq = seq.ProteinSequence(ref_ca.res_name)
-            pred_seq = seq.ProteinSequence(pred_ca.res_name)
-        except ValueError:
-            return None
+        # 3. Alignment Strategy
+        # If lengths match exactly, assume 1-to-1 mapping (common for fixed-backbone design)
+        # This avoids alignment errors when sequences have low identity (e.g. poly-A backbone vs design)
+        if len(ref_ca) == len(pred_ca):
+             ref_indices = np.arange(len(ref_ca))
+             pred_indices = np.arange(len(pred_ca))
+        else:
+            # Fallback to Sequence Alignment
+            try:
+                ref_seq = seq.ProteinSequence(ref_ca.res_name)
+                pred_seq = seq.ProteinSequence(pred_ca.res_name)
+            except ValueError:
+                return None
 
-        matrix = align.SubstitutionMatrix.std_protein_matrix()
-        alignments = align.align_optimal(
-            ref_seq, pred_seq, matrix, terminal_penalty=False
-        )
+            matrix = align.SubstitutionMatrix.std_protein_matrix()
+            alignments = align.align_optimal(
+                ref_seq, pred_seq, matrix, terminal_penalty=False
+            )
 
-        if not alignments:
-            return None
+            if not alignments:
+                return None
 
-        # DOCS CONFIRMATION: trace is (N, 2) array. -1 is a gap.
-        trace = alignments[0].trace
+            # trace is (N, 2) array. -1 is a gap.
+            trace = alignments[0].trace
 
-        # We want rows where neither column is -1
-        # Column 0 = Ref Index, Column 1 = Pred Index
-        match_mask = (trace[:, 0] != -1) & (trace[:, 1] != -1)
+            # We want rows where neither column is -1
+            match_mask = (trace[:, 0] != -1) & (trace[:, 1] != -1)
 
-        ref_indices = trace[match_mask, 0]
-        pred_indices = trace[match_mask, 1]
+            ref_indices = trace[match_mask, 0]
+            pred_indices = trace[match_mask, 1]
 
         if len(ref_indices) < 3:
             return None
@@ -621,7 +627,12 @@ def run_esmfold_validation(
                         continue
             plddt_values = np.array(plddt_values)
 
+    # Calculate Mean pLDDT
         mean_plddt = float(np.mean(plddt_values))
+        
+        # Auto-scale pLDDT if in 0-1 range (ESMFold often returns 0-1)
+        if mean_plddt <= 1.0:
+            mean_plddt *= 100.0
 
         print(f"  ESMFold: Mean pLDDT = {mean_plddt:.1f}")
 
@@ -800,6 +811,10 @@ def run_esmfold_validation_batch(
                     plddt_values = np.array(plddt_values)
 
                 mean_plddt = float(np.mean(plddt_values))
+                
+                # Auto-scale pLDDT if in 0-1 range
+                if mean_plddt <= 1.0:
+                    mean_plddt *= 100.0
 
                 # Check pLDDT
                 if mean_plddt < min_plddt:
