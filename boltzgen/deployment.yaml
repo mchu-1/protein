@@ -9,6 +9,7 @@ timeout: 14400        # 4 hours (safeguard for large batches)
 config_file: "3di3-config.yaml"
 script_file: "job.sh"
 
-# Run Strategy (1K designs)
-total_designs: 100
-batch_size: 10       # 10 parallel GPUs running 10 designs each
+# Run Strategy (1K designs within 2h)
+# 1000 designs / 50 batch size = 20 parallel workers
+total_designs: 1000
+batch_size: 50       # 20 parallel GPUs running 50 designs each
