@@ -601,58 +601,58 @@ def run_esmfold_validation(
             return None
         
         # Metric 2: Consistency check (RMSD vs RFDiffusion backbone)
-        # Load RFDiffusion backbone
-        ref_file = pdb.PDBFile.read(backbone_pdb)
-        ref_structure = pdb.get_structure(ref_file, model=1)
-        
-        # Extract CA atoms from both structures
-        # Use the binder chain ID to ensure we only compare against the generated part
-        binder_chain = getattr(sequence, 'binder_chain_id', 'B')
-        ref_ca = ref_structure[
-            (ref_structure.atom_name == "CA") & 
-            (ref_structure.chain_id == binder_chain)
-        ]
-        
-        # Fallback: if binder chain not found in reference, try all CA atoms (older behavior)
-        if len(ref_ca) == 0:
-            ref_ca = ref_structure[ref_structure.atom_name == "CA"]
+        # Create temporary file for ESMFold structure since _calculate_backbone_rmsd expects paths
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_esm:
+            tmp_esm.write(esmfold_pdb_str.encode())
+            tmp_esm_path = tmp_esm.name
+
+        try:
+            # Use binder chain ID - default to 'A' if not specified
+            binder_chain = getattr(sequence, 'binder_chain_id', 'A')
             
-        esm_ca = esmfold_structure[ca_mask]
-        
-        # Align lengths (handle minor length mismatches)
-        min_len = min(len(ref_ca), len(esm_ca))
-        ref_ca = ref_ca[:min_len]
-        esm_ca = esm_ca[:min_len]
-        
-        # Superimpose ESMFold onto RFDiffusion backbone
-        esm_ca_superimposed, transform = struc.superimpose(ref_ca, esm_ca)
-        
-        # Calculate RMSD
-        rmsd = struc.rmsd(ref_ca, esm_ca_superimposed)
-        
-        print(f"  ESMFold: RMSD to RFDiffusion = {rmsd:.2f} Å")
-        
-        if rmsd > max_rmsd:
-            print(f"  ✗ {sequence.sequence_id}: ESMFold RMSD {rmsd:.2f} Å > {max_rmsd} Å (INCONSISTENT GEOMETRY)")
-            return None
-        
-        # PASSED both gates
-        print(f"  ✓ {sequence.sequence_id}: ESMFold validation PASSED (pLDDT={mean_plddt:.1f}, RMSD={rmsd:.2f}Å)")
-        
-        # Optionally save ESMFold prediction
-        esmfold_pdb_path = None
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-            esmfold_pdb_path = f"{output_dir}/{sequence.sequence_id}_esmfold.pdb"
-            with open(esmfold_pdb_path, "w") as f:
-                f.write(esmfold_pdb_str)
-        
-        return {
-            "mean_plddt": mean_plddt,
-            "rmsd_to_design": rmsd,
-            "passed": True,
-            "esmfold_pdb": esmfold_pdb_path,
-        }
+            rmsd = _calculate_backbone_rmsd(
+                ref_pdb=backbone_pdb,
+                pred_pdb=tmp_esm_path,
+                chain_id=binder_chain
+            )
+            
+            if rmsd is None and binder_chain == 'A':
+                 rmsd = _calculate_backbone_rmsd(
+                    ref_pdb=backbone_pdb,
+                    pred_pdb=tmp_esm_path,
+                    chain_id='B'
+                )
+
+            print(f"  ESMFold: RMSD to RFDiffusion = {rmsd if rmsd is not None else 'N/A'}")
+            
+            if rmsd is None:
+                 print(f"  ? {sequence.sequence_id}: Could not calculate RMSD (alignment failed)")
+                 return None
+            elif rmsd > max_rmsd:
+                print(f"  ✗ {sequence.sequence_id}: ESMFold RMSD {rmsd:.2f} Å > {max_rmsd} Å (INCONSISTENT GEOMETRY)")
+                return None
+            
+            # PASSED both gates
+            print(f"  ✓ {sequence.sequence_id}: ESMFold validation PASSED (pLDDT={mean_plddt:.1f}, RMSD={rmsd:.2f}Å)")
+            
+            # Optionally save ESMFold prediction
+            esmfold_pdb_path = None
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                esmfold_pdb_path = f"{output_dir}/{sequence.sequence_id}_esmfold.pdb"
+                with open(esmfold_pdb_path, "w") as f:
+                    f.write(esmfold_pdb_str)
+            
+            return {
+                "mean_plddt": mean_plddt,
+                "rmsd_to_design": rmsd,
+                "passed": True,
+                "esmfold_pdb": esmfold_pdb_path,
+            }
+        finally:
+            if os.path.exists(tmp_esm_path):
+                os.remove(tmp_esm_path)
         
     except Exception as e:
         print(f"  ✗ {sequence.sequence_id}: ESMFold error: {e}")
@@ -766,60 +766,61 @@ def run_esmfold_validation_batch(
                 
                 # Check pLDDT
                 if mean_plddt < min_plddt:
-                    # print(f"  ✗ {sequence.sequence_id}: pLDDT {mean_plddt:.1f} < {min_plddt}")
+                    print(f"  ✗ {sequence.sequence_id}: pLDDT {mean_plddt:.1f} < {min_plddt}")
                     continue
 
                 # Check RMSD
-                # Load RFDiffusion backbone
-                ref_file = pdb.PDBFile.read(backbone_pdb_path)
-                ref_structure = pdb.get_structure(ref_file, model=1)
-                
-                # Use binder chain ID
-                binder_chain = sequence.binder_chain_id
-                ref_ca = ref_structure[
-                    (ref_structure.atom_name == "CA") & 
-                    (ref_structure.chain_id == binder_chain)
-                ]
-                
-                # Fallback
-                if len(ref_ca) == 0:
-                    ref_ca = ref_structure[ref_structure.atom_name == "CA"]
-                
-                # Align lengths
-                min_len = min(len(ref_ca), len(ca_atoms))
-                ref_ca = ref_ca[:min_len]
-                esm_ca = ca_atoms[:min_len]
-                
-                # Superimpose & Calc RMSD
-                esm_ca_superimposed, _ = struc.superimpose(ref_ca, esm_ca)
-                rmsd = struc.rmsd(ref_ca, esm_ca_superimposed)
-                
-                if rmsd > max_rmsd:
-                    # print(f"  ✗ {sequence.sequence_id}: RMSD {rmsd:.2f} > {max_rmsd}")
-                    continue
-                
-                # Passed!
-                print(f"  ✓ {sequence.sequence_id}: pLDDT={mean_plddt:.1f}, RMSD={rmsd:.2f}Å")
-                validated_sequences.append(sequence)
-                
-                # Save PDB if requested (handled by caller passing output_dir?)
-                # The original batch function passed output_dir logic strangely
-                # (f"{output_dir}/{sequence.sequence_id}" if output_dir else None)
-                # If output_dir is provided, we should save.
-                if output_dir:
-                    seq_dir = f"{output_dir}/{sequence.sequence_id}" if output_dir.endswith("batch_") else output_dir
-                    # output_dir from caller (pipeline.py) is .../esmfold/batch_N or just .../esmfold
-                    # Let's just save to output_dir if it's set
-                    # To be safe with the path, let's assume output_dir is a directory
-                    # and we write {sequence_id}_esmfold.pdb inside it.
-                    # But the pipeline creates a separate folder per sequence usually?
-                    # Pipeline call: output_dir=f"{dirs['sequences']}/esmfold/batch_{batch_num}"
-                    if not os.path.exists(output_dir):
-                        os.makedirs(output_dir, exist_ok=True)
+                # Create temporary file for ESMFold structure since _calculate_backbone_rmsd expects paths
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tmp_esm:
+                    tmp_esm.write(esmfold_pdb_str.encode())
+                    tmp_esm_path = tmp_esm.name
+
+                try:
+                    # Use binder chain ID - default to 'A' if not specified (RFDiffusion convention)
+                    binder_chain = getattr(sequence, 'binder_chain_id', 'A')
                     
-                    save_path = f"{output_dir}/{sequence.sequence_id}_esmfold.pdb"
-                    with open(save_path, "w") as f:
-                        f.write(esmfold_pdb_str)
+                    rmsd = _calculate_backbone_rmsd(
+                        ref_pdb=backbone_pdb_path,
+                        pred_pdb=tmp_esm_path,
+                        chain_id=binder_chain
+                    )
+                    
+                    if rmsd is None:
+                        # Try fallback chain "B" if "A" failed (legacy/default)
+                        if binder_chain == 'A':
+                             rmsd = _calculate_backbone_rmsd(
+                                ref_pdb=backbone_pdb_path,
+                                pred_pdb=tmp_esm_path,
+                                chain_id='B'
+                            )
+
+                    if rmsd is None:
+                         print(f"  ? {sequence.sequence_id}: Could not calculate RMSD (alignment failed)")
+                         # We could fail or pass here. Let's fail for safety if we can't align.
+                         # But ensure we clean up
+                         pass
+                    elif rmsd > max_rmsd:
+                        print(f"  ✗ {sequence.sequence_id}: RMSD {rmsd:.2f} > {max_rmsd}")
+                        continue
+                    else:
+                        # Passed
+                         print(f"  ✓ {sequence.sequence_id}: pLDDT={mean_plddt:.1f}, RMSD={rmsd:.2f}Å")
+                         validated_sequences.append(sequence)
+                         
+                         # Save PDB if requested
+                         if output_dir:
+                            if not os.path.exists(output_dir):
+                                os.makedirs(output_dir, exist_ok=True)
+                            
+                            save_path = f"{output_dir}/{sequence.sequence_id}_esmfold.pdb"
+                            with open(save_path, "w") as f:
+                                f.write(esmfold_pdb_str)
+
+                finally:
+                    # Cleanup
+                    if os.path.exists(tmp_esm_path):
+                        os.remove(tmp_esm_path)
 
             except Exception as e:
                 print(f"  ✗ {sequence.sequence_id}: Validation failed: {e}")
