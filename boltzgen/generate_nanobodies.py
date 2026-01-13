@@ -6,6 +6,8 @@ import subprocess
 import shutil
 from pathlib import Path
 import math
+import threading
+import time
 
 # Modal Pricing constants (USD per second)
 PRICING = {
@@ -38,6 +40,41 @@ image = (
 )
 
 app = modal.App("boltzgen-nanobody-design")
+
+
+class CostLogger(threading.Thread):
+    def __init__(self, gpu_type="A100", interval=10):
+        super().__init__()
+        self.gpu_type = gpu_type
+        self.interval = interval
+        self.stop_event = threading.Event()
+        self.start_time = None
+        # Default to A100 pricing if not found
+        self.price_per_sec = PRICING.get(gpu_type, PRICING["A100"])
+
+    def run(self):
+        self.start_time = time.time()
+        print(
+            f"[CostMonitor] Started monitoring for GPU: {self.gpu_type} (${self.price_per_sec}/sec)"
+        )
+
+        while not self.stop_event.is_set():
+            # Wait for interval or stop signal
+            if self.stop_event.wait(self.interval):
+                break
+
+            elapsed = time.time() - self.start_time
+            cost = elapsed * self.price_per_sec
+            print(f"[CostMonitor] Duration: {elapsed:.1f}s | Current Cost: ${cost:.5f}")
+
+    def stop(self):
+        self.stop_event.set()
+        if self.start_time:
+            elapsed = time.time() - self.start_time
+            cost = elapsed * self.price_per_sec
+            print(
+                f"[CostMonitor] Finished. Total Duration: {elapsed:.1f}s | Final Cost: ${cost:.5f}"
+            )
 
 
 # 3. Define the Remote Runner as a Class
@@ -85,6 +122,10 @@ class BoltzGenRunner:
 
         print(f"[{batch_index}] Executing: {' '.join(cmd)}")
 
+        # Start cost monitoring
+        cost_monitor = CostLogger(gpu_type="A100")
+        cost_monitor.start()
+
         try:
             # Run boltzgen
             process = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -97,6 +138,9 @@ class BoltzGenRunner:
             print(f"[{batch_index}] STDOUT:\n{e.stdout}")
             print(f"[{batch_index}] STDERR:\n{e.stderr}")
             raise e
+        finally:
+            cost_monitor.stop()
+            cost_monitor.join()
 
         # Collect outputs
         output_dir = workspace / "output"
