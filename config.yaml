@@ -67,9 +67,9 @@ proteinmpnn:
 
 # ESMFold - Orthogonal Validation (Gatekeeper)
 esmfold:
-  enabled: true # Essential gatekeeper
-  min_plddt: 80.0 # Strict: Only pass high-confidence structures (cheaper to fail here)
-  max_rmsd: 1.5 # Strict: High consistency required
+  enabled: true # Evolutionary gatekeep of diffusion designs
+  min_plddt: 90.0 # Strict: Only pass high-confidence binder structures
+  max_rmsd: 4.0 # Tolerant for (isolated, complexed) comparisons of binder structure
   save_predictions: false # Save storage cost
 
 # Boltz-2 - Structure Validation (AlphaProteo SI 2.2 thresholds)
