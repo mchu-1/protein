@@ -1,0 +1,14 @@
+# deployment.yaml
+app_name: "boltzgen"
+
+# Infrastructure Settings
+gpu_type: "A100"      # Options: T4, L4, A10G, A100
+timeout: 14400        # 4 hours (safeguard for large batches)
+
+# Experiment Settings
+config_file: "3di3-config.yaml"
+script_file: "job.sh"
+
+# Run Strategy (1K designs)
+total_designs: 1000
+batch_size: 200       # 5 parallel GPUs running 200 designs each

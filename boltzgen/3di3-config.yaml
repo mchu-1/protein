@@ -1,0 +1,15 @@
+--- # IL-7Ra (BoltzGen Configuration)
+entities:
+  - file:
+      path: 3DI3-assembly1.cif # IL-7Ra target
+      include: 
+        - chain: 
+            id: B
+            res_index: 5,80,139 # Hotspot residues
+
+  - file:
+      path: # Nanobody scaffolds
+        - nanobody_scaffolds/7eow.yaml
+        - nanobody_scaffolds/7xl0.yaml
+        - nanobody_scaffolds/8coh.yaml
+        - nanobody_scaffolds/8z8v.yaml
